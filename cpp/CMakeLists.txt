@@ -1692,16 +1692,17 @@ elseif(USE_BACKEND STREQUAL "VULKAN")
   list(APPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_BINARY_DIR}")
 
   # ggml is vendored at a pinned commit under external/ggml (see Compiling.md).
-  # Static libs only, so katago.exe stays self-contained.
+  # Static libs only, so katago.exe stays self-contained. GGML_CPU is enabled
+  # for the debug env toggle KATAGO_VULKAN_CPU (cross-check the graph on CPU).
   set(BUILD_SHARED_LIBS OFF)
   set(GGML_VULKAN ON)
-  set(GGML_CPU OFF)
+  set(GGML_CPU ON)
   set(GGML_OPENMP OFF)
   set(GGML_BUILD_TESTS OFF)
   set(GGML_BUILD_EXAMPLES OFF)
   add_subdirectory(external/ggml)
 
-  target_link_libraries(katago ggml ggml-base ggml-vulkan Vulkan::Vulkan)
+  target_link_libraries(katago ggml ggml-base ggml-vulkan ggml-cpu Vulkan::Vulkan)
 elseif(USE_BACKEND STREQUAL "ONNX")
   target_compile_definitions(katago PRIVATE USE_ONNX_BACKEND)
 
@@ -1751,12 +1752,14 @@ elseif(USE_BACKEND STREQUAL "ONNX")
   endif()
 endif()
 
-# The TensorRT and ONNX backends both build their network by emitting an ONNX ModelProto with
-# OnnxModelBuilder and handing the serialized bytes to nvonnxparser or to Ort::Session, so both
-# compile the vendored schema external/onnx/onnx.proto with protoc and link our own protobuf.
-# Serialized bytes are not ABI contact, so our protobuf never meets the one TensorRT links into
-# nvonnxparser, or whichever one lives inside the ONNX Runtime library.
-if(USE_BACKEND STREQUAL "TENSORRT" OR USE_BACKEND STREQUAL "ONNX")
+# The TensorRT, ONNX, and Vulkan backends all consume ONNX graphs: TRT and ONNX
+# emit them with OnnxModelBuilder, and the Vulkan backend interprets the same
+# serialized graph (from dumponnx output or built in memory from a .bin.gz).
+# All three compile the vendored schema external/onnx/onnx.proto with protoc
+# and link our own protobuf. Serialized bytes are not ABI contact, so our
+# protobuf never meets the one TensorRT links into nvonnxparser, or whichever
+# one lives inside the ONNX Runtime library.
+if(USE_BACKEND STREQUAL "TENSORRT" OR USE_BACKEND STREQUAL "ONNX" OR USE_BACKEND STREQUAL "VULKAN")
   # Static by default for ONNX only, and deliberately so - do not unify this with the TensorRT
   # case, which would change how Windows TensorRT builds resolve protobuf. A from-source ONNX
   # Runtime bundles a static protobuf, which module-mode FindProtobuf would otherwise take for a
@@ -1769,7 +1772,7 @@ if(USE_BACKEND STREQUAL "TENSORRT" OR USE_BACKEND STREQUAL "ONNX")
   # Override with -DProtobuf_USE_STATIC_LIBS=FALSE. Only module-mode FindProtobuf honors it: a
   # config-mode protobuf, as from a vcpkg toolchain or protobuf 22 and up with its abseil
   # dependencies, ignores the variable entirely.
-  if(USE_BACKEND STREQUAL "ONNX" AND NOT DEFINED Protobuf_USE_STATIC_LIBS)
+  if((USE_BACKEND STREQUAL "ONNX" OR USE_BACKEND STREQUAL "VULKAN") AND NOT DEFINED Protobuf_USE_STATIC_LIBS)
     set(Protobuf_USE_STATIC_LIBS TRUE)
   endif()
   find_package(Protobuf REQUIRED)

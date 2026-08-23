@@ -4,7 +4,7 @@
 // in builds with a backend that consumes ONNX graphs. See docs/ONNX_Model_Files.md for the file
 // format these tests exercise.
 
-#if defined(USE_TENSORRT_BACKEND) || defined(USE_ONNX_BACKEND)
+#if defined(USE_TENSORRT_BACKEND) || defined(USE_ONNX_BACKEND) || defined(USE_VULKAN_BACKEND)
 
 #include <fstream>
 #include <functional>
@@ -578,8 +578,8 @@ void Tests::runOnnxModelFileTests(const std::string& scratchDir, const std::stri
   (void)scratchDir;
   (void)modelFile;
   throw StringError(
-    "runonnxmodelfiletests requires a build with the TensorRT or ONNX backend, since those are the "
-    "backends that read .onnx model files.");
+    "runonnxmodelfiletests requires a build with the TensorRT, ONNX, or Vulkan backend, since those "
+    "are the backends that read .onnx model files.");
 }
 
 #endif
