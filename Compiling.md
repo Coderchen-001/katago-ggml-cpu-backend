@@ -288,3 +288,22 @@ Set `onnxProvider` in your config to choose the execution provider:
 
 ### Working with .onnx files
 This backend and the TensorRT backend can also write out the ONNX graph they build (`katago dumponnx`) and load a `.onnx` file as a model in place of the `.bin.gz`, including one produced by other tooling. See **[ONNX_Model_Files.md](docs/ONNX_Model_Files.md)** for the commands and the model file format.
+
+### Vulkan backend (experimental, in development)
+The `VULKAN` backend runs neural net inference on any Vulkan-capable GPU (Windows and Linux), using the vendored [ggml](https://github.com/ggml-org/llama.cpp/tree/master/ggml) Vulkan backend as its kernel base. It consumes `.onnx` model files dumped with `katago dumponnx`, or `.bin.gz` models directly. This backend is under active development.
+
+#### Requirements
+   * Everything KataGo normally needs (CMake, a C++17 compiler, zlib).
+   * The [LunarG Vulkan SDK](https://vulkan.lunarg.com/sdk/home) (for `glslc`, Vulkan headers, and `SPIRV-Headers`; `VULKAN_SDK` should be set).
+   * Nothing else - ggml is vendored at a pinned commit under `cpp/external/ggml`.
+
+#### Compile
+   ```
+   cmake -S KataGo/cpp -B KataGo/cpp/build -DUSE_BACKEND=VULKAN
+   cmake --build KataGo/cpp/build -j
+   ```
+   The first build compiles the ggml Vulkan shaders with glslc and can take a while.
+
+#### Runtime
+   * No extra DLLs are needed. Use `katago printDevices` to list Vulkan devices.
+   * The `vulkan*` keys in `configs/gtp_example.cfg` select the device and precision.

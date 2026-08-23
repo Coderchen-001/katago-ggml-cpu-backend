@@ -582,7 +582,7 @@ endif()
 set(BUILD_DISTRIBUTED 0 CACHE BOOL "Build with http support for contributing to distributed training")
 set(USE_BACKEND CACHE STRING "Neural net backend")
 string(TOUPPER "${USE_BACKEND}" USE_BACKEND)
-set_property(CACHE USE_BACKEND PROPERTY STRINGS "" CUDA TENSORRT OPENCL EIGEN METAL ONNX ROCM)
+set_property(CACHE USE_BACKEND PROPERTY STRINGS "" CUDA TENSORRT OPENCL EIGEN METAL ONNX ROCM VULKAN)
 
 set(USE_TCMALLOC 0 CACHE BOOL "Use TCMalloc")
 set(NO_GIT_REVISION 0 CACHE BOOL "Disable embedding the git revision into the compiled exe")
@@ -848,6 +848,12 @@ elseif(USE_BACKEND STREQUAL "ONNX")
   set(NEURALNET_BACKEND_SOURCES
     neuralnet/onnxbackend.cpp
     )
+# --------------------------- VULKAN backend (ggml-vulkan) ---------------------------
+elseif(USE_BACKEND STREQUAL "VULKAN")
+  message(STATUS "-DUSE_BACKEND=VULKAN, using the ggml Vulkan backend.")
+  set(NEURALNET_BACKEND_SOURCES
+    neuralnet/vulkanbackend.cpp
+    )
 # --------------------------- ROCM backend (AMD GPU / HIP + MIOpen) ---------------------------
 elseif(USE_BACKEND STREQUAL "ROCM")
   message(STATUS "-DUSE_BACKEND=ROCM, using AMD ROCm backend.")
@@ -906,7 +912,7 @@ elseif(USE_BACKEND STREQUAL "ROCM")
   )
 
 elseif(USE_BACKEND STREQUAL "")
-  message(WARNING "${ColorBoldRed}WARNING: Using dummy neural net backend, intended for non-neural-net testing only, will fail on any code path requiring a neural net. To use neural net, specify -DUSE_BACKEND=CUDA or -DUSE_BACKEND=TENSORRT or -DUSE_BACKEND=OPENCL or -DUSE_BACKEND=EIGEN or -DUSE_BACKEND=ONNX or -DUSE_BACKEND=ROCM to compile with the respective backend.${ColorReset}")
+  message(WARNING "${ColorBoldRed}WARNING: Using dummy neural net backend, intended for non-neural-net testing only, will fail on any code path requiring a neural net. To use neural net, specify -DUSE_BACKEND=CUDA or -DUSE_BACKEND=TENSORRT or -DUSE_BACKEND=OPENCL or -DUSE_BACKEND=EIGEN or -DUSE_BACKEND=ONNX or -DUSE_BACKEND=ROCM or -DUSE_BACKEND=VULKAN to compile with the respective backend.${ColorReset}")
   set(NEURALNET_BACKEND_SOURCES neuralnet/dummybackend.cpp)
 else()
   message(FATAL_ERROR "Unrecognized backend: " ${USE_BACKEND})
@@ -1664,6 +1670,38 @@ elseif(USE_BACKEND STREQUAL "EIGEN")
       message(STATUS "Found Eigen3 at ${EIGEN3_INCLUDE_DIRS}")
     endif()
   endif()
+elseif(USE_BACKEND STREQUAL "VULKAN")
+  target_compile_definitions(katago PRIVATE USE_VULKAN_BACKEND)
+
+  # katago itself uses the Vulkan API for device enumeration (printDevices),
+  # and ggml-vulkan needs the Vulkan headers for <spirv/unified1/spirv.hpp>.
+  find_package(Vulkan REQUIRED)
+
+  # The LunarG Vulkan SDK ships the SPIRV headers but not a SPIRV-Headers CMake
+  # package config, which ggml-vulkan's find_package(SPIRV-Headers CONFIG
+  # REQUIRED) demands. Write a minimal stub config pointing at the SDK headers
+  # into the build dir so the vendored ggml configures offline.
+  set(SPIRV_HEADERS_STUB_CONFIG "${CMAKE_CURRENT_BINARY_DIR}/SPIRV-HeadersConfig.cmake")
+  file(WRITE "${SPIRV_HEADERS_STUB_CONFIG}"
+    "if(NOT TARGET SPIRV-Headers::SPIRV-Headers)\n"
+    "  add_library(SPIRV-Headers::SPIRV-Headers INTERFACE IMPORTED)\n"
+    "  set_target_properties(SPIRV-Headers::SPIRV-Headers PROPERTIES\n"
+    "    INTERFACE_INCLUDE_DIRECTORIES \"${Vulkan_INCLUDE_DIRS}\")\n"
+    "endif()\n"
+  )
+  list(APPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_BINARY_DIR}")
+
+  # ggml is vendored at a pinned commit under external/ggml (see Compiling.md).
+  # Static libs only, so katago.exe stays self-contained.
+  set(BUILD_SHARED_LIBS OFF)
+  set(GGML_VULKAN ON)
+  set(GGML_CPU OFF)
+  set(GGML_OPENMP OFF)
+  set(GGML_BUILD_TESTS OFF)
+  set(GGML_BUILD_EXAMPLES OFF)
+  add_subdirectory(external/ggml)
+
+  target_link_libraries(katago ggml ggml-base ggml-vulkan Vulkan::Vulkan)
 elseif(USE_BACKEND STREQUAL "ONNX")
   target_compile_definitions(katago PRIVATE USE_ONNX_BACKEND)
 
