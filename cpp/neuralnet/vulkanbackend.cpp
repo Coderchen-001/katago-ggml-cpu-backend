@@ -199,6 +199,7 @@ struct OnnxToGgml {
   };
   unordered_map<string, RmsFusion> rmsFusions;     // by Div output name
   unordered_set<string> absorbedRmsNodes;          // Pow/ReduceMean/Add/Sqrt node names
+  unordered_map<string, ggml_tensor*> rmsWeightViews;  // weightSrc -> [C,1,1,1] view
 
   // ---- L2-B1: residual mask reassociation (C19-1/C20-1) ----
   // Residual pattern: Add(A, Mul(B, InputMask)) where B is a projection
@@ -1144,23 +1145,32 @@ struct OnnxToGgml {
     int64_t rest = 1;
     ggml_tensor* flat = prepareReduction(x, onnxAxes, reduced, rest);
     ggml_tensor* red;
-    if(reduced >= (1LL << 60)) {
+    if(reduced >= 4096) {
       // Long rows: ggml's sum_rows shader reduces each row with a single
       // workgroup, serialized for long rows (the trunk-final mean-square has
-      // reduced=138624 -> 305us). Reduce in K-chunks via an all-ones GEMM:
-      // parallel, and the per-chunk K is small enough that the coopmat2 F16
-      // conversion of the operands keeps the accuracy of a direct sum.
-      const int64_t CHUNK = 16384;
-      const size_t es = ggml_element_size(flat);
-      ggml_tensor* sum = NULL;
-      for(int64_t off = 0; off < reduced; off += CHUNK) {
-        const int64_t k = min(CHUNK, reduced - off);
-        ggml_tensor* ones = onesTable(k);                                    // [k,1]
-        ggml_tensor* slice = ggml_view_2d(ctx, flat, k, rest, flat->nb[1], (size_t)off * es);
-        ggml_tensor* part = ggml_mul_mat(ctx, ones, slice);                  // [1, rest]
-        sum = sum == NULL ? part : ggml_add(ctx, sum, part);
+      // reduced=138624 -> 305us). Two-stage reduction instead: reshape
+      // [reduced, rest] as [chunk, reduced/chunk, rest] (zero-copy view),
+      // sum_rows along the small chunk dim -> [1, reduced/chunk, rest] (that
+      // many workgroups run in parallel), then reshape + sum_rows again.
+      // Keeps exact F32 arithmetic (a mul_mat with an all-ones column would be
+      // faster but the coopmat2 F16 conversion pushed topPolicyDelta 99% over
+      // its limit).
+      int64_t chunk = -1;
+      for(int64_t cand : {1024LL, 768LL, 512LL, 384LL, 256LL, 192LL, 128LL, 96LL, 64LL}) {
+        if(reduced % cand == 0) {
+          chunk = cand;
+          break;
+        }
       }
-      red = isSum ? sum : ggml_scale(ctx, sum, 1.0f / (float)reduced);
+      if(chunk > 0) {
+        ggml_tensor* v = ggml_reshape_3d(ctx, flat, chunk, reduced / chunk, rest);
+        ggml_tensor* s1 = isSum ? ggml_sum_rows(ctx, v) : ggml_mean(ctx, v);   // [1, n, rest]
+        ggml_tensor* s2v = ggml_reshape_2d(ctx, s1, reduced / chunk, rest);
+        red = isSum ? ggml_sum_rows(ctx, s2v) : ggml_mean(ctx, s2v);           // [1, rest]
+      }
+      else {
+        red = isSum ? ggml_sum_rows(ctx, flat) : ggml_mean(ctx, flat);
+      }
     }
     else {
       red = isSum ? ggml_sum_rows(ctx, flat) : ggml_mean(ctx, flat);  // [1, rest]
@@ -1349,6 +1359,21 @@ struct OnnxToGgml {
     prescanSoftmaxScale();
     prescanRope();
     prescanProjFusion();
+    // Pre-build every RMS weight as a standalone [C,1,1,1] constant (not a
+    // reshape view) so the cgraph order becomes rms_norm -> mul with no node
+    // between; ggml-vulkan's RMS_NORM_MUL fusion requires mul to directly
+    // follow rms_norm. A reshape view would be expanded between them by
+    // ggml_build_forward (mul's src0 is expanded before src1).
+    for(auto& kv : rmsFusions) {
+      if(!kv.second.active)
+        continue;
+      const onnx::TensorProto* t = findInitializer(kv.second.weightSrc);
+      testAssert(t != NULL);
+      vector<float> wv = initializerFloats(*t);
+      int64_t ne[4] = {(int64_t)wv.size(), 1, 1, 1};
+      rmsWeightViews[kv.second.weightSrc] =
+        hostConstant(kv.second.weightSrc + "@c1", GGML_TYPE_F32, ne, wv.data());
+    }
     // Batch dim for the shared RoPE 2D tables: N = max batch (from InputSpatial).
     {
       auto itS = tensors.find("InputSpatial");
@@ -1582,12 +1607,20 @@ struct OnnxToGgml {
           // RMSNorm fused, L2 CS direct: x is [C, S, N] (CS) with the channel
           // dim at ne0, so ggml_rms_norm reduces the right axis with no permute
           // round-trip at all (design §4.2). weight is [1,1,C,1] -> [C,1,1,1].
+          // The weight view is created BEFORE the rms_norm so the cgraph order
+          // is rms_norm -> mul with nothing in between; ggml-vulkan's
+          // RMS_NORM_MUL fusion (ggml_vk_can_fuse) requires the mul node to
+          // directly follow the rms_norm node.
           const RmsFusion& f = itR->second;
           AnnotatedTensor annX = in(0);
           ggml_tensor* x = ensure(annX, Layout::L_CS, GGML_TYPE_F32);   // [C,S,N]
-          ggml_tensor* w = initializerTensor(f.weightSrc, GGML_TYPE_F32);
+          // The [C,1,1,1] weight view was pre-built before the node loop so
+          // the cgraph order is rms_norm -> mul with nothing in between
+          // (enables ggml-vulkan's RMS_NORM_MUL fusion).
+          auto itW = rmsWeightViews.find(f.weightSrc);
+          testAssert(itW != rmsWeightViews.end());
+          ggml_tensor* wr = itW->second;
           ggml_tensor* rn = ggml_rms_norm(ctx, x, f.eps);               // [C,S,N]
-          ggml_tensor* wr = ggml_reshape_4d(ctx, w, w->ne[2], 1, 1, 1);
           ggml_tensor* sc = ggml_mul(ctx, rn, wr);                      // [C,S,N]
           // The weight Mul was absorbed too, so register this result under both
           // the Div output and the Mul output names.
