@@ -420,11 +420,25 @@ struct OnnxToGgml {
       throw StringError("VULKAN backend: initializer '" + name + "' not found in the ONNX graph");
     int64_t ne[4];
     dimsToNe(*t, ne);
-    if(type == GGML_TYPE_F32) {
+    if(type == GGML_TYPE_F32 || type == GGML_TYPE_F16) {
       vector<float> data = initializerFloats(*t);
       testAssert((int64_t)data.size() == ne[0] * ne[1] * ne[2] * ne[3]);
-      vector<uint8_t> bytes(data.size() * 4);
-      memcpy(bytes.data(), data.data(), bytes.size());
+      vector<uint8_t> bytes;
+      if(type == GGML_TYPE_F16) {
+        // B1: keep matmul/conv weights natively in F16. ggml-vulkan converts
+        // F32 operands to F16 on every eval on coopmat2 devices (and im2col
+        // emits F16 anyway), so pre-converting here (same RTNE rounding as the
+        // device-side to_fp16) removes the per-eval weight conversion with
+        // bit-identical numerics.
+        bytes.resize(data.size() * 2);
+        ggml_fp16_t* dst = (ggml_fp16_t*)bytes.data();
+        for(size_t i = 0; i < data.size(); i++)
+          dst[i] = ggml_fp32_to_fp16(data[i]);
+      }
+      else {
+        bytes.resize(data.size() * 4);
+        memcpy(bytes.data(), data.data(), bytes.size());
+      }
       initData[name] = std::move(bytes);
       ggml_tensor* tensor = ggml_new_tensor_4d(wctx, type, ne[0], ne[1], ne[2], ne[3]);
       ggml_set_name(tensor, name.c_str());
@@ -770,7 +784,10 @@ struct OnnxToGgml {
 
       if(op == "Conv") {
         ggml_tensor* x = in(0);
-        ggml_tensor* w = initializerTensor(node.input(1), GGML_TYPE_F32);
+        // B1: conv weights are stored natively in F16 (ggml-vulkan converts
+        // F32 operands to F16 every eval on coopmat2 devices, and im2col
+        // emits F16 regardless).
+        ggml_tensor* w = initializerTensor(node.input(1), GGML_TYPE_F16);
         // 1x1 and odd-kernel stride-1 same-pad convs map to ggml_conv_2d_s1_ph.
         // Kernel a is [kW, kH, inC, outC] (same bytes as ONNX [outC,inC,kH,kW]).
         int64_t kY = w->ne[1], kX = w->ne[0];
@@ -795,7 +812,13 @@ struct OnnxToGgml {
         registerOut(ggml_conv_2d_s1_ph(ctx, w, x));
       }
       else if(op == "MatMul") {
-        registerOut(matmul(in(0), in(1)));
+        // B1: when the right operand is a stored weight, keep it natively F16
+        // to skip the per-eval F32->F16 conversion in ggml_vk_mul_mat. Live
+        // (non-initializer) operands stay F32.
+        ggml_tensor* b = in(1);
+        if(findInitializer(node.input(1)) != NULL)
+          b = initializerTensor(node.input(1), GGML_TYPE_F16);
+        registerOut(matmul(in(0), b));
       }
       else if(op == "Add") {
         registerOut(binary(in(0), in(1), 0));
