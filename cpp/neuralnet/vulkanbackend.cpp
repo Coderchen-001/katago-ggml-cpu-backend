@@ -156,6 +156,94 @@ struct OnnxToGgml {
   unordered_map<string, SiluFusion> siluFusions;   // by final Mul output name
   unordered_set<string> absorbedSiluNodes;         // Sigmoid + first Mul names
 
+  // ---- S1 fusion: RMSNorm chain ----
+  // ONNX exports RMSNorm as Pow(x,2) -> ReduceMean(axes=[C]) -> Add(eps) ->
+  // Sqrt -> Div(x, rms) -> Mul(weight). We rebuild the chain as
+  // ggml_rms_norm(x, eps) * weight. The ReduceMean axis is the channel dim
+  // (ONNX axis 1 == ggml ne2), which ggml_rms_norm does NOT reduce (it reduces
+  // ne0), so the fused op runs on a permuted [C, W*H, b] view.
+  // Map: Div output name -> { x tensor, weight tensor, eps }.
+  struct RmsFusion {
+    bool active = false;
+    string xSrc;       // tensor name fed to Pow and Div (the activation)
+    string weightSrc;  // tensor name of the per-channel weight
+    string mulOut;     // output tensor name of the absorbed weight Mul
+    float eps = 0.0f;
+  };
+  unordered_map<string, RmsFusion> rmsFusions;     // by Div output name
+  unordered_set<string> absorbedRmsNodes;          // Pow/ReduceMean/Add/Sqrt node names
+
+  void prescanRms() {
+    const auto& nodes = model.graph().node();
+    unordered_map<string, int> producer;
+    for(int i = 0; i < (int)nodes.size(); i++)
+      for(int j = 0; j < nodes[i].output_size(); j++)
+        producer[nodes[i].output(j)] = i;
+
+    for(int i = 0; i < (int)nodes.size(); i++) {
+      const onnx::NodeProto& n = nodes[i];
+      if(n.op_type() != "Div")
+        continue;
+      // Div(x, rmsstd): rmsstd = Sqrt(Add(ReduceMean(Pow(x,2)), eps))
+      auto itRms = producer.find(n.input(1));
+      if(itRms == producer.end())
+        continue;
+      const onnx::NodeProto& sqrtN = nodes[itRms->second];
+      if(sqrtN.op_type() != "Sqrt")
+        continue;
+      auto itAdd = producer.find(sqrtN.input(0));
+      if(itAdd == producer.end())
+        continue;
+      const onnx::NodeProto& addN = nodes[itAdd->second];
+      if(addN.op_type() != "Add")
+        continue;
+      auto itMean = producer.find(addN.input(0));
+      if(itMean == producer.end())
+        continue;
+      const onnx::NodeProto& meanN = nodes[itMean->second];
+      if(meanN.op_type() != "ReduceMean")
+        continue;
+      auto itSq = producer.find(meanN.input(0));
+      if(itSq == producer.end())
+        continue;
+      const onnx::NodeProto& sqN = nodes[itSq->second];
+      if(sqN.op_type() != "Pow")
+        continue;
+      // x must be the same tensor feeding both Pow and Div
+      if(sqN.input(0) != n.input(0))
+        continue;
+      // eps must be a scalar initializer
+      const onnx::TensorProto* epsInit = findInitializer(addN.input(1));
+      if(epsInit == NULL)
+        continue;
+      vector<float> ev = initializerFloats(*epsInit);
+      if(ev.size() != 1)
+        continue;
+      RmsFusion f;
+      f.active = true;
+      f.xSrc = n.input(0);
+      f.eps = ev[0];
+      // The weight Mul follows the Div: find the consumer Mul(node output, weight)
+      // and record the weight initializer name and the Mul node name.
+      for(int j = 0; j < (int)nodes.size(); j++) {
+        const onnx::NodeProto& c = nodes[j];
+        if(c.op_type() == "Mul" && c.input(0) == n.output(0) && findInitializer(c.input(1)) != NULL) {
+          f.weightSrc = c.input(1);
+          f.mulOut = c.output(0);
+          absorbedRmsNodes.insert(c.name());
+          break;
+        }
+      }
+      if(f.weightSrc.empty())
+        continue;   // no weight Mul: keep the original chain
+      rmsFusions[n.output(0)] = f;
+      absorbedRmsNodes.insert(sqN.name());
+      absorbedRmsNodes.insert(meanN.name());
+      absorbedRmsNodes.insert(addN.name());
+      absorbedRmsNodes.insert(sqrtN.name());
+    }
+  }
+
   void prescanSilu() {
     const auto& nodes = model.graph().node();
     unordered_map<string, int> producer;
@@ -350,7 +438,9 @@ struct OnnxToGgml {
       if(b->ne[i] == 1 && a->ne[i] != 1)
         bHas1 = true;
       if(a->ne[i] != 1 && b->ne[i] != 1 && a->ne[i] != b->ne[i])
-        throw StringError("VULKAN backend: shape mismatch in broadcast");
+        throw StringError("VULKAN backend: shape mismatch in broadcast a ne=" +
+          Global::intToString(a->ne[0]) + "," + Global::intToString(a->ne[1]) + "," + Global::intToString(a->ne[2]) + "," + Global::intToString(a->ne[3]) +
+          " b ne=" + Global::intToString(b->ne[0]) + "," + Global::intToString(b->ne[1]) + "," + Global::intToString(b->ne[2]) + "," + Global::intToString(b->ne[3]));
     }
     testAssert(!(aHas1 && bHas1));  // one side must be elementwise-larger
     if(!aHas1 && !bHas1) {
@@ -591,6 +681,7 @@ struct OnnxToGgml {
       tensors[kv.first] = kv.second;
 
     prescanSilu();
+    prescanRms();
 
     for(const onnx::NodeProto& node : model.graph().node()) {
       const string& op = node.op_type();
@@ -598,9 +689,9 @@ struct OnnxToGgml {
       testAssert(node.output_size() == 1);
       currentOpName = node.name().empty() ? op : node.name();
 
-      // S1 fusion: the Sigmoid/Mul pieces of a SwiGLU are skipped (rebuilt as
-      // ggml_silu in the final Mul).
-      if(absorbedSiluNodes.count(node.name()) > 0)
+      // S1 fusion: the Sigmoid/Mul pieces of a SwiGLU, and the Pow/ReduceMean/
+      // Add/Sqrt pieces of an RMSNorm chain, are skipped (rebuilt as single ops).
+      if(absorbedSiluNodes.count(node.name()) > 0 || absorbedRmsNodes.count(node.name()) > 0)
         continue;
 
       auto in = [&](int i) -> ggml_tensor* {
@@ -666,7 +757,36 @@ struct OnnxToGgml {
         }
       }
       else if(op == "Div") {
-        registerOut(binary(in(0), in(1), 2));
+        auto itR = rmsFusions.find(outName);
+        if(itR != rmsFusions.end() && itR->second.active) {
+          // RMSNorm fused: x [W,H,C,b] NCHW. ggml_rms_norm reduces ne0, but the
+          // norm reduces the channel dim (ggml ne2), so permute to channel-first
+          // [C, W, H, b], run rms_norm (per-position over channels), multiply by
+          // the per-channel weight, and permute back to NCHW.
+          const RmsFusion& f = itR->second;
+          ggml_tensor* x = tensors.count(f.xSrc) > 0 ? tensors[f.xSrc] : in(0);
+          ggml_tensor* w = initializerTensor(f.weightSrc, GGML_TYPE_F32);
+          // permute: ne2 (C) -> ne0. result->ne[p_i] = a->ne[i]
+          ggml_tensor* p = ggml_permute(ctx, x, 1, 2, 0, 3);       // [C, W, H, b]
+          ggml_tensor* pc = ggml_is_contiguous(p) ? p : ggml_cont(ctx, p);
+          ggml_tensor* rn = ggml_rms_norm(ctx, pc, f.eps);         // [C, W, H, b]
+          // weight is [1,1,C,1] (ggml ne); reshape to [C,1,1,1] then broadcast
+          // (mul along ne0=C).
+          ggml_tensor* wr = ggml_reshape_4d(ctx, w, w->ne[2], 1, 1, 1);
+          ggml_tensor* sc = ggml_mul(ctx, rn, wr);                  // [C, W, H, b]
+          // permute back to NCHW [W, H, C, b]: result->ne[p_i] = a->ne[i],
+          // want ne0=C->ne2, ne1=W->ne0, ne2=H->ne1: permute(2, 0, 1, 3)
+          ggml_tensor* bp = ggml_permute(ctx, sc, 2, 0, 1, 3);     // [W, H, C, b]
+          ggml_tensor* back = ggml_is_contiguous(bp) ? bp : ggml_cont(ctx, bp);
+          // The weight Mul was absorbed too, so register this result under both
+          // the Div output and the Mul output names.
+          tensors[outName] = back;
+          if(!f.mulOut.empty())
+            tensors[f.mulOut] = back;
+        }
+        else {
+          registerOut(binary(in(0), in(1), 2));
+        }
       }
       else if(op == "Sub") {
         registerOut(binary(in(0), in(1), 3));
