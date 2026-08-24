@@ -127,6 +127,17 @@ const ModelDesc& NeuralNet::getModelDesc(const LoadedModel* loadedModel) {
 // built from the actual tensor shapes. All tensors are FP32 in this phase.
 
 struct OnnxToGgml {
+  // ---- layout annotation (L1: infra only, behavior identical) ----
+  // L_NCHW: ne=[W,H,C,N] (classic KataGo NCHW ggml layout)
+  // L_CS:   ne=[C,S,N], S=W*H, s=h*W+w (channel-fastest; L2)
+  // L_MAT:  matrix-semantics domain inside attention (layout-orthogonal; L2)
+  enum class Layout { L_NCHW, L_CS, L_MAT };
+  struct AnnotatedTensor {
+    ggml_tensor* t;
+    Layout layout;
+    ggml_type dtype;   // F32 | F16 (annotation; actual ggml type may differ)
+  };
+
   ggml_context* ctx;
   ggml_context* wctx;   // initializer (weight) tensors live here so gallocr
                         // never reuses their buffers; allocated separately.
@@ -134,6 +145,10 @@ struct OnnxToGgml {
 
   const onnx::ModelProto& model;
   unordered_map<string, ggml_tensor*> tensors;
+  // Parallel annotation table (same keys as tensors). Initializer/constant
+  // tensors have no layout semantics and are exempt (ensure() never touches
+  // them; C10-4②).
+  unordered_map<string, AnnotatedTensor> annTensors;
 
   // Host-side data of initializer tensors, set into device memory after graph
   // allocation.
@@ -470,6 +485,61 @@ struct OnnxToGgml {
 
   // ---- shape helpers ----
 
+  // Layout conversion edges (L2 起生效; L1 阶段恒等,不插转换边):
+  // NCHW->CS: cont(permute(x, 1,2,0,3)) + reshape_3d(C,S,N)  (v2.5 穷举验证)
+  // CS->NCHW: reshape_4d(x,C,W,H,N) + permute(2,0,1,3) + cont (v2.5 穷举验证)
+  ggml_tensor* toCS(ggml_tensor* x) {
+    GGML_ASSERT(ggml_n_dims(x) <= 4);
+    const int64_t C = x->ne[2], S = x->ne[0] * x->ne[1], N = x->ne[3];
+    ggml_tensor* p = ggml_permute(ctx, x, 1, 2, 0, 3);
+    ggml_tensor* c = ggml_cont(ctx, p);
+    return ggml_reshape_3d(ctx, c, C, S, N);
+  }
+  ggml_tensor* toNCHW(ggml_tensor* x) {
+    GGML_ASSERT(ggml_n_dims(x) <= 4);
+    const int64_t C = x->ne[0], W = x->ne[1], H = x->ne[2], N = x->ne[3];
+    ggml_tensor* r4 = ggml_reshape_4d(ctx, x, C, W, H, N);
+    ggml_tensor* p = ggml_permute(ctx, r4, 2, 0, 1, 3);
+    return ggml_cont(ctx, p);
+  }
+  ggml_tensor* toF16(ggml_tensor* x) {
+    return ggml_cast(ctx, x, GGML_TYPE_F16);
+  }
+  ggml_tensor* toF32(ggml_tensor* x) {
+    return ggml_cast(ctx, x, GGML_TYPE_F32);
+  }
+
+  // Ensure a tensor is in the wanted layout/dtype, inserting conversion edges
+  // if not (rule R1). In L1 all tensors default to L_NCHW/F32 so this is a
+  // no-op; L2 flips the seeds and enables conversions.
+  ggml_tensor* ensure(AnnotatedTensor& ann, Layout wantLayout, ggml_type wantDtype) {
+    ggml_tensor* t = ann.t;
+    if(ann.layout != wantLayout) {
+      if(wantLayout == Layout::L_CS) {
+        GGML_ASSERT(ann.layout == Layout::L_NCHW);
+        t = toCS(t);
+      } else if(wantLayout == Layout::L_NCHW) {
+        GGML_ASSERT(ann.layout == Layout::L_CS);
+        t = toNCHW(t);
+      }
+      // L_MAT conversions are never inserted (C8-5): layout-orthogonal domain.
+      ann.layout = wantLayout;
+      ann.t = t;
+    }
+    if(ann.dtype != wantDtype) {
+      if(wantDtype == GGML_TYPE_F16) {
+        GGML_ASSERT(ann.dtype == GGML_TYPE_F32);
+        t = toF16(t);
+      } else {
+        GGML_ASSERT(wantDtype == GGML_TYPE_F32 && ann.dtype == GGML_TYPE_F16);
+        t = toF32(t);
+      }
+      ann.dtype = wantDtype;
+      ann.t = t;
+    }
+    return t;
+  }
+
   static int64_t onnxDimOf(ggml_tensor* t, int onnxIdx) {
     // ONNX dims are the reverse of ggml ne: dim 0 (N) is ne[3].
     return t->ne[3 - onnxIdx];
@@ -748,8 +818,11 @@ struct OnnxToGgml {
   // ---- main loop ----
 
   void build(const vector<pair<string, ggml_tensor*>>& inputs) {
-    for(auto& kv : inputs)
+    for(auto& kv : inputs) {
       tensors[kv.first] = kv.second;
+      // Graph inputs are uploaded in NCHW/F32 (F10): L1 default domain.
+      annTensors[kv.first] = {kv.second, Layout::L_NCHW, GGML_TYPE_F32};
+    }
 
     prescanSilu();
     prescanRms();
@@ -768,26 +841,27 @@ struct OnnxToGgml {
          (absorbedSiluNodes.count(node.name()) > 0 || absorbedRmsNodes.count(node.name()) > 0))
         continue;
 
-      auto in = [&](int i) -> ggml_tensor* {
+      auto in = [&](int i) -> AnnotatedTensor {
         testAssert(i < node.input_size());
         const string& name = node.input(i);
         if(name.empty())
           throw StringError("VULKAN backend: op " + op + " is missing an optional input the interpreter requires");
-        auto it = tensors.find(name);
-        if(it != tensors.end())
+        auto it = annTensors.find(name);
+        if(it != annTensors.end())
           return it->second;
         // Inputs that are initializers (weights, scalars, RoPE tables) are
         // materialized as F32 tensors on first use.
         if(findInitializer(name) != NULL)
-          return initializerTensor(name, GGML_TYPE_F32);
+          return {initializerTensor(name, GGML_TYPE_F32), Layout::L_NCHW, GGML_TYPE_F32};
         throw StringError("VULKAN backend: tensor '" + name + "' used by op " + op + " was not produced yet (graph not topologically ordered?)");
       };
-      auto registerOut = [&](ggml_tensor* t) {
+      auto registerOut = [&](ggml_tensor* t, Layout lay = Layout::L_NCHW, ggml_type dt = GGML_TYPE_F32) {
         tensors[outName] = t;
+        annTensors[outName] = {t, lay, dt};
       };
 
       if(op == "Conv") {
-        ggml_tensor* x = in(0);
+        ggml_tensor* x = in(0).t;
         // B1: conv weights are stored natively in F16 (ggml-vulkan converts
         // F32 operands to F16 every eval on coopmat2 devices, and im2col
         // emits F16 regardless).
@@ -819,13 +893,15 @@ struct OnnxToGgml {
         // B1: when the right operand is a stored weight, keep it natively F16
         // to skip the per-eval F32->F16 conversion in ggml_vk_mul_mat. Live
         // (non-initializer) operands stay F32.
-        ggml_tensor* b = in(1);
+        ggml_tensor* b;
         if(findInitializer(node.input(1)) != NULL)
           b = initializerTensor(node.input(1), GGML_TYPE_F16);
-        registerOut(matmul(in(0), b));
+        else
+          b = in(1).t;
+        registerOut(matmul(in(0).t, b));
       }
       else if(op == "Add") {
-        registerOut(binary(in(0), in(1), 0));
+        registerOut(binary(in(0).t, in(1).t, 0));
       }
       else if(op == "Mul") {
         auto itSilu = siluFusions.find(outName);
@@ -836,7 +912,7 @@ struct OnnxToGgml {
           registerOut(ggml_swiglu_split(ctx, a, gate));
         }
         else {
-          registerOut(binary(in(0), in(1), 1));
+          registerOut(binary(in(0).t, in(1).t, 1));
         }
       }
       else if(op == "Div") {
@@ -847,7 +923,7 @@ struct OnnxToGgml {
           // [C, W, H, b], run rms_norm (per-position over channels), multiply by
           // the per-channel weight, and permute back to NCHW.
           const RmsFusion& f = itR->second;
-          ggml_tensor* x = tensors.count(f.xSrc) > 0 ? tensors[f.xSrc] : in(0);
+          ggml_tensor* x = tensors.count(f.xSrc) > 0 ? tensors[f.xSrc] : in(0).t;
           ggml_tensor* w = initializerTensor(f.weightSrc, GGML_TYPE_F32);
           // permute: ne2 (C) -> ne0. result->ne[p_i] = a->ne[i]
           ggml_tensor* p = ggml_permute(ctx, x, 1, 2, 0, 3);       // [C, W, H, b]
@@ -864,33 +940,36 @@ struct OnnxToGgml {
           // The weight Mul was absorbed too, so register this result under both
           // the Div output and the Mul output names.
           tensors[outName] = back;
-          if(!f.mulOut.empty())
+          annTensors[outName] = {back, Layout::L_NCHW, GGML_TYPE_F32};
+          if(!f.mulOut.empty()) {
             tensors[f.mulOut] = back;
+            annTensors[f.mulOut] = {back, Layout::L_NCHW, GGML_TYPE_F32};
+          }
         }
         else {
-          registerOut(binary(in(0), in(1), 2));
+          registerOut(binary(in(0).t, in(1).t, 2));
         }
       }
       else if(op == "Sub") {
-        registerOut(binary(in(0), in(1), 3));
+        registerOut(binary(in(0).t, in(1).t, 3));
       }
       else if(op == "Relu") {
-        registerOut(ggml_relu(ctx, in(0)));
+        registerOut(ggml_relu(ctx, in(0).t));
       }
       else if(op == "Sigmoid") {
-        registerOut(ggml_sigmoid(ctx, in(0)));
+        registerOut(ggml_sigmoid(ctx, in(0).t));
       }
       else if(op == "Tanh") {
-        registerOut(ggml_tanh(ctx, in(0)));
+        registerOut(ggml_tanh(ctx, in(0).t));
       }
       else if(op == "Softplus") {
-        registerOut(ggml_softplus(ctx, in(0)));
+        registerOut(ggml_softplus(ctx, in(0).t));
       }
       else if(op == "Sqrt") {
-        registerOut(ggml_sqrt(ctx, in(0)));
+        registerOut(ggml_sqrt(ctx, in(0).t));
       }
       else if(op == "Identity") {
-        registerOut(in(0));
+        registerOut(in(0).t);
       }
       else if(op == "Pow") {
         // Only Pow(x, const 2) is used (RMSNorm squaring).
@@ -898,7 +977,7 @@ struct OnnxToGgml {
         testAssert(e != NULL);
         vector<float> expo = initializerFloats(*e);
         testAssert(expo.size() == 1 && expo[0] == 2.0f);
-        ggml_tensor* x = in(0);
+        ggml_tensor* x = in(0).t;
         registerOut(ggml_mul(ctx, x, x));
       }
       else if(op == "ReduceMean" || op == "ReduceSum" || op == "ReduceMax") {
@@ -906,16 +985,16 @@ struct OnnxToGgml {
         testAssert(axes != NULL);
         vector<int64_t> ax = initializerInt64(*axes);
         if(op == "ReduceMax")
-          registerOut(reduceMaxAxes(in(0), ax));
+          registerOut(reduceMaxAxes(in(0).t, ax));
         else
-          registerOut(reduceAxes(in(0), ax, op == "ReduceSum"));
+          registerOut(reduceAxes(in(0).t, ax, op == "ReduceSum"));
       }
       else if(op == "Gather") {
         int64_t axis = 0;
         if(hasAttr(node, "axis"))
           axis = getAttr(node, "axis").i();
         ggml_tensor* idx = initializerTensor(node.input(1), GGML_TYPE_I32);
-        registerOut(gather(in(0), idx, axis));
+        registerOut(gather(in(0).t, idx, axis));
       }
       else if(op == "Transpose") {
         vector<int64_t> perm;
@@ -928,27 +1007,27 @@ struct OnnxToGgml {
           for(int i = 0; i < 4; i++)
             perm.push_back(3 - i);
         }
-        registerOut(transposeOp(in(0), perm));
+        registerOut(transposeOp(in(0).t, perm));
       }
       else if(op == "Reshape") {
         const onnx::TensorProto* shape = findInitializer(node.input(1));
         testAssert(shape != NULL);
-        registerOut(reshapeOp(in(0), initializerInt64(*shape)));
+        registerOut(reshapeOp(in(0).t, initializerInt64(*shape)));
       }
       else if(op == "Concat") {
         int64_t axis = getAttr(node, "axis").i();
         testAssert(axis >= 0 && axis < 4);
         int ggmlAxis = 3 - (int)axis;
-        ggml_tensor* acc = in(0);
+        ggml_tensor* acc = in(0).t;
         for(int i = 1; i < node.input_size(); i++)
-          acc = ggml_concat(ctx, acc, in(i), ggmlAxis);
+          acc = ggml_concat(ctx, acc, in(i).t, ggmlAxis);
         registerOut(acc);
       }
       else if(op == "Softmax") {
         int64_t axis = getAttr(node, "axis").i();
         if(axis != 3)
           throw StringError("VULKAN backend: Softmax is only supported on the last ONNX axis");
-        registerOut(ggml_soft_max(ctx, in(0)));
+        registerOut(ggml_soft_max(ctx, in(0).t));
       }
       else {
         throw StringError("VULKAN backend: unsupported ONNX op '" + op + "'");
