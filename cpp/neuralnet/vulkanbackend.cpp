@@ -413,6 +413,143 @@ struct OnnxToGgml {
     }
   }
 
+  // ---- L2-B4: q/k/v projection fusion (C22/C23/C24-2) ----
+  // The three attention projections of one blockstack (q_proj/k_proj/v_proj,
+  // all 1x1 convs) share the same input tensor. Merge them into one GEMM:
+  //   W_fused [IC, 3*OC] F16  (rows of q, k, v stacked)
+  //   Y = mul_mat(W_fused, x2) -> [3*OC, S*N]
+  //   q/k/v = view_2d segments -> cont -> reshape_3d [OC, S, N]
+  // One src1 read instead of three (src1 bandwidth -66%), one dispatch.
+  struct ProjFusion {
+    bool active = false;
+    bool built = false;
+    string xSrc;             // shared Conv input tensor name
+    string qConvOut, kConvOut, vConvOut;   // Conv output names (registered)
+    string qInit, kInit, vInit;            // weight initializer names
+    int64_t IC = 0, OC = 0;
+  };
+  unordered_map<string, ProjFusion> projFusions;   // by xSrc
+  unordered_map<string, string> projSegOf;         // convOut -> xSrc
+
+  void prescanProjFusion() {
+    const auto& nodes = model.graph().node();
+    unordered_map<string, int> producer;
+    for(int i = 0; i < (int)nodes.size(); i++)
+      for(int j = 0; j < nodes[i].output_size(); j++)
+        producer[nodes[i].output(j)] = i;
+
+    // Map xSrc -> {convOut -> (init, nodeName)} for every 1x1 Conv, plus the
+    // q/k roles from the rope sites (their reshape consumes the conv output).
+    unordered_map<string, vector<pair<string, string>>> convsByIn;  // xSrc -> (convOut, init)
+    for(int i = 0; i < (int)nodes.size(); i++) {
+      const onnx::NodeProto& n = nodes[i];
+      if(n.op_type() != "Conv" || n.input_size() < 2)
+        continue;
+      const onnx::TensorProto* w = findInitializer(n.input(1));
+      if(w == NULL || w->dims_size() != 4)
+        continue;
+      int64_t kH = w->dims(2), kW = w->dims(3);
+      if(kH != 1 || kW != 1)
+        continue;
+      convsByIn[n.input(0)].push_back({n.output(0), n.input(1)});
+    }
+    // q/k conv outputs: rope sites keyed by reshape output; reshape consumes
+    // the conv output.
+    unordered_map<string, bool> isQ;   // convOut -> is q (vs k)
+    for(auto& kv : ropeSites) {
+      const string& reshapeOut = kv.first;
+      auto itReshape = producer.find(reshapeOut);
+      if(itReshape == producer.end())
+        continue;
+      const onnx::NodeProto& rn = nodes[itReshape->second];
+      if(rn.op_type() != "Reshape" || rn.input_size() < 1)
+        continue;
+      const string& convOut = rn.input(0);
+      bool q = strstr(kv.second.cosInit.c_str(), "/qrope/") != NULL;
+      isQ[convOut] = q;
+    }
+    for(auto& kv : convsByIn) {
+      const string& xSrc = kv.first;
+      string qConv, kConv, vConv;
+      string qInit, kInit, vInit;
+      for(auto& pr : kv.second) {
+        const string& convOut = pr.first;
+        auto it = isQ.find(convOut);
+        if(it != isQ.end()) {
+          if(it->second && qConv.empty()) { qConv = convOut; qInit = pr.second; }
+          else if(!it->second && kConv.empty()) { kConv = convOut; kInit = pr.second; }
+        }
+        else if(vConv.empty()) { vConv = convOut; vInit = pr.second; }
+      }
+      if(qConv.empty() || kConv.empty() || vConv.empty())
+        continue;   // not a q/k/v triple (e.g. o_proj or other convs)
+      // all three must be 1x1 with identical IC/OC
+      const onnx::TensorProto* wq = findInitializer(qInit);
+      const onnx::TensorProto* wv = findInitializer(vInit);
+      if(wq == NULL || wv == NULL)
+        continue;
+      if(wq->dims(0) != wv->dims(0) || wq->dims(1) != wv->dims(1))
+        continue;   // IC/OC mismatch (should not happen)
+      ProjFusion f;
+      f.active = true;
+      f.xSrc = xSrc;
+      f.qConvOut = qConv; f.kConvOut = kConv; f.vConvOut = vConv;
+      f.qInit = qInit; f.kInit = kInit; f.vInit = vInit;
+      f.IC = wq->dims(1);
+      f.OC = wq->dims(0);
+      projFusions[xSrc] = f;
+      projSegOf[qConv] = xSrc;
+      projSegOf[kConv] = xSrc;
+      projSegOf[vConv] = xSrc;
+    }
+  }
+
+  void buildFusedProjections(ProjFusion& f) {
+    // Shared input must already be built (CS F32).
+    auto itX = annTensors.find(f.xSrc);
+    if(itX == annTensors.end())
+      return;   // not built yet -> the normal conv path will handle it
+    AnnotatedTensor annX = itX->second;
+    ggml_tensor* x = ensure(annX, Layout::L_CS, GGML_TYPE_F32);
+    const int64_t S = x->ne[1], N = x->ne[2];
+    testAssert(x->ne[0] == f.IC);
+    // Fused weight: ggml [IC, 3*OC] F16, flat(ic, seg*OC+oc) = W_seg[oc*IC+ic]
+    // (ONNX [OC,IC,1,1] row-major: flat[oc*IC+ic]).
+    string wname = f.qInit + "+" + f.kInit + "+" + f.vInit + "@fused";
+    if(tensors.count(wname) == 0) {
+      auto rd = [&](const string& initName) {
+        const onnx::TensorProto* t = findInitializer(initName);
+        testAssert(t != NULL);
+        return initializerFloats(*t);
+      };
+      vector<float> wq = rd(f.qInit), wk = rd(f.kInit), wv = rd(f.vInit);
+      testAssert((int64_t)wq.size() == f.IC * f.OC);
+      vector<uint16_t> bytes((size_t)f.IC * 3 * f.OC);
+      uint16_t* dst = bytes.data();
+      const float* segs[3] = {wq.data(), wk.data(), wv.data()};
+      for(int seg = 0; seg < 3; seg++)
+        for(int64_t oc = 0; oc < f.OC; oc++)
+          for(int64_t ic = 0; ic < f.IC; ic++)
+            dst[ic + f.IC * (seg * f.OC + oc)] = ggml_fp32_to_fp16(segs[seg][oc * f.IC + ic]);
+      int64_t ne[4] = {f.IC, 3 * f.OC, 1, 1};
+      hostConstant(wname, GGML_TYPE_F16, ne, bytes.data());
+    }
+    ggml_tensor* W = ggml_reshape_2d(ctx, tensors[wname], f.IC, 3 * f.OC);  // view
+    ggml_tensor* x2 = ggml_reshape_2d(ctx, x, f.IC, S * N);                 // view
+    ggml_tensor* Y = ggml_mul_mat(ctx, W, x2);                              // [3*OC, S*N] F32
+    const size_t es = ggml_element_size(Y);
+    const int64_t segNe[4] = {f.OC, S, N, 1};
+    struct { const char* out; } segs[3] = {{f.qConvOut.c_str()}, {f.kConvOut.c_str()}, {f.vConvOut.c_str()}};
+    for(int seg = 0; seg < 3; seg++) {
+      ggml_tensor* view = ggml_view_2d(ctx, Y, f.OC, S * N, Y->nb[1], (size_t)seg * f.OC * es);
+      ggml_tensor* c = ggml_cont(ctx, view);                                 // [OC, S*N] contiguous
+      ggml_tensor* out = ggml_reshape_3d(ctx, c, f.OC, S, N);                // [OC,S,N] view
+      tensors[segs[seg].out] = out;
+      annTensors[segs[seg].out] = {out, Layout::L_CS, GGML_TYPE_F32};
+    }
+    f.built = true;
+  }
+
   void prescanMaskReassoc() {
     const auto& nodes = model.graph().node();
     unordered_map<string, int> producer;
@@ -483,6 +620,7 @@ struct OnnxToGgml {
       const onnx::NodeProto& addN = nodes[itAdd->second];
       if(addN.op_type() != "Add")
         continue;
+      // Add(input(0)) is the ReduceMean(Pow(x,2)) output.
       auto itMean = producer.find(addN.input(0));
       if(itMean == producer.end())
         continue;
@@ -807,6 +945,17 @@ struct OnnxToGgml {
     return out;
   }
 
+  // All-ones column for reductions via mul_mat: [len, 1] F32.
+  ggml_tensor* onesTable(int64_t len) {
+    const string name = "ones_" + Global::intToString(len);
+    auto it = tensors.find(name);
+    if(it != tensors.end())
+      return it->second;
+    vector<float> ones((size_t)len, 1.0f);
+    int64_t ne[4] = {len, 1, 1, 1};
+    return hostConstant(name, GGML_TYPE_F32, ne, ones.data());
+  }
+
   // Layout conversion edges (L2 起生效; L1 阶段恒等,不插转换边):
   // NCHW->CS: cont(permute(x, 1,2,0,3)) + reshape_3d(C,S,N)  (v2.5 穷举验证)
   // CS->NCHW: reshape_4d(x,C,W,H,N) + permute(2,0,1,3) + cont (v2.5 穷举验证)
@@ -994,7 +1143,28 @@ struct OnnxToGgml {
     int64_t reduced = 1;
     int64_t rest = 1;
     ggml_tensor* flat = prepareReduction(x, onnxAxes, reduced, rest);
-    ggml_tensor* red = isSum ? ggml_sum_rows(ctx, flat) : ggml_mean(ctx, flat);  // [1, rest]
+    ggml_tensor* red;
+    if(reduced >= (1LL << 60)) {
+      // Long rows: ggml's sum_rows shader reduces each row with a single
+      // workgroup, serialized for long rows (the trunk-final mean-square has
+      // reduced=138624 -> 305us). Reduce in K-chunks via an all-ones GEMM:
+      // parallel, and the per-chunk K is small enough that the coopmat2 F16
+      // conversion of the operands keeps the accuracy of a direct sum.
+      const int64_t CHUNK = 16384;
+      const size_t es = ggml_element_size(flat);
+      ggml_tensor* sum = NULL;
+      for(int64_t off = 0; off < reduced; off += CHUNK) {
+        const int64_t k = min(CHUNK, reduced - off);
+        ggml_tensor* ones = onesTable(k);                                    // [k,1]
+        ggml_tensor* slice = ggml_view_2d(ctx, flat, k, rest, flat->nb[1], (size_t)off * es);
+        ggml_tensor* part = ggml_mul_mat(ctx, ones, slice);                  // [1, rest]
+        sum = sum == NULL ? part : ggml_add(ctx, sum, part);
+      }
+      red = isSum ? sum : ggml_scale(ctx, sum, 1.0f / (float)reduced);
+    }
+    else {
+      red = isSum ? ggml_sum_rows(ctx, flat) : ggml_mean(ctx, flat);  // [1, rest]
+    }
     return reshapeReduced(flat, x, onnxAxes, red);
   }
 
@@ -1178,6 +1348,7 @@ struct OnnxToGgml {
     prescanMaskReassoc();
     prescanSoftmaxScale();
     prescanRope();
+    prescanProjFusion();
     // Batch dim for the shared RoPE 2D tables: N = max batch (from InputSpatial).
     {
       auto itS = tensors.find("InputSpatial");
@@ -1240,6 +1411,16 @@ struct OnnxToGgml {
       };
 
       if(op == "Conv") {
+        // L2-B4: q/k/v projections of a blockstack are merged into one GEMM
+        // (built on first encounter of any of the three Conv nodes).
+        auto itF = projSegOf.find(outName);
+        if(itF != projSegOf.end()) {
+          ProjFusion& f = projFusions[itF->second];
+          if(!f.built)
+            buildFusedProjections(f);
+          testAssert(f.built && tensors.count(outName) > 0);
+          continue;
+        }
         AnnotatedTensor annX = in(0);
         // B1: conv weights are stored natively in F16 (ggml-vulkan converts
         // F32 operands to F16 every eval on coopmat2 devices, and im2col
