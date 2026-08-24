@@ -212,7 +212,39 @@ struct OnnxToGgml {
       // x must be the same tensor feeding both Pow and Div
       if(sqN.input(0) != n.input(0))
         continue;
-      // eps must be a scalar initializer
+      // ---- structural guards: only fuse the exact RMSNorm pattern, otherwise
+      // fall back to the original chain (avoid silently wrong results on other
+      // model variants) ----
+      // 1) Pow exponent must be exactly 2
+      {
+        const onnx::TensorProto* powInit = findInitializer(sqN.input(1));
+        if(powInit == NULL)
+          continue;
+        vector<float> pv = initializerFloats(*powInit);
+        if(pv.size() != 1 || pv[0] != 2.0f)
+          continue;
+      }
+      // 2) ReduceMean must reduce exactly the channel axis (ONNX axis 1) with
+      // keepdims. The axes come from an initializer; also accept the common
+      // attribute form.
+      {
+        const onnx::TensorProto* axInit = NULL;
+        for(int a = 0; a < meanN.input_size(); a++)
+          if(findInitializer(meanN.input(a)) != NULL)
+            axInit = findInitializer(meanN.input(a));
+        if(axInit != NULL) {
+          vector<int64_t> ax = initializerInt64(*axInit);
+          if(ax.size() != 1 || ax[0] != 1)
+            continue;
+        }
+        bool keepdims = true;
+        for(const onnx::AttributeProto& at : meanN.attribute())
+          if(at.name() == "keepdims")
+            keepdims = at.i() != 0;
+        if(!keepdims)
+          continue;
+      }
+      // 3) eps must be a scalar initializer
       const onnx::TensorProto* epsInit = findInitializer(addN.input(1));
       if(epsInit == NULL)
         continue;
@@ -224,15 +256,25 @@ struct OnnxToGgml {
       f.xSrc = n.input(0);
       f.eps = ev[0];
       // The weight Mul follows the Div: find the consumer Mul(node output, weight)
-      // and record the weight initializer name and the Mul node name.
+      // and record the weight initializer name and the Mul node name. The
+      // weight must be a per-channel [1,1,C,1] tensor, not a scalar.
       for(int j = 0; j < (int)nodes.size(); j++) {
         const onnx::NodeProto& c = nodes[j];
-        if(c.op_type() == "Mul" && c.input(0) == n.output(0) && findInitializer(c.input(1)) != NULL) {
-          f.weightSrc = c.input(1);
-          f.mulOut = c.output(0);
-          absorbedRmsNodes.insert(c.name());
-          break;
-        }
+        if(c.op_type() != "Mul" || c.input(0) != n.output(0))
+          continue;
+        const onnx::TensorProto* wInit = findInitializer(c.input(1));
+        if(wInit == NULL)
+          continue;
+        // weight dims: expect [1,1,C,1] (ggml ne [1,1,C,1]); reject scalars
+        int64_t ne4[4] = {1, 1, 1, 1};
+        for(int d = 0; d < wInit->dims_size() && d < 4; d++)
+          ne4[3 - d] = wInit->dims(d);
+        if(ne4[0] == 1 && ne4[1] == 1 && ne4[2] == 1 && ne4[3] == 1)
+          continue;   // scalar weight: keep the original chain
+        f.weightSrc = c.input(1);
+        f.mulOut = c.output(0);
+        absorbedRmsNodes.insert(c.name());
+        break;
       }
       if(f.weightSrc.empty())
         continue;   // no weight Mul: keep the original chain
@@ -285,6 +327,17 @@ struct OnnxToGgml {
         f.active = true;
         f.siluInput = aName;
         f.gateSrc = n.input(1 - inIdx);
+        // Guard: the gate must be produced by a compute node (Conv/MatMul),
+        // not a graph input or initializer. Otherwise plain swish activations
+        // (a*sigmoid(a)) followed by a mask Mul get misidentified as SwiGLU.
+        {
+          auto itGate = producer.find(f.gateSrc);
+          if(itGate == producer.end())
+            continue;   // gate is a graph input (e.g. InputMask): not a SwiGLU
+          const onnx::NodeProto& gateN = nodes[itGate->second];
+          if(gateN.op_type() != "Conv" && gateN.op_type() != "MatMul")
+            continue;
+        }
         siluFusions[n.output(0)] = f;
         absorbedSiluNodes.insert(prod.name());
         absorbedSiluNodes.insert(sigNodeName);
@@ -691,7 +744,10 @@ struct OnnxToGgml {
 
       // S1 fusion: the Sigmoid/Mul pieces of a SwiGLU, and the Pow/ReduceMean/
       // Add/Sqrt pieces of an RMSNorm chain, are skipped (rebuilt as single ops).
-      if(absorbedSiluNodes.count(node.name()) > 0 || absorbedRmsNodes.count(node.name()) > 0)
+      // Skip only named nodes: an empty name would otherwise absorb every
+      // following unnamed node.
+      if(!node.name().empty() &&
+         (absorbedSiluNodes.count(node.name()) > 0 || absorbedRmsNodes.count(node.name()) > 0))
         continue;
 
       auto in = [&](int i) -> ggml_tensor* {
@@ -747,10 +803,10 @@ struct OnnxToGgml {
       else if(op == "Mul") {
         auto itSilu = siluFusions.find(outName);
         if(itSilu != siluFusions.end() && itSilu->second.active) {
-          // SwiGLU: silu(a) * gate
+          // SwiGLU: silu(a) * gate, fused into a single swiglu kernel
           ggml_tensor* a = tensors.count(itSilu->second.siluInput) > 0 ? tensors[itSilu->second.siluInput] : initializerTensor(itSilu->second.siluInput, GGML_TYPE_F32);
           ggml_tensor* gate = tensors.count(itSilu->second.gateSrc) > 0 ? tensors[itSilu->second.gateSrc] : initializerTensor(itSilu->second.gateSrc, GGML_TYPE_F32);
-          registerOut(ggml_mul(ctx, ggml_silu(ctx, a), gate));
+          registerOut(ggml_swiglu_split(ctx, a, gate));
         }
         else {
           registerOut(binary(in(0), in(1), 1));
