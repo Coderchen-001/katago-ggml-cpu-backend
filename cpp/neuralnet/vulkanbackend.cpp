@@ -216,6 +216,82 @@ struct OnnxToGgml {
   unordered_map<string, MaskReassoc> maskReassocs;   // by Add output name
   unordered_set<string> absorbedMaskMulNodes;        // the Mul(B, InputMask) nodes
 
+  // ---- L2-B2: softmax scale absorption (C19-2/C20-2) ----
+  // Pattern: Softmax(Add(Mul(scores, scale_init), mask)) where scale_init is a
+  // scalar initializer (1/sqrt(D)) and mask is a per-key additive bias.
+  // Rebuilt as ggml_soft_max_ext(scores, mask_full, scale, 0) -- one fused
+  // kernel instead of Mul+Add+Softmax. The mask must be materialized as
+  // [S_k, S_q, 1, N] (F21; soft_max_ext asserts mask->ne[1] >= a->ne[1]).
+  // Map: Softmax output name -> { scores, mask, scale }.
+  struct SoftmaxScaleAbsorb {
+    bool active = false;
+    string scoresSrc;  // raw scores tensor (before Mul(scale))
+    string maskSrc;    // additive mask tensor (InputMask/bias/reshape)
+    float scale = 1.0f;
+  };
+  unordered_map<string, SoftmaxScaleAbsorb> softmaxAbsorbs;   // by Softmax output
+  // Materialized [S_k,S_q,1,N] mask, shared by all attention softmaxes.
+  ggml_tensor* maskFullShared = NULL;
+  int64_t maskFullSK = 0, maskFullSQ = 0, maskFullN = 0;
+
+  void prescanSoftmaxScale() {
+    const auto& nodes = model.graph().node();
+    unordered_map<string, int> producer;
+    for(int i = 0; i < (int)nodes.size(); i++)
+      for(int j = 0; j < nodes[i].output_size(); j++)
+        producer[nodes[i].output(j)] = i;
+
+    for(int i = 0; i < (int)nodes.size(); i++) {
+      const onnx::NodeProto& n = nodes[i];
+      if(n.op_type() != "Softmax")
+        continue;
+      bool axisLast = true;
+      for(const onnx::AttributeProto& a : n.attribute())
+        if(a.name() == "axis" && a.i() != 3)
+          axisLast = false;
+      if(!axisLast)
+        continue;
+      auto itAdd = producer.find(n.input(0));
+      if(itAdd == producer.end())
+        continue;
+      const onnx::NodeProto& addN = nodes[itAdd->second];
+      if(addN.op_type() != "Add" || addN.input_size() != 2)
+        continue;
+      // One Add input is Mul(scores, scale), the other is the mask.
+      SoftmaxScaleAbsorb f;
+      int mulIdx = -1;
+      for(int k = 0; k < 2; k++) {
+        auto itMul = producer.find(addN.input(k));
+        if(itMul == producer.end())
+          continue;
+        const onnx::NodeProto& mulN = nodes[itMul->second];
+        if(mulN.op_type() != "Mul" || mulN.input_size() != 2)
+          continue;
+        // scale must be a scalar initializer; the other input is scores.
+        const onnx::TensorProto* sc = NULL;
+        int scIdx = -1;
+        for(int j = 0; j < 2; j++) {
+          sc = findInitializer(mulN.input(j));
+          if(sc != NULL) { scIdx = j; break; }
+        }
+        if(sc == NULL)
+          continue;
+        vector<float> sv = initializerFloats(*sc);
+        if(sv.size() != 1)
+          continue;
+        f.scale = sv[0];
+        f.scoresSrc = mulN.input(1 - scIdx);
+        f.maskSrc = addN.input(1 - k);
+        mulIdx = k;
+        break;
+      }
+      if(mulIdx < 0)
+        continue;
+      f.active = true;
+      softmaxAbsorbs[n.output(0)] = f;
+    }
+  }
+
   void prescanMaskReassoc() {
     const auto& nodes = model.graph().node();
     unordered_map<string, int> producer;
@@ -928,6 +1004,7 @@ struct OnnxToGgml {
     prescanSilu();
     prescanRms();
     prescanMaskReassoc();
+    prescanSoftmaxScale();
 
     for(const onnx::NodeProto& node : model.graph().node()) {
       const string& op = node.op_type();
@@ -1219,7 +1296,31 @@ struct OnnxToGgml {
         int64_t axis = getAttr(node, "axis").i();
         if(axis != 3)
           throw StringError("VULKAN backend: Softmax is only supported on the last ONNX axis");
-        registerOut(ggml_soft_max(ctx, in(0).t));
+        auto itS = softmaxAbsorbs.find(outName);
+        if(itS != softmaxAbsorbs.end() && itS->second.active) {
+          // C19-2: Softmax(Add(Mul(scores, scale), mask)) ->
+          // soft_max_ext(scores, mask_full, scale). scores is [S_k, S_q, H, N]
+          // (ggml ne from matmul); mask must be materialized [S_k,S_q,1,N].
+          const SoftmaxScaleAbsorb& f = itS->second;
+          AnnotatedTensor annS = annTensors.count(f.scoresSrc) > 0 ? annTensors[f.scoresSrc] : in(0);
+          // The mask lives in the attention chain's domain (NCHW in L2-A);
+          // pull it from the annotation table under its producer name.
+          AnnotatedTensor annM = annTensors.count(f.maskSrc) > 0 ? annTensors[f.maskSrc] : in(1);
+          GGML_ASSERT(annS.layout == annM.layout);   // both NCHW in L2-A
+          const int64_t SK = annS.t->ne[0], SQ = annS.t->ne[1], N = annS.t->ne[3];
+          // Materialize the shared mask once; reuse for all attention blocks.
+          if(maskFullShared == NULL || maskFullSK != SK || maskFullSQ != SQ || maskFullN != N) {
+            int64_t targetNe[4] = {SK, SQ, 1, N};
+            maskFullShared = ggml_repeat(ctx, annM.t, shapeRefFor(targetNe));
+            maskFullSK = SK; maskFullSQ = SQ; maskFullN = N;
+          }
+          registerOut(ggml_soft_max_ext(ctx, annS.t, maskFullShared, f.scale, 0.0f),
+                      annS.layout, GGML_TYPE_F32);
+        }
+        else {
+          AnnotatedTensor ann = in(0);
+          registerOut(ggml_soft_max(ctx, ann.t), ann.layout, GGML_TYPE_F32);
+        }
       }
       else {
         throw StringError("VULKAN backend: unsupported ONNX op '" + op + "'");
