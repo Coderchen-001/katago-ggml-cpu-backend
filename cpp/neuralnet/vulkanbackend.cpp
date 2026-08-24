@@ -230,6 +230,7 @@ struct OnnxToGgml {
     float scale = 1.0f;
   };
   unordered_map<string, SoftmaxScaleAbsorb> softmaxAbsorbs;   // by Softmax output
+  unordered_set<string> absorbedSoftmaxNodes;   // the absorbed Mul/Add node names
   // Materialized [S_k,S_q,1,N] mask, shared by all attention softmaxes.
   ggml_tensor* maskFullShared = NULL;
   int64_t maskFullSK = 0, maskFullSQ = 0, maskFullN = 0;
@@ -260,6 +261,7 @@ struct OnnxToGgml {
       // One Add input is Mul(scores, scale), the other is the mask.
       SoftmaxScaleAbsorb f;
       int mulIdx = -1;
+      string mulNodeName, addNodeName = addN.name();
       for(int k = 0; k < 2; k++) {
         auto itMul = producer.find(addN.input(k));
         if(itMul == producer.end())
@@ -283,12 +285,131 @@ struct OnnxToGgml {
         f.scoresSrc = mulN.input(1 - scIdx);
         f.maskSrc = addN.input(1 - k);
         mulIdx = k;
+        mulNodeName = mulN.name();
         break;
       }
       if(mulIdx < 0)
         continue;
       f.active = true;
       softmaxAbsorbs[n.output(0)] = f;
+      absorbedSoftmaxNodes.insert(mulNodeName);
+      absorbedSoftmaxNodes.insert(addNodeName);
+    }
+  }
+
+  // ---- L2-B3: RoPE zero-materialization (C18) ----
+  // In the CS domain the q/k reshape target [0,H,D,S] maps to a zero-copy
+  // reshape_4d(x, D, H, S, N) view [D,H,S,N] (head-major c=h*D+d). The whole
+  // rope subgraph (gather + Mul(cos) + Mul(sin) + Add) is rebuilt efficiently:
+  //   hsnd = cont(permute(3,0,1,2))(q)     // [H,S,N,D] contiguous (h fastest)
+  //   q2   = reshape_2d(H*S*N, D)          // rows (h,s,n), cols d
+  //   sw2  = get_rows(q2, swapidx[32])     // row-internal channel-pair swap;
+  //                                        // get_rows: dst[i0][d] = q2[i0][swapidx[d]]
+  //   out2 = q2*cos2 + sw2*sin2            // [H*S*N, D] (tables in same layout)
+  //   ret  = cont(permute(1,2,3,0))(reshape_4d(H,S,N,D)(out2))  // [D,H,S,N]
+  // get_rows' ne0 is H*S*N (2166) so its shader uses the x dimension well;
+  // the naive 3D-ids variant (ne0=H=6) wasted 506/512 lanes (393us/site).
+  // Verified exhaustively in l2b3-rope-verify.py / l2b3-fulltrace.py.
+  struct RopeSite {
+    bool active = false;
+    string swapIdxInit;  // ropeswapidx initializer
+    string cosInit;      // ropecos initializer
+    string sinInit;      // ropesinsigned initializer
+    int64_t D = 0, H = 0, S = 0;   // head dim / heads / positions (per site)
+    string t1MulName, t2MulName, addName;   // absorbed nodes (by node name)
+    string addOut;   // rope_out tensor name (the Add output)
+  };
+  unordered_map<string, RopeSite> ropeSites;      // by reshape output name
+  unordered_set<string> absorbedRopeNodes;        // absorbed Mul/Add node names
+  int64_t ropeIdsN = 0;                           // batch for the 2D tables
+
+  void prescanRope() {
+    const auto& nodes = model.graph().node();
+    unordered_map<string, int> producer;
+    for(int i = 0; i < (int)nodes.size(); i++)
+      for(int j = 0; j < nodes[i].output_size(); j++)
+        producer[nodes[i].output(j)] = i;
+
+    for(int i = 0; i < (int)nodes.size(); i++) {
+      const onnx::NodeProto& n = nodes[i];
+      if(n.op_type() != "Gather")
+        continue;
+      int64_t axis = 0;
+      for(const onnx::AttributeProto& a : n.attribute())
+        if(a.name() == "axis")
+          axis = a.i();
+      if(axis != 2)
+        continue;
+      // data = reshape output (q/k), indices = swapidx initializer
+      auto itData = producer.find(n.input(0));
+      if(itData == producer.end())
+        continue;
+      const onnx::NodeProto& reshapeN = nodes[itData->second];
+      if(reshapeN.op_type() != "Reshape")
+        continue;
+      const onnx::TensorProto* sw = findInitializer(n.input(1));
+      if(sw == NULL)
+        continue;
+      // Locate t1 = Mul(q, cos) and t2 = Mul(swap, sin), then Add(t1, t2).
+      RopeSite site;
+      site.active = true;
+      site.swapIdxInit = n.input(1);
+      string t1Out, t2Out, addOut;
+      for(int j = 0; j < (int)nodes.size(); j++) {
+        const onnx::NodeProto& c = nodes[j];
+        if(c.op_type() != "Mul" || c.input_size() != 2)
+          continue;
+        const string& a0 = c.input(0), a1 = c.input(1);
+        if((a0 == reshapeN.output(0) || a1 == reshapeN.output(0)) &&
+           (a0 == n.output(0) || a1 == n.output(0)))
+          continue;   // mul of q and swap? not part of the pattern
+        if(a0 == reshapeN.output(0) || a1 == reshapeN.output(0)) {
+          const string& other = (a0 == reshapeN.output(0)) ? a1 : a0;
+          if(strstr(other.c_str(), "cos") != NULL && site.cosInit.empty()) {
+            site.cosInit = other;
+            site.t1MulName = c.name();
+            t1Out = c.output(0);
+          }
+        }
+        else if(a0 == n.output(0) || a1 == n.output(0)) {
+          const string& other = (a0 == n.output(0)) ? a1 : a0;
+          if(strstr(other.c_str(), "sin") != NULL && site.sinInit.empty()) {
+            site.sinInit = other;
+            site.t2MulName = c.name();
+            t2Out = c.output(0);
+          }
+        }
+      }
+      if(site.cosInit.empty() || site.sinInit.empty() || t1Out.empty() || t2Out.empty())
+        continue;
+      // The Add consuming t1 and t2 is the rope output.
+      bool foundAdd = false;
+      for(int j = 0; j < (int)nodes.size(); j++) {
+        const onnx::NodeProto& c = nodes[j];
+        if(c.op_type() != "Add" || c.input_size() != 2)
+          continue;
+        if((c.input(0) == t1Out && c.input(1) == t2Out) ||
+           (c.input(0) == t2Out && c.input(1) == t1Out)) {
+          site.addName = c.name();
+          addOut = c.output(0);
+          foundAdd = true;
+          break;
+        }
+      }
+      if(!foundAdd)
+        continue;
+      // head dims from the cos table shape (1,H,D,S)
+      const onnx::TensorProto* ct = findInitializer(site.cosInit);
+      if(ct == NULL || ct->dims_size() != 4)
+        continue;
+      site.H = ct->dims(1);
+      site.D = ct->dims(2);
+      site.S = ct->dims(3);
+      site.addOut = addOut;
+      ropeSites[reshapeN.output(0)] = site;
+      absorbedRopeNodes.insert(site.t1MulName);
+      absorbedRopeNodes.insert(site.t2MulName);
+      absorbedRopeNodes.insert(site.addName);
     }
   }
 
@@ -633,7 +754,58 @@ struct OnnxToGgml {
     throw StringError("VULKAN backend: unsupported initializer type for '" + name + "'");
   }
 
+  // Host-generated constant (C27-3): create a weight-context tensor plus its
+  // upload bytes from arbitrary host data, bypassing ONNX initializers. Used
+  // for L2-B RoPE tables: ids[32,S,N] I32 (swapidx broadcast) and the CS-layout
+  // cos/sin tables. Cached by name like initializerTensor.
+  ggml_tensor* hostConstant(const string& name, ggml_type type, const int64_t ne[4], const void* data) {
+    auto it = tensors.find(name);
+    if(it != tensors.end()) {
+      testAssert(it->second->type == type);
+      return it->second;
+    }
+    size_t es = ggml_type_size(type);
+    size_t nbytes = es;
+    for(int i = 0; i < 4; i++)
+      nbytes *= (size_t)ne[i];
+    vector<uint8_t> bytes(nbytes);
+    memcpy(bytes.data(), data, nbytes);
+    initData[name] = std::move(bytes);
+    ggml_tensor* t = ggml_new_tensor_4d(wctx, type, ne[0], ne[1], ne[2], ne[3]);
+    ggml_set_name(t, name.c_str());
+    tensors[name] = t;
+    return t;
+  }
+
   // ---- shape helpers ----
+
+  // 2D variant for the efficient RoPE path: table laid out as [H*S*N, D]
+  // (flat(i0, d) = i0 + H*S*N*d, i0 = h + H*s + H*S*n), so the multiply
+  // operates on the same [H*S*N, D] tensor as get_rows' output.
+  ggml_tensor* ropeCosTable2D(const RopeSite& site, bool isSin) {
+    const string& initName = isSin ? site.sinInit : site.cosInit;
+    const string name = initName + (isSin ? "@2d_sin" : "@2d_cos");
+    auto it = tensors.find(name);
+    if(it != tensors.end())
+      return it->second;
+    const onnx::TensorProto* t = findInitializer(initName);
+    testAssert(t != NULL);
+    vector<float> src = initializerFloats(*t);
+    const int64_t H = site.H, D = site.D, S = site.S;
+    const int64_t N = ropeIdsN;   // batch from the shared ids table setup
+    testAssert(N > 0);
+    vector<float> dst((size_t)H * S * N * D);
+    for(int64_t h = 0; h < H; h++)
+      for(int64_t s = 0; s < S; s++)
+        for(int64_t n = 0; n < N; n++) {
+          const int64_t i0 = h + H * s + H * S * n;
+          for(int64_t d = 0; d < D; d++)
+            dst[i0 + H * S * N * d] = src[h * D * S + d * S + s];
+        }
+    int64_t ne[4] = {H * S * N, D, 1, 1};
+    ggml_tensor* out = hostConstant(name, GGML_TYPE_F32, ne, dst.data());
+    return out;
+  }
 
   // Layout conversion edges (L2 起生效; L1 阶段恒等,不插转换边):
   // NCHW->CS: cont(permute(x, 1,2,0,3)) + reshape_3d(C,S,N)  (v2.5 穷举验证)
@@ -1005,6 +1177,13 @@ struct OnnxToGgml {
     prescanRms();
     prescanMaskReassoc();
     prescanSoftmaxScale();
+    prescanRope();
+    // Batch dim for the shared RoPE 2D tables: N = max batch (from InputSpatial).
+    {
+      auto itS = tensors.find("InputSpatial");
+      if(itS != tensors.end())
+        ropeIdsN = itS->second->ne[3];
+    }
 
     for(const onnx::NodeProto& node : model.graph().node()) {
       const string& op = node.op_type();
@@ -1018,7 +1197,8 @@ struct OnnxToGgml {
       // following unnamed node.
       if(!node.name().empty() &&
          (absorbedSiluNodes.count(node.name()) > 0 || absorbedRmsNodes.count(node.name()) > 0 ||
-          absorbedMaskMulNodes.count(node.name()) > 0))
+          absorbedMaskMulNodes.count(node.name()) > 0 || absorbedRopeNodes.count(node.name()) > 0 ||
+          absorbedSoftmaxNodes.count(node.name()) > 0))
         continue;
 
       auto in = [&](int i) -> AnnotatedTensor {
@@ -1109,15 +1289,63 @@ struct OnnxToGgml {
         }
       }
       else if(op == "MatMul") {
-        // B1: when the right operand is a stored weight, keep it natively F16
-        // to skip the per-eval F32->F16 conversion in ggml_vk_mul_mat. Live
-        // (non-initializer) operands stay F32.
-        ggml_tensor* b;
-        if(findInitializer(node.input(1)) != NULL)
-          b = initializerTensor(node.input(1), GGML_TYPE_F16);
-        else
-          b = in(1).t;
-        registerOut(matmul(in(0).t, b));
+        AnnotatedTensor annA = in(0), annB = in(1);
+        if(annA.layout == Layout::L_MAT || annB.layout == Layout::L_MAT) {
+          // L_MAT domain attention (C18 verified):
+          //  scores = qT·k: qT [D,S_q,H,N] (transpose output, K=D at ne0) x
+          //    k [D,H,S,N] -> permute k to [D,S,H,N]; mul_mat -> [S_q,S_k,H,N].
+          //  sv = probs·vT: probs [S_q,S_k,H,N] x vT [D,S,H,N] (transpose
+          //    output). mul_mat(A,B) = A^T B with A [K,M], B [K,N]:
+          //    A = permute(v, 1,2,0,3) -> [S_k, D, H, N]
+          //    B = permute(probs, 1,0,2,3) -> [S_k, S_q, H, N]
+          //    -> [D, S_q, H, N].
+          GGML_ASSERT(annA.layout == annB.layout);   // L_MAT on both sides
+          if(outName.find("/scores") != string::npos || outName.find("scores") == 0) {
+            // scores[i,j] = sum_d q[d,i]*k[d,j]; softmax is along S_k (ONNX
+            // axis 3), which must sit at ne0. mul_mat(a,b) computes
+            // dst[m,n] = sum_k a[k,m]*b[k,n] -> [a.ne1, b.ne1]. With
+            //   a = permute(k, 0,2,1,3) [D,S,H,N]  (K=D, ne1=S_k)
+            //   b = permute(q, 0,2,1,3) [D,S,H,N]  (K=D, ne1=S_q)
+            // dst = [S_k, S_q, H, N], and dst[m,n] = scores_LMAT where
+            // ONNX scores[n,m] lives at (m=S_k,n=S_q): softmax along ne0=S_k.
+            // mul_mat needs contiguous (non-transposed) operands, so the
+            // permuted views are materialized.
+            ggml_tensor* a = annB.t;   // k [D,H,S,N]
+            if(a->ne[1] < a->ne[2])
+              a = ggml_cont(ctx, ggml_permute(ctx, a, 0, 2, 1, 3));   // -> [D,S,H,N]
+            ggml_tensor* b = annA.t;   // qT [D,H,S,N] (identity in L_MAT)
+            if(b->ne[1] < b->ne[2])
+              b = ggml_cont(ctx, ggml_permute(ctx, b, 0, 2, 1, 3));   // -> [D,S,H,N]
+            ggml_tensor* r = ggml_mul_mat(ctx, a, b);   // [S_k, S_q, H, N]
+            registerOut(r, Layout::L_MAT, GGML_TYPE_F32);
+          }
+          else if(outName.find("/sv") != string::npos) {
+            // sv[d,i] = sum_j probs[i,j] * v[d,j] (j = S_k contraction).
+            // vT (transpose) is identity in L_MAT, so v is [D,H,S,N].
+            // mul_mat(A,B) = A^T B with A [K,M], B [K,N]:
+            //   A = permute(v, 1,2,0,3) -> [S_k, D, H, N]  (K=S_k) [contiguous]
+            //   B = probs as-is [S_k, S_q, H, N]
+            //   -> [D, S_q, H, N].
+            ggml_tensor* a = ggml_cont(ctx, ggml_permute(ctx, annB.t, 1, 2, 0, 3)); // v [D,H,S,N]->[S_k,D,H,N]
+            ggml_tensor* b = annA.t;   // probs [S_k,S_q,H,N] as-is
+            ggml_tensor* r = ggml_mul_mat(ctx, a, b);   // [D, S_q, H, N]
+            registerOut(r, Layout::L_MAT, GGML_TYPE_F32);
+          }
+          else {
+            throw StringError("VULKAN backend: L_MAT MatMul with unrecognized role (" + outName + ")");
+          }
+        }
+        else {
+          // B1: when the right operand is a stored weight, keep it natively F16
+          // to skip the per-eval F32->F16 conversion in ggml_vk_mul_mat. Live
+          // (non-initializer) operands stay F32.
+          ggml_tensor* b;
+          if(findInitializer(node.input(1)) != NULL)
+            b = initializerTensor(node.input(1), GGML_TYPE_F16);
+          else
+            b = annB.t;
+          registerOut(matmul(annA.t, b));
+        }
       }
       else if(op == "Add") {
         auto itM = maskReassocs.find(outName);
@@ -1249,13 +1477,54 @@ struct OnnxToGgml {
         int64_t axis = 0;
         if(hasAttr(node, "axis"))
           axis = getAttr(node, "axis").i();
-        ggml_tensor* idx = initializerTensor(node.input(1), GGML_TYPE_I32);
-        // RoPE swaps run inside the NCHW attention chain (L2-A keeps the
-        // hand-written attention in NCHW; the 3D-ids zero-materialization is
-        // L2-B). Convert CS inputs back.
-        AnnotatedTensor ann = in(0);
-        ggml_tensor* x = ensure(ann, Layout::L_NCHW, GGML_TYPE_F32);
-        registerOut(gather(x, idx, axis));
+        // L2-B: if the gather's data input is a rope-site reshape output and it
+        // lives in L_MAT (built by the Reshape branch), rebuild the entire rope
+        // subgraph with 3D ids -- zero materializations (C18).
+        auto itRope = ropeSites.find(node.input(0));
+        if(itRope != ropeSites.end() && itRope->second.active) {
+          const RopeSite& site = itRope->second;
+          testAssert(axis == 2);
+          AnnotatedTensor ann = in(0);      // [D,H,S,N] L_MAT
+          GGML_ASSERT(ann.layout == Layout::L_MAT);
+          ggml_tensor* q = ann.t;           // [D,H,S,N]
+          const int64_t D = site.D, H = site.H, S = site.S;
+          const int64_t N = q->ne[3];
+          // Layout the tensor as [H,S,N,D] contiguous so get_rows' ne0 is
+          // large (its shader uses ne0 as the x dimension; ne0=H=6 wastes
+          // 506/512 lanes -- that was the 393us regression). Then flatten to
+          // [H*S*N, D]: rows are (h,s,n) with h fastest, columns are d.
+          // get_rows selects along ne1 (=D) with a 1D swapidx table:
+          //   dst[i0][i1] = a[i0][swapidx[i1]]  (row-internal channel swap).
+          ggml_tensor* hsnd = ggml_cont(ctx, ggml_permute(ctx, q, 3, 0, 1, 2)); // [H,S,N,D]
+          ggml_tensor* q2 = ggml_reshape_2d(ctx, hsnd, H * S * N, D);          // [H*S*N, D]
+          // 2) 1D swapidx as the row index (all sites share the same table)
+          ggml_tensor* ids = initializerTensor(site.swapIdxInit, GGML_TYPE_I32);
+          // 3) sw = get_rows(q2, ids) -> [H*S*N, D]
+          ggml_tensor* sw2 = ggml_get_rows(ctx, q2, ids);
+          // 4) rotate in 2D: t1 = q2*cos2, t2 = sw2*sin2, out = t1+t2, where
+          //    cos2/sin2 are the same [H*S*N, D] layout.
+          ggml_tensor* cos2 = ropeCosTable2D(site, false);
+          ggml_tensor* sin2 = ropeCosTable2D(site, true);
+          ggml_tensor* t1 = ggml_mul(ctx, q2, cos2);
+          ggml_tensor* t2 = ggml_mul(ctx, sw2, sin2);
+          ggml_tensor* out2 = ggml_add(ctx, t1, t2);                    // [H*S*N, D]
+          // 5) back to [D,H,S,N]: reshape [H,S,N,D] then permute to [D,H,S,N]
+          ggml_tensor* out4 = ggml_reshape_4d(ctx, out2, H, S, N, D);   // view
+          ggml_tensor* ret = ggml_cont(ctx, ggml_permute(ctx, out4, 1, 2, 3, 0)); // [D,H,S,N]
+          // Register under the rope_out (Add output) name; the gather's own
+          // output name (rope_swap) is only an intermediate.
+          tensors[site.addOut] = ret;
+          annTensors[site.addOut] = {ret, Layout::L_MAT, GGML_TYPE_F32};
+        }
+        else {
+          ggml_tensor* idx = initializerTensor(node.input(1), GGML_TYPE_I32);
+          // RoPE swaps run inside the NCHW attention chain (L2-A keeps the
+          // hand-written attention in NCHW; the 3D-ids zero-materialization is
+          // L2-B). Convert CS inputs back.
+          AnnotatedTensor ann = in(0);
+          ggml_tensor* x = ensure(ann, Layout::L_NCHW, GGML_TYPE_F32);
+          registerOut(gather(x, idx, axis));
+        }
       }
       else if(op == "Transpose") {
         vector<int64_t> perm;
@@ -1268,20 +1537,63 @@ struct OnnxToGgml {
           for(int i = 0; i < 4; i++)
             perm.push_back(3 - i);
         }
-        // attention-internal transpose: keep NCHW semantics (permutation of
-        // the NCHW tensor; see transposeOp which handles any 4D shape).
         AnnotatedTensor ann = in(0);
-        ggml_tensor* x = ensure(ann, Layout::L_NCHW, GGML_TYPE_F32);
-        registerOut(transposeOp(x, perm));
+        if(ann.layout == Layout::L_MAT) {
+          // L_MAT domain: ONNX Transpose [0,1,3,2] swaps the D and S axes of
+          // the underlying [N,H,D,S] tensor.
+          //  * qT/vT inputs are [D,H,S,N] (head-major, ne1=H < ne2=S): the
+          //    swap is absorbed by the CS layout -> identity (verified).
+          //  * svT input is sv [D,S_q,H,N] (ne1=S > ne2=H): swap S<->H ->
+          //    permute(0,2,1,3) view -> [D,H,S,N].
+          testAssert(perm.size() == 4 && perm[0] == 0 && perm[1] == 1 && perm[2] == 3 && perm[3] == 2);
+          if(ann.t->ne[1] > ann.t->ne[2]) {
+            ggml_tensor* v = ggml_permute(ctx, ann.t, 0, 2, 1, 3);
+            registerOut(v, Layout::L_MAT, GGML_TYPE_F32);
+          }
+          else {
+            registerOut(ann.t, Layout::L_MAT, GGML_TYPE_F32);
+          }
+        }
+        else {
+          // attention-internal transpose: keep NCHW semantics (permutation of
+          // the NCHW tensor; see transposeOp which handles any 4D shape).
+          ggml_tensor* x = ensure(ann, Layout::L_NCHW, GGML_TYPE_F32);
+          registerOut(transposeOp(x, perm));
+        }
       }
       else if(op == "Reshape") {
         const onnx::TensorProto* shape = findInitializer(node.input(1));
         testAssert(shape != NULL);
-        // L2-A: reshape keeps NCHW semantics (attention chain, mask reshape);
-        // CS inputs convert back once per source.
+        vector<int64_t> target = initializerInt64(*shape);
         AnnotatedTensor ann = in(0);
-        ggml_tensor* x = ensure(ann, Layout::L_NCHW, GGML_TYPE_F32);
-        registerOut(reshapeOp(x, initializerInt64(*shape)));
+        // L2-B: q/k/v head-split reshape [0,H,D,S] with a CS input is a
+        // zero-copy reshape_4d(x, D, H, S, N) -> [D,H,S,N] (head-major
+        // c=h*D+d; verified in l2b3-rope-verify.py).
+        bool headSplit = ann.layout == Layout::L_CS && target.size() >= 4 &&
+                         target[0] == 0 && target[3] > 1 &&
+                         target[1] * target[2] == ann.t->ne[0] &&
+                         target[3] == ann.t->ne[1];
+        if(headSplit) {
+          const int64_t D = target[2], H = target[1], S = target[3], N = ann.t->ne[2];
+          ggml_tensor* v = ggml_reshape_4d(ctx, ann.t, D, H, S, N);
+          registerOut(v, Layout::L_MAT, GGML_TYPE_F32);
+        }
+        else if(ann.layout == Layout::L_MAT && target.size() >= 4 && target[0] == 0 &&
+                target[1] == ann.t->ne[0] * ann.t->ne[1]) {
+          // attnnchw reshape: [D,H,S,N] L_MAT -> [C,S,N] CS (c = h*D+d).
+          const int64_t C = ann.t->ne[0] * ann.t->ne[1];
+          const int64_t S = ann.t->ne[2];
+          const int64_t N = ann.t->ne[3];
+          ggml_tensor* c = ggml_is_contiguous(ann.t) ? ann.t : ggml_cont(ctx, ann.t);
+          ggml_tensor* out = ggml_reshape_3d(ctx, c, C, S, N);
+          registerOut(out, Layout::L_CS, GGML_TYPE_F32);
+        }
+        else {
+          // L2-A: reshape keeps NCHW semantics (attention chain, mask reshape);
+          // CS inputs convert back once per source.
+          ggml_tensor* x = ensure(ann, Layout::L_NCHW, GGML_TYPE_F32);
+          registerOut(reshapeOp(x, target));
+        }
       }
       else if(op == "Concat") {
         int64_t axis = getAttr(node, "axis").i();
@@ -1300,17 +1612,16 @@ struct OnnxToGgml {
         if(itS != softmaxAbsorbs.end() && itS->second.active) {
           // C19-2: Softmax(Add(Mul(scores, scale), mask)) ->
           // soft_max_ext(scores, mask_full, scale). scores is [S_k, S_q, H, N]
-          // (ggml ne from matmul); mask must be materialized [S_k,S_q,1,N].
+          // (L_MAT) or [S_k,S_q,H,N] (NCHW from matmul); mask is materialized
+          // [S_k,S_q,1,N] (F21). In L_MAT the mask layout is orthogonal.
           const SoftmaxScaleAbsorb& f = itS->second;
           AnnotatedTensor annS = annTensors.count(f.scoresSrc) > 0 ? annTensors[f.scoresSrc] : in(0);
-          // The mask lives in the attention chain's domain (NCHW in L2-A);
-          // pull it from the annotation table under its producer name.
           AnnotatedTensor annM = annTensors.count(f.maskSrc) > 0 ? annTensors[f.maskSrc] : in(1);
-          GGML_ASSERT(annS.layout == annM.layout);   // both NCHW in L2-A
+          GGML_ASSERT(annS.layout == Layout::L_NCHW || annS.layout == Layout::L_MAT);
           const int64_t SK = annS.t->ne[0], SQ = annS.t->ne[1], N = annS.t->ne[3];
-          // Materialize the shared mask once; reuse for all attention blocks.
           if(maskFullShared == NULL || maskFullSK != SK || maskFullSQ != SQ || maskFullN != N) {
             int64_t targetNe[4] = {SK, SQ, 1, N};
+            maskFullShared = ggml_repeat(ctx, annM.t, shapeRefFor(targetNe));
             maskFullShared = ggml_repeat(ctx, annM.t, shapeRefFor(targetNe));
             maskFullSK = SK; maskFullSQ = SQ; maskFullN = N;
           }
@@ -1326,8 +1637,15 @@ struct OnnxToGgml {
         throw StringError("VULKAN backend: unsupported ONNX op '" + op + "'");
       }
     }
-    if(getenv("KATAGO_VULKAN_LAYOUTDBG") != nullptr)
-      fprintf(stderr, "LAYOUT-DBG: convToCS=%d convToNCHW=%d\n", nConvToCS, nConvToNCHW);
+    if(getenv("KATAGO_VULKAN_LAYOUTDBG") != nullptr) {
+      fprintf(stderr, "LAYOUT-DBG: convToCS=%d convToNCHW=%d ropeSites=%d\n", nConvToCS, nConvToNCHW, (int)ropeSites.size());
+      for(auto& kv : ropeSites) {
+        const RopeSite& s = kv.second;
+        fprintf(stderr, "  rope %s D=%lld H=%lld S=%lld cos=%s sin=%s\n",
+          kv.first.c_str(), (long long)s.D, (long long)s.H, (long long)s.S,
+          s.cosInit.c_str(), s.sinInit.c_str());
+      }
+    }
   }
 };
 
