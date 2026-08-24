@@ -1,5 +1,6 @@
 #include "ggml-vulkan.h"
 #include <vulkan/vulkan_core.h>
+#include <fstream>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
 #include "ggml-cpu.h"
@@ -792,6 +793,7 @@ struct vk_device_struct {
     bool pipeline_robustness;
     bool memory_priority;
     vk::Device device;
+    vk::PipelineCache pipeline_cache;
     uint32_t vendor_id;
     vk::DriverId driver_id;
     vk_device_architecture architecture;
@@ -1134,6 +1136,11 @@ struct vk_device_struct {
             ggml_vk_destroy_pipeline(device, pl);
         }
         all_pipelines.clear();
+
+        if (this->pipeline_cache) {
+            this->device.destroyPipelineCache(this->pipeline_cache);
+            this->pipeline_cache = nullptr;
+        }
 
         device.destroyDescriptorSetLayout(dsl);
 
@@ -3030,7 +3037,7 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
 #endif
 
     try {
-        pipeline->pipeline = device->device.createComputePipeline(VK_NULL_HANDLE, compute_pipeline_create_info).value;
+        pipeline->pipeline = device->device.createComputePipeline(device->pipeline_cache, compute_pipeline_create_info).value;
     } catch (const vk::SystemError& e) {
         std::cerr << "ggml_vulkan: Compute pipeline creation failed for " << pipeline->name << std::endl;
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
@@ -6942,6 +6949,35 @@ static vk_device ggml_vk_get_device(size_t idx) {
             .setPEnabledExtensionNames(device_extensions);
         device_create_info.setPNext(&device_features2);
         device->device = device->physical_device.createDevice(device_create_info);
+
+        // Persistent pipeline cache: load the previous session's compiled
+        // pipelines to skip recompiling ~300 shaders on every startup.
+        // Env GGML_VK_PIPELINE_CACHE sets the cache file path; when unset the
+        // cache is kept in memory only (per-process benefit is small, but the
+        // same mechanism enables warm starts via the env var).
+        device->pipeline_cache = device->device.createPipelineCache({});
+        {
+            const char* cache_path = getenv("GGML_VK_PIPELINE_CACHE");
+            if (cache_path != nullptr && cache_path[0] != '\0') {
+                std::ifstream f(cache_path, std::ios::binary | std::ios::ate);
+                if (f.good()) {
+                    std::streamsize sz = f.tellg();
+                    f.seekg(0, std::ios::beg);
+                    std::vector<unsigned char> data((size_t)sz);
+                    f.read((char*)data.data(), sz);
+                    f.close();
+                    if (sz >= 16 + 4) {  // VkPipelineCacheHeaderVersionOne (16) + vendor magic
+                        try {
+                            vk::PipelineCacheCreateInfo pci{ vk::PipelineCacheCreateFlags(), data.size(), data.data() };
+                            device->pipeline_cache = device->device.createPipelineCache(pci);
+                        } catch (const vk::SystemError&) {
+                            // cache data invalid (driver/version mismatch): rebuild fresh
+                            device->pipeline_cache = device->device.createPipelineCache({});
+                        }
+                    }
+                }
+            }
+        }
 
         if (device->device_fault) {
             device->pfn_vkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)
@@ -15957,6 +15993,24 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
         ctx->transfer_cmd_pool.destroy(ctx->device->device);
     }
+
+    // Persist the pipeline cache so the next run skips shader recompiles.
+    {
+        const char* cache_path = getenv("GGML_VK_PIPELINE_CACHE");
+        if (cache_path != nullptr && cache_path[0] != '\0') {
+            try {
+                std::vector<unsigned char> data = ctx->device->device.getPipelineCacheData(ctx->device->pipeline_cache);
+                std::ofstream f(cache_path, std::ios::binary | std::ios::trunc);
+                if (f.good() && !data.empty()) {
+                    f.write((const char*)data.data(), (std::streamsize)data.size());
+                    f.close();
+                }
+            } catch (const vk::SystemError&) {
+                // best effort; ignore write failures
+            }
+        }
+    }
+
     if (vk_perf_logger_enabled) {
         ctx->perf_logger->print_timings(true);
     }
