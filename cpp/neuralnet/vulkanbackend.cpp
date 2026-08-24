@@ -142,6 +142,69 @@ struct OnnxToGgml {
   // Name of the ONNX node currently being interpreted (diagnostics).
   string currentOpName;
 
+  // ---- S1 fusion: SiLU decomposition (SwiGLU) ----
+  // ONNX exports SwiGLU as Sigmoid(gate?) -> Mul(a, sig) -> Mul(silu, other).
+  // Actual pattern in this model: silu = linear1 * sigmoid(linear1), then
+  // swiglu = silu * linear_gate. We absorb the Sigmoid and the first Mul and
+  // rebuild the swiglu Mul as ggml_silu(linear1) * linear_gate.
+  // Map: swiglu Mul output name -> { silu-input tensor name (a), gate name }.
+  struct SiluFusion {
+    bool active = false;
+    string siluInput;  // tensor name whose silu feeds the final mul
+    string gateSrc;    // other input of the final mul
+  };
+  unordered_map<string, SiluFusion> siluFusions;   // by final Mul output name
+  unordered_set<string> absorbedSiluNodes;         // Sigmoid + first Mul names
+
+  void prescanSilu() {
+    const auto& nodes = model.graph().node();
+    unordered_map<string, int> producer;
+    for(int i = 0; i < (int)nodes.size(); i++)
+      for(int j = 0; j < nodes[i].output_size(); j++)
+        producer[nodes[i].output(j)] = i;
+
+    for(int i = 0; i < (int)nodes.size(); i++) {
+      const onnx::NodeProto& n = nodes[i];
+      if(n.op_type() != "Mul")
+        continue;
+      // final swiglu Mul: one input is the silu product, other is the gate
+      for(int inIdx = 0; inIdx < 2; inIdx++) {
+        auto itProd = producer.find(n.input(inIdx));
+        if(itProd == producer.end())
+          continue;
+        const onnx::NodeProto& prod = nodes[itProd->second];
+        if(prod.op_type() != "Mul")
+          continue;
+        // prod = a * sigmoid(a): find the sigmoid among prod's inputs
+        string sigTensorName, sigInput, sigNodeName;
+        for(int pIdx = 0; pIdx < 2; pIdx++) {
+          auto itSig = producer.find(prod.input(pIdx));
+          if(itSig == producer.end())
+            continue;
+          if(nodes[itSig->second].op_type() == "Sigmoid") {
+            sigTensorName = prod.input(pIdx);
+            sigInput = nodes[itSig->second].input(0);
+            sigNodeName = nodes[itSig->second].name();
+          }
+        }
+        if(sigTensorName.empty())
+          continue;
+        // the other prod input must equal the sigmoid input
+        const string& aName = prod.input(0) == sigTensorName ? prod.input(1) : prod.input(0);
+        if(aName != sigInput)
+          continue;
+        SiluFusion f;
+        f.active = true;
+        f.siluInput = aName;
+        f.gateSrc = n.input(1 - inIdx);
+        siluFusions[n.output(0)] = f;
+        absorbedSiluNodes.insert(prod.name());
+        absorbedSiluNodes.insert(sigNodeName);
+        break;
+      }
+    }
+  }
+
   // One shared full-shape reference tensor per distinct target shape, reused
   // by ggml_repeat for broadcasts (repeat reads only the small operand; the
   // reference only supplies the shape, so a handful of them per handle is all
@@ -488,11 +551,18 @@ struct OnnxToGgml {
     for(auto& kv : inputs)
       tensors[kv.first] = kv.second;
 
+    prescanSilu();
+
     for(const onnx::NodeProto& node : model.graph().node()) {
       const string& op = node.op_type();
       const string& outName = node.output_size() > 0 ? node.output(0) : string();
       testAssert(node.output_size() == 1);
       currentOpName = node.name().empty() ? op : node.name();
+
+      // S1 fusion: the Sigmoid/Mul pieces of a SwiGLU are skipped (rebuilt as
+      // ggml_silu in the final Mul).
+      if(absorbedSiluNodes.count(node.name()) > 0)
+        continue;
 
       auto in = [&](int i) -> ggml_tensor* {
         testAssert(i < node.input_size());
@@ -545,7 +615,16 @@ struct OnnxToGgml {
         registerOut(binary(in(0), in(1), 0));
       }
       else if(op == "Mul") {
-        registerOut(binary(in(0), in(1), 1));
+        auto itSilu = siluFusions.find(outName);
+        if(itSilu != siluFusions.end() && itSilu->second.active) {
+          // SwiGLU: silu(a) * gate
+          ggml_tensor* a = tensors.count(itSilu->second.siluInput) > 0 ? tensors[itSilu->second.siluInput] : initializerTensor(itSilu->second.siluInput, GGML_TYPE_F32);
+          ggml_tensor* gate = tensors.count(itSilu->second.gateSrc) > 0 ? tensors[itSilu->second.gateSrc] : initializerTensor(itSilu->second.gateSrc, GGML_TYPE_F32);
+          registerOut(ggml_mul(ctx, ggml_silu(ctx, a), gate));
+        }
+        else {
+          registerOut(binary(in(0), in(1), 1));
+        }
       }
       else if(op == "Div") {
         registerOut(binary(in(0), in(1), 2));
