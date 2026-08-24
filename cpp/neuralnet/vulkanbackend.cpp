@@ -142,6 +142,8 @@ struct OnnxToGgml {
   ggml_context* wctx;   // initializer (weight) tensors live here so gallocr
                         // never reuses their buffers; allocated separately.
   int maxBatchSize;
+  int nnXLen;   // board spatial dims; CS <-> NCHW conversions need the explicit
+  int nnYLen;   // W/H split of S (a CS tensor alone cannot recover them)
 
   const onnx::ModelProto& model;
   unordered_map<string, ggml_tensor*> tensors;
@@ -153,6 +155,12 @@ struct OnnxToGgml {
   // Host-side data of initializer tensors, set into device memory after graph
   // allocation.
   unordered_map<string, vector<uint8_t>> initData;
+
+  // Conversion-edge caches (R2): a converted tensor for a given source is
+  // created once and reused by every consumer (e.g. InputMask is masked-mul'd
+  // at ~40 sites; all share one CS copy instead of 40 identical edges).
+  unordered_map<ggml_tensor*, ggml_tensor*> convertCacheToCS;     // NCHW -> CS
+  unordered_map<ggml_tensor*, ggml_tensor*> convertCacheToNCHW;   // CS -> NCHW
 
   // Name of the ONNX node currently being interpreted (diagnostics).
   string currentOpName;
@@ -367,8 +375,8 @@ struct OnnxToGgml {
   // it takes and the transient repeat outputs reuse graph memory).
   unordered_map<uint64_t, ggml_tensor*> shapeRefs;
 
-  OnnxToGgml(ggml_context* c, ggml_context* wc, int maxBatch, const onnx::ModelProto& m)
-    : ctx(c), wctx(wc), maxBatchSize(maxBatch), model(m)
+  OnnxToGgml(ggml_context* c, ggml_context* wc, int maxBatch, int xLen, int yLen, const onnx::ModelProto& m)
+    : ctx(c), wctx(wc), maxBatchSize(maxBatch), nnXLen(xLen), nnYLen(yLen), model(m)
   {}
 
   ggml_tensor* shapeRefFor(const int64_t ne[4]) {
@@ -497,7 +505,20 @@ struct OnnxToGgml {
   }
   ggml_tensor* toNCHW(ggml_tensor* x) {
     GGML_ASSERT(ggml_n_dims(x) <= 4);
-    const int64_t C = x->ne[0], W = x->ne[1], H = x->ne[2], N = x->ne[3];
+    // x is CS [C, S, N] (3D) or [C, S, N, 1]. S = W*H must be split with the
+    // board dims: reshape to [C, W, H, N] then permute to [W, H, C, N].
+    const int64_t C = x->ne[0];
+    const int64_t S = x->ne[1];
+    const int64_t N = ggml_n_dims(x) >= 3 ? x->ne[2] : 1;
+    // S==1 covers the heads' global-pooled [C,1,1] outputs; otherwise the CS
+    // spatial dim is the full board W*H (sub-board positions appear as 0/1
+    // masked inputs, the tensor is still W*H wide).
+    int64_t W, H;
+    if(S == 1) { W = 1; H = 1; }
+    else {
+      GGML_ASSERT(S == (int64_t)nnXLen * nnYLen);
+      W = nnXLen; H = nnYLen;
+    }
     ggml_tensor* r4 = ggml_reshape_4d(ctx, x, C, W, H, N);
     ggml_tensor* p = ggml_permute(ctx, r4, 2, 0, 1, 3);
     return ggml_cont(ctx, p);
@@ -510,17 +531,23 @@ struct OnnxToGgml {
   }
 
   // Ensure a tensor is in the wanted layout/dtype, inserting conversion edges
-  // if not (rule R1). In L1 all tensors default to L_NCHW/F32 so this is a
-  // no-op; L2 flips the seeds and enables conversions.
+  // if not (rule R1). Conversion results are cached per source tensor so
+  // shared inputs (InputMask, stem outputs) only pay once.
   ggml_tensor* ensure(AnnotatedTensor& ann, Layout wantLayout, ggml_type wantDtype) {
     ggml_tensor* t = ann.t;
     if(ann.layout != wantLayout) {
       if(wantLayout == Layout::L_CS) {
         GGML_ASSERT(ann.layout == Layout::L_NCHW);
-        t = toCS(t);
+        auto& cached = convertCacheToCS[t];
+        if(cached == NULL)
+          cached = toCS(t);
+        t = cached;
       } else if(wantLayout == Layout::L_NCHW) {
         GGML_ASSERT(ann.layout == Layout::L_CS);
-        t = toNCHW(t);
+        auto& cached = convertCacheToNCHW[t];
+        if(cached == NULL)
+          cached = toNCHW(t);
+        t = cached;
       }
       // L_MAT conversions are never inserted (C8-5): layout-orthogonal domain.
       ann.layout = wantLayout;
@@ -795,6 +822,10 @@ struct OnnxToGgml {
     }
     if(inferIdx >= 0)
       dims[inferIdx] = ggml_nelements(x) / known;
+    if(ggml_nelements(x) != dims[0] * dims[1] * dims[2] * dims[3])
+      fprintf(stderr, "RESHAPE-DBG op=%s xne=%lld,%lld,%lld,%lld nl=%lld dims=%lld,%lld,%lld,%lld\n",
+        currentOpName.c_str(), (long long)x->ne[0], (long long)x->ne[1], (long long)x->ne[2], (long long)x->ne[3],
+        (long long)ggml_nelements(x), (long long)dims[0], (long long)dims[1], (long long)dims[2], (long long)dims[3]);
     testAssert(ggml_nelements(x) == dims[0] * dims[1] * dims[2] * dims[3]);
     return ggml_reshape_4d(ctx, x, dims[3], dims[2], dims[1], dims[0]);
   }
@@ -859,14 +890,32 @@ struct OnnxToGgml {
         tensors[outName] = t;
         annTensors[outName] = {t, lay, dt};
       };
+      // Follow the layout/dtype of an input tensor for ops that preserve them.
+      auto registerFollow = [&](const AnnotatedTensor& ann) {
+        registerOut(ann.t, ann.layout, ann.dtype);
+      };
+
+      // L2 domain unification for elementwise binaries: both operands must live
+      // in the same domain. If exactly one side is L_CS, the NCHW side is
+      // converted (trunk target domain is CS; InputMask's CS copy is cached and
+      // shared by all ~40 mask sites).
+      auto unifyDomains = [&](AnnotatedTensor& a0, AnnotatedTensor& a1) {
+        if(a0.layout == a1.layout)
+          return;
+        if(a0.layout == Layout::L_CS && a1.layout == Layout::L_NCHW)
+          ensure(a1, Layout::L_CS, GGML_TYPE_F32);
+        else if(a0.layout == Layout::L_NCHW && a1.layout == Layout::L_CS)
+          ensure(a0, Layout::L_CS, GGML_TYPE_F32);
+        else
+          throw StringError("VULKAN backend: binary op across incompatible domains (" + currentOpName + ")");
+      };
 
       if(op == "Conv") {
-        ggml_tensor* x = in(0).t;
+        AnnotatedTensor annX = in(0);
         // B1: conv weights are stored natively in F16 (ggml-vulkan converts
         // F32 operands to F16 every eval on coopmat2 devices, and im2col
         // emits F16 regardless).
         ggml_tensor* w = initializerTensor(node.input(1), GGML_TYPE_F16);
-        // 1x1 and odd-kernel stride-1 same-pad convs map to ggml_conv_2d_s1_ph.
         // Kernel a is [kW, kH, inC, outC] (same bytes as ONNX [outC,inC,kH,kW]).
         int64_t kY = w->ne[1], kX = w->ne[0];
         testAssert(kY == kX && (kY % 2) == 1);
@@ -887,7 +936,28 @@ struct OnnxToGgml {
           testAssert(p.ints(0) == (kY - 1) / 2 && p.ints(1) == (kX - 1) / 2);
           testAssert(p.ints(2) == (kY - 1) / 2 && p.ints(3) == (kX - 1) / 2);
         }
-        registerOut(ggml_conv_2d_s1_ph(ctx, w, x));
+        if(kX == 1 && kY == 1) {
+          // L2 §4.1: 1x1 conv (the linear-layer workhorse) -> direct mul_mat in
+          // the CS domain: no im2col materialization, no conv-output cont.
+          //   W [1,1,IC,OC] -> reshape_2d(IC, OC)          (zero-copy view)
+          //   x [C,S,N]     -> reshape_2d(IC, S*N)         (zero-copy view)
+          //   Y = mul_mat(W, x2) -> [OC, S*N], OC fastest
+          //   out = reshape_3d(Y, OC, S, N)                (zero-copy view)
+          ggml_tensor* x = ensure(annX, Layout::L_CS, GGML_TYPE_F32);
+          const int64_t IC = w->ne[2], OC = w->ne[3];
+          testAssert(x->ne[0] == IC);
+          const int64_t S = x->ne[1], N = x->ne[2];
+          ggml_tensor* W = ggml_reshape_2d(ctx, w, IC, OC);
+          ggml_tensor* x2 = ggml_reshape_2d(ctx, x, IC, S * N);
+          ggml_tensor* Y = ggml_mul_mat(ctx, W, x2);            // [OC, S*N]
+          ggml_tensor* out = ggml_reshape_3d(ctx, Y, OC, S, N); // [OC, S, N]
+          registerOut(out, Layout::L_CS, GGML_TYPE_F32);
+        }
+        else {
+          // k>1 (stem conv_spatial only): keep the im2col path in NCHW.
+          ggml_tensor* x = annX.t;   // stem input is NCHW (graph input)
+          registerOut(ggml_conv_2d_s1_ph(ctx, w, x), Layout::L_NCHW, GGML_TYPE_F32);
+        }
       }
       else if(op == "MatMul") {
         // B1: when the right operand is a stored weight, keep it natively F16
@@ -901,7 +971,9 @@ struct OnnxToGgml {
         registerOut(matmul(in(0).t, b));
       }
       else if(op == "Add") {
-        registerOut(binary(in(0).t, in(1).t, 0));
+        AnnotatedTensor a0 = in(0), a1 = in(1);
+        unifyDomains(a0, a1);
+        registerOut(binary(a0.t, a1.t, 0), a0.layout, GGML_TYPE_F32);
       }
       else if(op == "Mul") {
         auto itSilu = siluFusions.find(outName);
@@ -909,67 +981,75 @@ struct OnnxToGgml {
           // SwiGLU: silu(a) * gate, fused into a single swiglu kernel
           ggml_tensor* a = tensors.count(itSilu->second.siluInput) > 0 ? tensors[itSilu->second.siluInput] : initializerTensor(itSilu->second.siluInput, GGML_TYPE_F32);
           ggml_tensor* gate = tensors.count(itSilu->second.gateSrc) > 0 ? tensors[itSilu->second.gateSrc] : initializerTensor(itSilu->second.gateSrc, GGML_TYPE_F32);
-          registerOut(ggml_swiglu_split(ctx, a, gate));
+          // The gate and silu inputs share the layout of the linear layers'
+          // outputs; L2 trunk runs in CS so both are CS.
+          Layout lay = Layout::L_NCHW;
+          auto itA = annTensors.find(itSilu->second.siluInput);
+          if(itA != annTensors.end())
+            lay = itA->second.layout;
+          registerOut(ggml_swiglu_split(ctx, a, gate), lay, GGML_TYPE_F32);
         }
         else {
-          registerOut(binary(in(0).t, in(1).t, 1));
+          AnnotatedTensor a0 = in(0), a1 = in(1);
+          unifyDomains(a0, a1);
+          registerOut(binary(a0.t, a1.t, 1), a0.layout, GGML_TYPE_F32);
         }
       }
       else if(op == "Div") {
         auto itR = rmsFusions.find(outName);
         if(itR != rmsFusions.end() && itR->second.active) {
-          // RMSNorm fused: x [W,H,C,b] NCHW. ggml_rms_norm reduces ne0, but the
-          // norm reduces the channel dim (ggml ne2), so permute to channel-first
-          // [C, W, H, b], run rms_norm (per-position over channels), multiply by
-          // the per-channel weight, and permute back to NCHW.
+          // RMSNorm fused, L2 CS direct: x is [C, S, N] (CS) with the channel
+          // dim at ne0, so ggml_rms_norm reduces the right axis with no permute
+          // round-trip at all (design §4.2). weight is [1,1,C,1] -> [C,1,1,1].
           const RmsFusion& f = itR->second;
-          ggml_tensor* x = tensors.count(f.xSrc) > 0 ? tensors[f.xSrc] : in(0).t;
+          AnnotatedTensor annX = in(0);
+          ggml_tensor* x = ensure(annX, Layout::L_CS, GGML_TYPE_F32);   // [C,S,N]
           ggml_tensor* w = initializerTensor(f.weightSrc, GGML_TYPE_F32);
-          // permute: ne2 (C) -> ne0. result->ne[p_i] = a->ne[i]
-          ggml_tensor* p = ggml_permute(ctx, x, 1, 2, 0, 3);       // [C, W, H, b]
-          ggml_tensor* pc = ggml_is_contiguous(p) ? p : ggml_cont(ctx, p);
-          ggml_tensor* rn = ggml_rms_norm(ctx, pc, f.eps);         // [C, W, H, b]
-          // weight is [1,1,C,1] (ggml ne); reshape to [C,1,1,1] then broadcast
-          // (mul along ne0=C).
+          ggml_tensor* rn = ggml_rms_norm(ctx, x, f.eps);               // [C,S,N]
           ggml_tensor* wr = ggml_reshape_4d(ctx, w, w->ne[2], 1, 1, 1);
-          ggml_tensor* sc = ggml_mul(ctx, rn, wr);                  // [C, W, H, b]
-          // permute back to NCHW [W, H, C, b]: result->ne[p_i] = a->ne[i],
-          // want ne0=C->ne2, ne1=W->ne0, ne2=H->ne1: permute(2, 0, 1, 3)
-          ggml_tensor* bp = ggml_permute(ctx, sc, 2, 0, 1, 3);     // [W, H, C, b]
-          ggml_tensor* back = ggml_is_contiguous(bp) ? bp : ggml_cont(ctx, bp);
+          ggml_tensor* sc = ggml_mul(ctx, rn, wr);                      // [C,S,N]
           // The weight Mul was absorbed too, so register this result under both
           // the Div output and the Mul output names.
-          tensors[outName] = back;
-          annTensors[outName] = {back, Layout::L_NCHW, GGML_TYPE_F32};
+          tensors[outName] = sc;
+          annTensors[outName] = {sc, Layout::L_CS, GGML_TYPE_F32};
           if(!f.mulOut.empty()) {
-            tensors[f.mulOut] = back;
-            annTensors[f.mulOut] = {back, Layout::L_NCHW, GGML_TYPE_F32};
+            tensors[f.mulOut] = sc;
+            annTensors[f.mulOut] = {sc, Layout::L_CS, GGML_TYPE_F32};
           }
         }
         else {
-          registerOut(binary(in(0).t, in(1).t, 2));
+          AnnotatedTensor a0 = in(0), a1 = in(1);
+          unifyDomains(a0, a1);
+          registerOut(binary(a0.t, a1.t, 2), a0.layout, GGML_TYPE_F32);
         }
       }
       else if(op == "Sub") {
-        registerOut(binary(in(0).t, in(1).t, 3));
+        AnnotatedTensor a0 = in(0), a1 = in(1);
+        unifyDomains(a0, a1);
+        registerOut(binary(a0.t, a1.t, 3), a0.layout, GGML_TYPE_F32);
       }
       else if(op == "Relu") {
-        registerOut(ggml_relu(ctx, in(0).t));
+        AnnotatedTensor ann = in(0);
+        registerOut(ggml_relu(ctx, ann.t), ann.layout, GGML_TYPE_F32);
       }
       else if(op == "Sigmoid") {
-        registerOut(ggml_sigmoid(ctx, in(0).t));
+        AnnotatedTensor ann = in(0);
+        registerOut(ggml_sigmoid(ctx, ann.t), ann.layout, GGML_TYPE_F32);
       }
       else if(op == "Tanh") {
-        registerOut(ggml_tanh(ctx, in(0).t));
+        AnnotatedTensor ann = in(0);
+        registerOut(ggml_tanh(ctx, ann.t), ann.layout, GGML_TYPE_F32);
       }
       else if(op == "Softplus") {
-        registerOut(ggml_softplus(ctx, in(0).t));
+        AnnotatedTensor ann = in(0);
+        registerOut(ggml_softplus(ctx, ann.t), ann.layout, GGML_TYPE_F32);
       }
       else if(op == "Sqrt") {
-        registerOut(ggml_sqrt(ctx, in(0).t));
+        AnnotatedTensor ann = in(0);
+        registerOut(ggml_sqrt(ctx, ann.t), ann.layout, GGML_TYPE_F32);
       }
       else if(op == "Identity") {
-        registerOut(in(0).t);
+        registerFollow(in(0));
       }
       else if(op == "Pow") {
         // Only Pow(x, const 2) is used (RMSNorm squaring).
@@ -977,24 +1057,33 @@ struct OnnxToGgml {
         testAssert(e != NULL);
         vector<float> expo = initializerFloats(*e);
         testAssert(expo.size() == 1 && expo[0] == 2.0f);
-        ggml_tensor* x = in(0).t;
-        registerOut(ggml_mul(ctx, x, x));
+        AnnotatedTensor ann = in(0);
+        registerOut(ggml_mul(ctx, ann.t, ann.t), ann.layout, GGML_TYPE_F32);
       }
       else if(op == "ReduceMean" || op == "ReduceSum" || op == "ReduceMax") {
         const onnx::TensorProto* axes = findInitializer(node.input(1));
         testAssert(axes != NULL);
         vector<int64_t> ax = initializerInt64(*axes);
+        // Reductions (trunk-tip global means, policy/value head stats) run in
+        // the NCHW domain (P1); CS inputs convert back once (few sites, §4.5).
+        AnnotatedTensor ann = in(0);
+        ggml_tensor* x = ensure(ann, Layout::L_NCHW, GGML_TYPE_F32);
         if(op == "ReduceMax")
-          registerOut(reduceMaxAxes(in(0).t, ax));
+          registerOut(reduceMaxAxes(x, ax));
         else
-          registerOut(reduceAxes(in(0).t, ax, op == "ReduceSum"));
+          registerOut(reduceAxes(x, ax, op == "ReduceSum"));
       }
       else if(op == "Gather") {
         int64_t axis = 0;
         if(hasAttr(node, "axis"))
           axis = getAttr(node, "axis").i();
         ggml_tensor* idx = initializerTensor(node.input(1), GGML_TYPE_I32);
-        registerOut(gather(in(0).t, idx, axis));
+        // RoPE swaps run inside the NCHW attention chain (L2-A keeps the
+        // hand-written attention in NCHW; the 3D-ids zero-materialization is
+        // L2-B). Convert CS inputs back.
+        AnnotatedTensor ann = in(0);
+        ggml_tensor* x = ensure(ann, Layout::L_NCHW, GGML_TYPE_F32);
+        registerOut(gather(x, idx, axis));
       }
       else if(op == "Transpose") {
         vector<int64_t> perm;
@@ -1007,12 +1096,20 @@ struct OnnxToGgml {
           for(int i = 0; i < 4; i++)
             perm.push_back(3 - i);
         }
-        registerOut(transposeOp(in(0).t, perm));
+        // attention-internal transpose: keep NCHW semantics (permutation of
+        // the NCHW tensor; see transposeOp which handles any 4D shape).
+        AnnotatedTensor ann = in(0);
+        ggml_tensor* x = ensure(ann, Layout::L_NCHW, GGML_TYPE_F32);
+        registerOut(transposeOp(x, perm));
       }
       else if(op == "Reshape") {
         const onnx::TensorProto* shape = findInitializer(node.input(1));
         testAssert(shape != NULL);
-        registerOut(reshapeOp(in(0).t, initializerInt64(*shape)));
+        // L2-A: reshape keeps NCHW semantics (attention chain, mask reshape);
+        // CS inputs convert back once per source.
+        AnnotatedTensor ann = in(0);
+        ggml_tensor* x = ensure(ann, Layout::L_NCHW, GGML_TYPE_F32);
+        registerOut(reshapeOp(x, initializerInt64(*shape)));
       }
       else if(op == "Concat") {
         int64_t axis = getAttr(node, "axis").i();
@@ -1211,7 +1308,7 @@ struct ComputeHandle {
     }
 
     // --- Create graph inputs (NCHW, batch = maxBatchSize) ---
-    OnnxToGgml builder(ggmlCtx, wctx, maxBatchSize, model);
+    OnnxToGgml builder(ggmlCtx, wctx, maxBatchSize, ctx->nnXLen, ctx->nnYLen, model);
     vector<pair<string, ggml_tensor*>> inputTensors;
 
     // Read the declared input shapes from the graph.
@@ -1243,11 +1340,19 @@ struct ComputeHandle {
     builder.build(inputTensors);
 
     // --- Resolve outputs ---
+    // getOutput decodes in NCHW (channel-strided), so CS-domain head outputs
+    // get a CS->NCHW conversion edge here (design §11.3 "heads 出口插转换边").
     auto getOut = [&](const char* name) -> ggml_tensor* {
       auto it = builder.tensors.find(name);
       if(it == builder.tensors.end())
         throw StringError(string("VULKAN backend: graph is missing expected output ") + name);
-      return it->second;
+      ggml_tensor* t = it->second;
+      auto aIt = builder.annTensors.find(name);
+      if(aIt != builder.annTensors.end() && aIt->second.layout == OnnxToGgml::Layout::L_CS) {
+        // outPolicyPass is [N,2,1,1]-ish flat; converting keeps getOutput intact.
+        t = builder.toNCHW(t);
+      }
+      return t;
     };
     outPolicyPass = getOut("OutputPolicyPass");
     outPolicy = getOut("OutputPolicy");
