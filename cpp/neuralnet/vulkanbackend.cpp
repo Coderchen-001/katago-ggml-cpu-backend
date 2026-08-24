@@ -161,6 +161,10 @@ struct OnnxToGgml {
   // at ~40 sites; all share one CS copy instead of 40 identical edges).
   unordered_map<ggml_tensor*, ggml_tensor*> convertCacheToCS;     // NCHW -> CS
   unordered_map<ggml_tensor*, ggml_tensor*> convertCacheToNCHW;   // CS -> NCHW
+  // Debug counters: how many unique conversion edges were inserted, and from
+  // which op (diagnostics for the L2 CONT budget).
+  int nConvToCS = 0;
+  int nConvToNCHW = 0;
 
   // Name of the ONNX node currently being interpreted (diagnostics).
   string currentOpName;
@@ -539,14 +543,18 @@ struct OnnxToGgml {
       if(wantLayout == Layout::L_CS) {
         GGML_ASSERT(ann.layout == Layout::L_NCHW);
         auto& cached = convertCacheToCS[t];
-        if(cached == NULL)
+        if(cached == NULL) {
           cached = toCS(t);
+          nConvToCS++;
+        }
         t = cached;
       } else if(wantLayout == Layout::L_NCHW) {
         GGML_ASSERT(ann.layout == Layout::L_CS);
         auto& cached = convertCacheToNCHW[t];
-        if(cached == NULL)
+        if(cached == NULL) {
           cached = toNCHW(t);
+          nConvToNCHW++;
+        }
         t = cached;
       }
       // L_MAT conversions are never inserted (C8-5): layout-orthogonal domain.
@@ -1130,6 +1138,8 @@ struct OnnxToGgml {
         throw StringError("VULKAN backend: unsupported ONNX op '" + op + "'");
       }
     }
+    if(getenv("KATAGO_VULKAN_LAYOUTDBG") != nullptr)
+      fprintf(stderr, "LAYOUT-DBG: convToCS=%d convToNCHW=%d\n", nConvToCS, nConvToNCHW);
   }
 };
 
