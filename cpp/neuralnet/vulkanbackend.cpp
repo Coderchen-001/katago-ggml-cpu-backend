@@ -336,18 +336,57 @@ struct OnnxToGgml {
   }
 
   ggml_tensor* binary(ggml_tensor* a, ggml_tensor* b, int op) {
-    // Elementwise op with broadcasting; both operands expanded to the
-    // elementwise-max shape.
+    // Elementwise op with native ggml broadcasting (no explicit ggml_repeat):
+    // the ggml binary kernels handle src1 with per-dim ne==1 by indexing, so
+    // broadcasts cost nothing extra. ggml broadcasts src1 up to src0's shape,
+    // so the elementwise-larger tensor must be src0. For commutative ops
+    // (Add/Mul) that is always possible; for Div/Sub the operand order matters
+    // (a/b != b/a), so when a is the smaller one it is materialized via
+    // ggml_repeat first and then used as src0.
+    bool aHas1 = false, bHas1 = false;
+    for(int i = 0; i < 4; i++) {
+      if(a->ne[i] == 1 && b->ne[i] != 1)
+        aHas1 = true;
+      if(b->ne[i] == 1 && a->ne[i] != 1)
+        bHas1 = true;
+      if(a->ne[i] != 1 && b->ne[i] != 1 && a->ne[i] != b->ne[i])
+        throw StringError("VULKAN backend: shape mismatch in broadcast");
+    }
+    testAssert(!(aHas1 && bHas1));  // one side must be elementwise-larger
+    if(!aHas1 && !bHas1) {
+      // same shape
+      switch(op) {
+      case 0: return ggml_add(ctx, a, b);
+      case 1: return ggml_mul(ctx, a, b);
+      case 2: return ggml_div(ctx, a, b);
+      case 3: return ggml_sub(ctx, a, b);
+      default: throw StringError("VULKAN backend: unknown binary op");
+      }
+    }
+    if(bHas1) {
+      // b is the smaller one: b broadcasts against a. Keep operand order.
+      switch(op) {
+      case 0: return ggml_add(ctx, a, b);
+      case 1: return ggml_mul(ctx, a, b);
+      case 2: return ggml_div(ctx, a, b);
+      case 3: return ggml_sub(ctx, a, b);
+      default: throw StringError("VULKAN backend: unknown binary op");
+      }
+    }
+    // a is the smaller one (aHas1). Commutative ops: use b as src0. Non-
+    // commutative (Div/Sub): materialize a to b's shape first, then a-op-b.
+    switch(op) {
+    case 0: return ggml_add(ctx, b, a);
+    case 1: return ggml_mul(ctx, b, a);
+    default: break;
+    }
     int64_t targetNe[4];
     for(int i = 0; i < 4; i++)
-      targetNe[i] = std::max(a->ne[i], b->ne[i]);
-    ggml_tensor* ba = broadcastTo(a, targetNe);
-    ggml_tensor* bb = broadcastTo(b, targetNe);
+      targetNe[i] = b->ne[i];
+    ggml_tensor* ba = ggml_repeat(ctx, a, shapeRefFor(targetNe));
     switch(op) {
-    case 0: return ggml_add(ctx, ba, bb);
-    case 1: return ggml_mul(ctx, ba, bb);
-    case 2: return ggml_div(ctx, ba, bb);
-    case 3: return ggml_sub(ctx, ba, bb);
+    case 2: return ggml_div(ctx, ba, b);
+    case 3: return ggml_sub(ctx, ba, b);
     default: throw StringError("VULKAN backend: unknown binary op");
     }
   }
