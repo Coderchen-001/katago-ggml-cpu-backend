@@ -410,11 +410,15 @@ struct OnnxToGgml {
   }
 
   // Create (or fetch) a ggml tensor for an initializer, remembering its host
-  // data for the post-allocation upload.
+  // data for the post-allocation upload. The cache is keyed by name only, so
+  // the first request fixes the type: assert a conflicting later request
+  // instead of silently returning a tensor of the wrong type.
   ggml_tensor* initializerTensor(const string& name, ggml_type type) {
     auto it = tensors.find(name);
-    if(it != tensors.end())
+    if(it != tensors.end()) {
+      testAssert(it->second->type == type);
       return it->second;
+    }
     const onnx::TensorProto* t = findInitializer(name);
     if(t == NULL)
       throw StringError("VULKAN backend: initializer '" + name + "' not found in the ONNX graph");
