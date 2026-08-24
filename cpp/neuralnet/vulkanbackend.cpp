@@ -200,6 +200,68 @@ struct OnnxToGgml {
   unordered_map<string, RmsFusion> rmsFusions;     // by Div output name
   unordered_set<string> absorbedRmsNodes;          // Pow/ReduceMean/Add/Sqrt node names
 
+  // ---- L2-B1: residual mask reassociation (C19-1/C20-1) ----
+  // Residual pattern: Add(A, Mul(B, InputMask)) where B is a projection
+  // (1x1 conv / matmul output) and A is an already-masked residual. The mask
+  // is a per-position 0/1 multiplier and 1x1 convs are linear, so
+  //   A + B*mask == (A + B) * mask
+  // Reassociating moves the Mul after the Add, letting the Add fuse into the
+  // projection's MUL_MAT epilogue (ggml-vulkan MUL_MAT+ADD fusion).
+  // Map: Add output name -> { residual src (A), projection src (B) }.
+  struct MaskReassoc {
+    bool active = false;
+    string resSrc;   // A: the (masked) residual tensor feeding the Add
+    string projSrc;  // B: the unmasked projection output
+  };
+  unordered_map<string, MaskReassoc> maskReassocs;   // by Add output name
+  unordered_set<string> absorbedMaskMulNodes;        // the Mul(B, InputMask) nodes
+
+  void prescanMaskReassoc() {
+    const auto& nodes = model.graph().node();
+    unordered_map<string, int> producer;
+    for(int i = 0; i < (int)nodes.size(); i++)
+      for(int j = 0; j < nodes[i].output_size(); j++)
+        producer[nodes[i].output(j)] = i;
+
+    for(int i = 0; i < (int)nodes.size(); i++) {
+      const onnx::NodeProto& n = nodes[i];
+      if(n.op_type() != "Add" || n.input_size() != 2)
+        continue;
+      // The masked branch must be input(1): Mul(proj, InputMask).
+      auto itMul = producer.find(n.input(1));
+      if(itMul == producer.end())
+        continue;
+      const onnx::NodeProto& mulN = nodes[itMul->second];
+      if(mulN.op_type() != "Mul" || mulN.input_size() != 2)
+        continue;
+      int maskIdx = -1, projIdx = -1;
+      for(int k = 0; k < 2; k++) {
+        if(mulN.input(k) == "InputMask")
+          maskIdx = k;
+        else
+          projIdx = k;
+      }
+      if(maskIdx < 0 || projIdx < 0)
+        continue;
+      // B must be produced by a Conv/MatMul (a real projection) and A must be
+      // a computed tensor, not a graph input or initializer.
+      auto itProj = producer.find(mulN.input(projIdx));
+      if(itProj == producer.end())
+        continue;
+      const onnx::NodeProto& projN = nodes[itProj->second];
+      if(projN.op_type() != "Conv" && projN.op_type() != "MatMul")
+        continue;
+      if(producer.find(n.input(0)) == producer.end())
+        continue;   // A is a graph input: not a residual chain
+      MaskReassoc f;
+      f.active = true;
+      f.resSrc = n.input(0);
+      f.projSrc = mulN.input(projIdx);
+      maskReassocs[n.output(0)] = f;
+      absorbedMaskMulNodes.insert(mulN.name());
+    }
+  }
+
   void prescanRms() {
     const auto& nodes = model.graph().node();
     unordered_map<string, int> producer;
@@ -865,6 +927,7 @@ struct OnnxToGgml {
 
     prescanSilu();
     prescanRms();
+    prescanMaskReassoc();
 
     for(const onnx::NodeProto& node : model.graph().node()) {
       const string& op = node.op_type();
@@ -877,7 +940,8 @@ struct OnnxToGgml {
       // Skip only named nodes: an empty name would otherwise absorb every
       // following unnamed node.
       if(!node.name().empty() &&
-         (absorbedSiluNodes.count(node.name()) > 0 || absorbedRmsNodes.count(node.name()) > 0))
+         (absorbedSiluNodes.count(node.name()) > 0 || absorbedRmsNodes.count(node.name()) > 0 ||
+          absorbedMaskMulNodes.count(node.name()) > 0))
         continue;
 
       auto in = [&](int i) -> AnnotatedTensor {
@@ -979,9 +1043,32 @@ struct OnnxToGgml {
         registerOut(matmul(in(0).t, b));
       }
       else if(op == "Add") {
-        AnnotatedTensor a0 = in(0), a1 = in(1);
-        unifyDomains(a0, a1);
-        registerOut(binary(a0.t, a1.t, 0), a0.layout, GGML_TYPE_F32);
+        auto itM = maskReassocs.find(outName);
+        if(itM != maskReassocs.end() && itM->second.active) {
+          // C19-1: Add(A, Mul(B, InputMask)) -> Mul(Add(A, B), InputMask).
+          // A is the masked residual, B the unmasked projection output; the
+          // reassociation is exact for 0/1 masks and linear 1x1 convs, and it
+          // lets the Add fuse into B's MUL_MAT epilogue.
+          const MaskReassoc& f = itM->second;
+          AnnotatedTensor annA = annTensors.count(f.resSrc) > 0 ? annTensors[f.resSrc] : in(0);
+          AnnotatedTensor annB = annTensors.count(f.projSrc) > 0 ? annTensors[f.projSrc] : in(1);
+          unifyDomains(annA, annB);
+          ggml_tensor* sum = binary(annA.t, annB.t, 0);
+          // The mask must be applied in the unified domain: re-mask with InputMask.
+          AnnotatedTensor annMask = annTensors.count("InputMask") > 0 ? annTensors["InputMask"] : in(0);
+          // Mask is the same tensor on both sides; pick a domain via unify with sum.
+          Layout sumLay = annA.layout;
+          AnnotatedTensor annM = annTensors["InputMask"];
+          if(annM.layout != sumLay)
+            ensure(annM, sumLay, GGML_TYPE_F32);
+          ggml_tensor* out = binary(sum, annM.t, 1);
+          registerOut(out, sumLay, GGML_TYPE_F32);
+        }
+        else {
+          AnnotatedTensor a0 = in(0), a1 = in(1);
+          unifyDomains(a0, a1);
+          registerOut(binary(a0.t, a1.t, 0), a0.layout, GGML_TYPE_F32);
+        }
       }
       else if(op == "Mul") {
         auto itSilu = siluFusions.find(outName);
