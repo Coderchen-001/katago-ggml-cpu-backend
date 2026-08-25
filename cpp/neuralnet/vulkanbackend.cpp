@@ -1457,7 +1457,7 @@ struct OnnxToGgml {
     prescanSoftmaxScale();
     prescanRope();
     prescanProjFusion();
-    // prescanGammaAbsorb();  // EXPERIMENT: disabled for margin isolation
+    // prescanGammaAbsorb();  // sequence-1 path A: margin gate fails (1.04x), disabled
     // Pre-build every RMS weight as a standalone [C,1,1,1] constant (not a
     // reshape view) so the cgraph order becomes rms_norm -> mul with no node
     // between; ggml-vulkan's RMS_NORM_MUL fusion requires mul to directly
