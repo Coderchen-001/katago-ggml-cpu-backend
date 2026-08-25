@@ -341,7 +341,106 @@ struct OnnxToGgml {
     }
   }
 
-  // ---- L2-B3: RoPE zero-materialization (C18) ----
+  // ---- M1: Flash Attention replacement (fa) ----
+  // Replaces the per-block scores mul_mat + soft_max_ext + sv mul_mat chain
+  // with a single ggml_flash_attn_ext. q/k/v are the L_MAT [D,H,S,N] tensors
+  // (rope outputs for q/k, reshape output for v); fa requires [D,S,H,N]
+  // (ne1=seq, ne2=heads, ggml.h doc) which we get as zero-dispatch strided
+  // views (ggml_view_4d with swapped nb -- the fa shader addresses via
+  // p.nb01/nb02/nb03, flash_attn.comp:110). fa output is [D,H,S,N]
+  // (ggml.c: res = [v.ne0, q.ne2, q.ne1, q.ne3]) -- contiguous, so the
+  // attnnchw reshape is a zero-copy view (saves the current permute+cont).
+  // mask must be F16 (ggml.c:5434); we build a separate F16 cache from the
+  // same mask source as the soft_max_ext fallback (caches kept separate per
+  // OpenCode review). scale comes from the ONNX-absorbed softmax scale.
+  struct FaSite {
+    bool active = false;
+    string qName, kName, vName;      // L_MAT tensor names [D,H,S,N]
+    string maskSrc;                  // Add mask input (same as softmaxAbsorbs)
+    string scoresOut, softmaxOut, svOut;  // output names to register
+    float scale = 0.0f;
+  };
+  unordered_map<string, FaSite> faSites;   // by scores MatMul outName
+  unordered_set<string> faAbsorbedSoftmax; // softmax outNames to skip
+  unordered_set<string> faAbsorbedSv;      // sv MatMul outNames to skip
+  ggml_tensor* faMaskF16Shared = NULL;     // F16 [S_k,S_q,1,N] (fa-only cache)
+  int64_t faMaskF16SK = 0, faMaskF16SQ = 0, faMaskF16N = 0;
+
+  void prescanFa() {
+    const auto& nodes = model.graph().node();
+    unordered_map<string, int> producer;
+    for(int i = 0; i < (int)nodes.size(); i++)
+      for(int j = 0; j < nodes[i].output_size(); j++)
+        producer[nodes[i].output(j)] = i;
+    for(int i = 0; i < (int)nodes.size(); i++) {
+      const onnx::NodeProto& n = nodes[i];
+      if(n.op_type() != "MatMul" || n.input_size() < 2)
+        continue;
+      const string& scoresOut = n.output(0);
+      if(scoresOut.find("/scores") == string::npos && scoresOut.find("scores") != 0)
+        continue;
+      // find the softmax absorbing this scores output
+      string softmaxOut, svOut, maskSrc;
+      float scale = 0.0f;
+      for(auto& kv : softmaxAbsorbs) {
+        if(!kv.second.active || kv.second.scoresSrc != scoresOut)
+          continue;
+        softmaxOut = kv.first;
+        maskSrc = kv.second.maskSrc;
+        scale = kv.second.scale;
+        break;
+      }
+      if(softmaxOut.empty())
+        continue;
+      // find the sv MatMul consuming the softmax output (via its own outName)
+      for(const auto& c : nodes) {
+        if(c.op_type() != "MatMul" || c.input_size() < 2)
+          continue;
+        if(c.input(0) == softmaxOut || c.input(1) == softmaxOut) {
+          const string& so = c.output(0);
+          if(so.find("/sv") != string::npos) { svOut = so; break; }
+        }
+      }
+      if(svOut.empty())
+        continue;
+      // q: scores input(0) is qT transpose output; its producer's input is q rope out
+      auto itQ = producer.find(n.input(0));
+      if(itQ == producer.end())
+        continue;
+      const onnx::NodeProto& qT = nodes[itQ->second];
+      if(qT.op_type() != "Transpose" || qT.input_size() < 1)
+        continue;
+      // k: scores input(1) is the rope output directly
+      // v: sv input(1) is vT transpose output; producer's input is v reshape out
+      auto itSv = producer.find(svOut);
+      if(itSv == producer.end())
+        continue;
+      const onnx::NodeProto& svN = nodes[itSv->second];
+      if(svN.input_size() < 2)
+        continue;
+      auto itVT = producer.find(svN.input(1));
+      if(itVT == producer.end())
+        continue;
+      const onnx::NodeProto& vT = nodes[itVT->second];
+      if(vT.op_type() != "Transpose" || vT.input_size() < 1)
+        continue;
+      FaSite f;
+      f.active = true;
+      f.qName = qT.input(0);
+      f.kName = n.input(1);
+      f.vName = vT.input(0);
+      f.maskSrc = maskSrc;
+      f.scoresOut = scoresOut;
+      f.softmaxOut = softmaxOut;
+      f.svOut = svOut;
+      f.scale = scale;
+      faSites[scoresOut] = f;
+      faAbsorbedSoftmax.insert(softmaxOut);
+      faAbsorbedSv.insert(svOut);
+    }
+  }
+
+
   // In the CS domain the q/k reshape target [0,H,D,S] maps to a zero-copy
   // reshape_4d(x, D, H, S, N) view [D,H,S,N] (head-major c=h*D+d). The whole
   // rope subgraph (gather + Mul(cos) + Mul(sin) + Add) is rebuilt efficiently:
@@ -1499,6 +1598,7 @@ struct OnnxToGgml {
     prescanRms();
     prescanMaskReassoc();
     prescanSoftmaxScale();
+    // prescanFa();  // EXPERIMENT b': disabled to test F16 scores GEMM path
     prescanRope();
     prescanProjFusion();
     // prescanGammaAbsorb();  // sequence-1 path A: margin gate fails (1.04x), disabled
@@ -1651,6 +1751,51 @@ struct OnnxToGgml {
           //    -> [D, S_q, H, N].
           GGML_ASSERT(annA.layout == annB.layout);   // L_MAT on both sides
           if(outName.find("/scores") != string::npos || outName.find("scores") == 0) {
+            auto itFa = faSites.find(outName);
+            if(itFa != faSites.end() && itFa->second.active) {
+              // M1: build flash_attn_ext instead of scores matmul + softmax + sv.
+              // q/k/v are [D,H,S,N] L_MAT; fa wants [D,S,H,N] (ne1=seq,
+              // ne2=heads). Zero-dispatch strided views via ggml_view_4d with
+              // swapped strides (fa shader uses p.nb01/nb02/nb03).
+              const FaSite& f = itFa->second;
+              auto itQ = tensors.find(f.qName), itK = tensors.find(f.kName), itV = tensors.find(f.vName);
+              testAssert(itQ != tensors.end() && itK != tensors.end() && itV != tensors.end());
+              ggml_tensor* q = itQ->second;   // [D,H,S,N]
+              ggml_tensor* k = itK->second;
+              ggml_tensor* v = itV->second;
+              const int64_t D = q->ne[0], H = q->ne[1], S = q->ne[2], N = q->ne[3];
+              testAssert(k->ne[0] == D && v->ne[0] == D);
+              // [D,S,H,N] views: ne1=S (stride = old ne2 stride), ne2=H (old ne1)
+              ggml_tensor* qv = ggml_view_4d(ctx, q, D, S, H, N, q->nb[2], q->nb[1], q->nb[3], 0);
+              ggml_tensor* kv = ggml_view_4d(ctx, k, D, S, H, N, k->nb[2], k->nb[1], k->nb[3], 0);
+              ggml_tensor* vv = ggml_view_4d(ctx, v, D, S, H, N, v->nb[2], v->nb[1], v->nb[3], 0);
+              // mask: F16 [S_k,S_q,1,N] from the same source as the fallback
+              // (separate cache per review: fallback keeps its F32 cache).
+              auto itM = annTensors.find(f.maskSrc);
+              testAssert(itM != annTensors.end());
+              if(faMaskF16Shared == NULL || faMaskF16SK != S || faMaskF16SQ != S || faMaskF16N != N) {
+                int64_t targetNe[4] = {S, S, 1, N};
+                ggml_tensor* full = ggml_repeat(ctx, itM->second.t, shapeRefFor(targetNe));   // F32
+                faMaskF16Shared = ggml_cast(ctx, full, GGML_TYPE_F16);
+                faMaskF16SK = S; faMaskF16SQ = S; faMaskF16N = N;
+              }
+              ggml_tensor* r = ggml_flash_attn_ext(ctx, qv, kv, vv, faMaskF16Shared,
+                                                    f.scale, 0.0f, 0.0f);   // [D,H,S,N]
+              // Force F32 accumulation: fa defaults to f16 acc on fp16 devices
+              // (GV:10864 f32acc = !fp16 || prec==F32 || bf16), which costs
+              // precision -- b10c384 margin 1.08x fails. F32 acc restores the
+              // hand-written chain's accuracy (margin gate AD-5).
+              ggml_flash_attn_ext_set_prec(r, GGML_PREC_F32);
+              // Register under scores/softmax/sv output names; downstream
+              // attnnchw consumes svOut. The softmax/sv nodes are skipped.
+              tensors[f.scoresOut] = r;
+              annTensors[f.scoresOut] = {r, Layout::L_MAT, GGML_TYPE_F32};
+              tensors[f.softmaxOut] = r;
+              annTensors[f.softmaxOut] = {r, Layout::L_MAT, GGML_TYPE_F32};
+              tensors[f.svOut] = r;
+              annTensors[f.svOut] = {r, Layout::L_MAT, GGML_TYPE_F32};
+              continue;
+            }
             // scores[i,j] = sum_d q[d,i]*k[d,j]; softmax is along S_k (ONNX
             // axis 3), which must sit at ne0. mul_mat(a,b) computes
             // dst[m,n] = sum_k a[k,m]*b[k,n] -> [a.ne1, b.ne1]. With
@@ -1666,10 +1811,18 @@ struct OnnxToGgml {
             ggml_tensor* b = annA.t;   // qT [D,H,S,N] (identity in L_MAT)
             if(b->ne[1] < b->ne[2])
               b = ggml_cont(ctx, ggml_permute(ctx, b, 0, 2, 1, 3));   // -> [D,S,H,N]
-            ggml_tensor* r = ggml_mul_mat(ctx, a, b);   // [S_k, S_q, H, N]
+            // EXPERIMENT b': F16 operands -> F16 tensor-core GEMM path
+            // (coopmat2 consumes F16 natively; F32 inputs get converted
+            // device-side anyway, GV:9246 -- this makes it explicit and skips
+            // the conversion; softmax below stays the exact soft_max_ext).
+            a = ggml_cast(ctx, a, GGML_TYPE_F16);
+            b = ggml_cast(ctx, b, GGML_TYPE_F16);
+            ggml_tensor* r = ggml_mul_mat(ctx, a, b);   // [S_k, S_q, H, N] F32 out
             registerOut(r, Layout::L_MAT, GGML_TYPE_F32);
           }
           else if(outName.find("/sv") != string::npos) {
+            if(faAbsorbedSv.count(outName) > 0)
+              continue;   // M1: already produced by flash_attn_ext in the scores branch
             // sv[d,i] = sum_j probs[i,j] * v[d,j] (j = S_k contraction).
             // vT (transpose) is identity in L_MAT, so v is [D,H,S,N].
             // mul_mat(A,B) = A^T B with A [K,M], B [K,N]:
@@ -1678,6 +1831,9 @@ struct OnnxToGgml {
             //   -> [D, S_q, H, N].
             ggml_tensor* a = ggml_cont(ctx, ggml_permute(ctx, annB.t, 1, 2, 0, 3)); // v [D,H,S,N]->[S_k,D,H,N]
             ggml_tensor* b = annA.t;   // probs [S_k,S_q,H,N] as-is
+            // EXPERIMENT b': F16 operands for the tensor-core path (see scores)
+            a = ggml_cast(ctx, a, GGML_TYPE_F16);
+            b = ggml_cast(ctx, b, GGML_TYPE_F16);
             ggml_tensor* r = ggml_mul_mat(ctx, a, b);   // [D, S_q, H, N]
             registerOut(r, Layout::L_MAT, GGML_TYPE_F32);
           }
@@ -1980,6 +2136,8 @@ struct OnnxToGgml {
         registerOut(acc);
       }
       else if(op == "Softmax") {
+        if(faAbsorbedSoftmax.count(outName) > 0)
+          continue;   // M1: already produced by flash_attn_ext in the scores branch
         int64_t axis = getAttr(node, "axis").i();
         if(axis != 3)
           throw StringError("VULKAN backend: Softmax is only supported on the last ONNX axis");
