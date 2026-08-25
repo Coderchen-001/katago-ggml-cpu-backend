@@ -183,6 +183,49 @@ struct OnnxToGgml {
   unordered_map<string, SiluFusion> siluFusions;   // by final Mul output name
   unordered_set<string> absorbedSiluNodes;         // Sigmoid + first Mul names
 
+  // ---- F-4: plain swish (x*sigmoid(x)) -> ggml_silu ----
+  // prescanSilu's guard (gate must be a Conv/MatMul output) deliberately
+  // excludes plain swish activations (e.g. normactconv.act, policy head
+  // actg), leaving 26 SIGMOID ops per eval. A Mul(x, Sigmoid(x)) with the
+  // same source tensor is exactly silu(x) = x*sigmoid(x) = swish(x) --
+  // ggml_silu exists, so the pair (Sigmoid + Mul) collapses into one op.
+  // Map: swish Mul output name -> source tensor name.
+  struct SwishFusion {
+    bool active = false;
+    string xSrc;
+  };
+  unordered_map<string, SwishFusion> swishFusions;   // by Mul output name
+
+  void prescanSwish() {
+    const auto& nodes = model.graph().node();
+    unordered_map<string, int> producer;
+    for(int i = 0; i < (int)nodes.size(); i++)
+      for(int j = 0; j < nodes[i].output_size(); j++)
+        producer[nodes[i].output(j)] = i;
+    for(int i = 0; i < (int)nodes.size(); i++) {
+      const onnx::NodeProto& n = nodes[i];
+      if(n.op_type() != "Mul" || n.input_size() != 2)
+        continue;
+      for(int k = 0; k < 2; k++) {
+        auto itSig = producer.find(n.input(k));
+        if(itSig == producer.end())
+          continue;
+        const onnx::NodeProto& sig = nodes[itSig->second];
+        if(sig.op_type() != "Sigmoid" || sig.input_size() < 1)
+          continue;
+        const string& x = sig.input(0);
+        if(n.input(1 - k) != x)
+          continue;   // not swish (needs the same source on both sides)
+        SwishFusion f;
+        f.active = true;
+        f.xSrc = x;
+        swishFusions[n.output(0)] = f;
+        absorbedSiluNodes.insert(sig.name());   // Sigmoid absorbed into silu
+        break;
+      }
+    }
+  }
+
   // ---- S1 fusion: RMSNorm chain ----
   // ONNX exports RMSNorm as Pow(x,2) -> ReduceMean(axes=[C]) -> Add(eps) ->
   // Sqrt -> Div(x, rms) -> Mul(weight). We rebuild the chain as
@@ -1452,6 +1495,7 @@ struct OnnxToGgml {
     }
 
     prescanSilu();
+    prescanSwish();
     prescanRms();
     prescanMaskReassoc();
     prescanSoftmaxScale();
@@ -1682,6 +1726,14 @@ struct OnnxToGgml {
         }
       }
       else if(op == "Mul") {
+        auto itSwish = swishFusions.find(outName);
+        if(itSwish != swishFusions.end() && itSwish->second.active) {
+          // F-4: plain swish x*sigmoid(x) == ggml_silu(x) (single op).
+          auto itX = annTensors.find(itSwish->second.xSrc);
+          testAssert(itX != annTensors.end());
+          registerOut(ggml_silu(ctx, itX->second.t), itX->second.layout, GGML_TYPE_F32);
+        }
+        else {
         auto itSilu = siluFusions.find(outName);
         if(itSilu != siluFusions.end() && itSilu->second.active) {
           // SwiGLU: silu(a) * gate, fused into a single swiglu kernel
@@ -1699,6 +1751,7 @@ struct OnnxToGgml {
           AnnotatedTensor a0 = in(0), a1 = in(1);
           unifyDomains(a0, a1);
           registerOut(binary(a0.t, a1.t, 1), a0.layout, GGML_TYPE_F32);
+        }
         }
       }
       else if(op == "Div") {
