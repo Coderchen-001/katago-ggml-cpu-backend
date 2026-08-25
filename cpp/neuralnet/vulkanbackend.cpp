@@ -432,6 +432,65 @@ struct OnnxToGgml {
   unordered_map<string, ProjFusion> projFusions;   // by xSrc
   unordered_map<string, string> projSegOf;         // convOut -> xSrc
 
+  // ---- Sequence ①: RMSNorm gamma absorption into downstream 1x1 convs ----
+  // Graph: Div(normed) -> Mul(gamma)[scaled] -> Mul(InputMask)[*/mask] -> Conv(W)
+  // Absorb gamma into W by input channel (W'[oc,ic]=W[oc,ic]*gamma[ic], exact for
+  // linear 1x1 convs), leaving Div(normed) -> Mul(InputMask) -> Conv(W') so the
+  // existing RMS_NORM_MUL fusion (ggml-vulkan) eats rms_norm -> mul(mask) -- the
+  // mask is a spatial broadcast [1,S,N] which rms_norm.comp handles correctly
+  // (verified H-2: fastmod(col, ne10=1) -> per-channel broadcast).
+  // Map: conv weight initializer -> rms weight initializer (gamma).
+  unordered_map<string, string> gammaAbsorbOf;
+  // Div output names whose gamma was absorbed (Div branch then skips the gamma mul).
+  unordered_set<string> gammaAbsorbedNorm;
+
+  void prescanGammaAbsorb() {
+    const auto& nodes = model.graph().node();
+    for(auto& kv : rmsFusions) {
+      if(!kv.second.active)
+        continue;
+      const RmsFusion& f = kv.second;
+      // 1) find the mask mul consuming the gamma-scaled output: Mul(scaled, InputMask)
+      string maskOut;
+      for(const auto& c : nodes) {
+        if(c.op_type() != "Mul" || c.input_size() != 2)
+          continue;
+        bool hasMask = false, hasScaled = false;
+        for(int k = 0; k < 2; k++) {
+          if(c.input(k) == "InputMask")
+            hasMask = true;
+          if(c.input(k) == f.mulOut)
+            hasScaled = true;
+        }
+        if(hasMask && hasScaled) {
+          maskOut = c.output(0);
+          break;
+        }
+      }
+      if(maskOut.empty())
+        continue;   // norm not mask-corrected (e.g. trunk-final): keep gamma mul
+      // 2) every 1x1 Conv consuming the masked output gets the gamma absorbed
+      bool anyConv = false;
+      for(const auto& c : nodes) {
+        if(c.op_type() != "Conv" || c.input_size() < 2)
+          continue;
+        bool consumes = false;
+        for(int k = 0; k < c.input_size(); k++)
+          if(c.input(k) == maskOut)
+            consumes = true;
+        if(!consumes)
+          continue;
+        const onnx::TensorProto* wt = findInitializer(c.input(1));
+        if(wt == NULL || wt->dims_size() != 4 || wt->dims(2) != 1 || wt->dims(3) != 1)
+          continue;   // only 1x1 convs are absorb targets
+        gammaAbsorbOf[c.input(1)] = f.weightSrc;
+        anyConv = true;
+      }
+      if(anyConv)
+        gammaAbsorbedNorm.insert(kv.first);
+    }
+  }
+
   void prescanProjFusion() {
     const auto& nodes = model.graph().node();
     unordered_map<string, int> producer;
@@ -505,6 +564,29 @@ struct OnnxToGgml {
     }
   }
 
+  // Conv weight with the RMSNorm gamma absorbed by input channel (Sequence ①).
+  // F16 storage like the plain path; cached per initializer name.
+  ggml_tensor* convWeightWithGamma(const string& initName) {
+    auto itG = gammaAbsorbOf.find(initName);
+    if(itG == gammaAbsorbOf.end())
+      return initializerTensor(initName, GGML_TYPE_F16);
+    const string name = initName + "@gamma";
+    auto it = tensors.find(name);
+    if(it != tensors.end())
+      return it->second;
+    const onnx::TensorProto* wt = findInitializer(initName);
+    testAssert(wt != NULL);
+    vector<float> wf = initializerFloats(*wt);
+    vector<float> gv = initializerFloats(*findInitializer(itG->second));
+    const int64_t IC = (int64_t)gv.size();
+    testAssert((int64_t)wf.size() % IC == 0);
+    vector<uint16_t> bytes(wf.size());
+    for(size_t i = 0; i < wf.size(); i++)
+      bytes[i] = ggml_fp32_to_fp16(wf[i] * gv[i % (size_t)IC]);
+    int64_t ne[4] = {1, 1, IC, (int64_t)(wf.size() / (size_t)IC)};
+    return hostConstant(name, GGML_TYPE_F16, ne, bytes.data());
+  }
+
   void buildFusedProjections(ProjFusion& f) {
     // Shared input must already be built (CS F32).
     auto itX = annTensors.find(f.xSrc);
@@ -525,13 +607,29 @@ struct OnnxToGgml {
       };
       vector<float> wq = rd(f.qInit), wk = rd(f.kInit), wv = rd(f.vInit);
       testAssert((int64_t)wq.size() == f.IC * f.OC);
+      // Sequence ①: absorb each segment's RMSNorm gamma by input channel.
+      auto gammaOf = [&](const string& initName) {
+        vector<float> g;
+        auto itG = gammaAbsorbOf.find(initName);
+        if(itG != gammaAbsorbOf.end())
+          g = initializerFloats(*findInitializer(itG->second));
+        return g;
+      };
+      vector<float> gq = gammaOf(f.qInit), gk = gammaOf(f.kInit), gv = gammaOf(f.vInit);
+      const float* gs[3] = {gq.empty() ? nullptr : gq.data(),
+                            gk.empty() ? nullptr : gk.data(),
+                            gv.empty() ? nullptr : gv.data()};
       vector<uint16_t> bytes((size_t)f.IC * 3 * f.OC);
       uint16_t* dst = bytes.data();
       const float* segs[3] = {wq.data(), wk.data(), wv.data()};
       for(int seg = 0; seg < 3; seg++)
         for(int64_t oc = 0; oc < f.OC; oc++)
-          for(int64_t ic = 0; ic < f.IC; ic++)
-            dst[ic + f.IC * (seg * f.OC + oc)] = ggml_fp32_to_fp16(segs[seg][oc * f.IC + ic]);
+          for(int64_t ic = 0; ic < f.IC; ic++) {
+            float v = segs[seg][oc * f.IC + ic];
+            if(gs[seg])
+              v *= gs[seg][ic];
+            dst[ic + f.IC * (seg * f.OC + oc)] = ggml_fp32_to_fp16(v);
+          }
       int64_t ne[4] = {f.IC, 3 * f.OC, 1, 1};
       hostConstant(wname, GGML_TYPE_F16, ne, bytes.data());
     }
@@ -1359,6 +1457,7 @@ struct OnnxToGgml {
     prescanSoftmaxScale();
     prescanRope();
     prescanProjFusion();
+    // prescanGammaAbsorb();  // EXPERIMENT: disabled for margin isolation
     // Pre-build every RMS weight as a standalone [C,1,1,1] constant (not a
     // reshape view) so the cgraph order becomes rms_norm -> mul with no node
     // between; ggml-vulkan's RMS_NORM_MUL fusion requires mul to directly
@@ -1449,8 +1548,9 @@ struct OnnxToGgml {
         AnnotatedTensor annX = in(0);
         // B1: conv weights are stored natively in F16 (ggml-vulkan converts
         // F32 operands to F16 every eval on coopmat2 devices, and im2col
-        // emits F16 regardless).
-        ggml_tensor* w = initializerTensor(node.input(1), GGML_TYPE_F16);
+        // emits F16 regardless). Sequence ①: if this conv consumes a norm's
+        // masked output, its gamma is absorbed by input channel here.
+        ggml_tensor* w = convWeightWithGamma(node.input(1));
         // Kernel a is [kW, kH, inC, outC] (same bytes as ONNX [outC,inC,kH,kW]).
         int64_t kY = w->ne[1], kX = w->ne[0];
         testAssert(kY == kX && (kY % 2) == 1);
@@ -1614,14 +1714,22 @@ struct OnnxToGgml {
           const RmsFusion& f = itR->second;
           AnnotatedTensor annX = in(0);
           ggml_tensor* x = ensure(annX, Layout::L_CS, GGML_TYPE_F32);   // [C,S,N]
-          // The [C,1,1,1] weight view was pre-built before the node loop so
-          // the cgraph order is rms_norm -> mul with nothing in between
-          // (enables ggml-vulkan's RMS_NORM_MUL fusion).
-          auto itW = rmsWeightViews.find(f.weightSrc);
-          testAssert(itW != rmsWeightViews.end());
-          ggml_tensor* wr = itW->second;
           ggml_tensor* rn = ggml_rms_norm(ctx, x, f.eps);               // [C,S,N]
-          ggml_tensor* sc = ggml_mul(ctx, rn, wr);                      // [C,S,N]
+          ggml_tensor* sc;
+          if(gammaAbsorbedNorm.count(outName) > 0) {
+            // Sequence ①: gamma absorbed into the downstream conv weights; the
+            // next node is the mask Mul, and ggml-vulkan's RMS_NORM_MUL fusion
+            // eats rms_norm -> mul(mask) (mask is spatial broadcast, H-2).
+            sc = rn;
+          }
+          else {
+            // The [C,1,1,1] weight view was pre-built before the node loop so
+            // the cgraph order is rms_norm -> mul with nothing in between
+            // (enables ggml-vulkan's RMS_NORM_MUL fusion).
+            auto itW = rmsWeightViews.find(f.weightSrc);
+            testAssert(itW != rmsWeightViews.end());
+            sc = ggml_mul(ctx, rn, itW->second);                        // [C,S,N]
+          }
           // The weight Mul was absorbed too, so register this result under both
           // the Div output and the Mul output names.
           tensors[outName] = sc;
