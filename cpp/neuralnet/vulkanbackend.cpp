@@ -2155,7 +2155,6 @@ struct OnnxToGgml {
           if(maskFullShared == NULL || maskFullSK != SK || maskFullSQ != SQ || maskFullN != N) {
             int64_t targetNe[4] = {SK, SQ, 1, N};
             maskFullShared = ggml_repeat(ctx, annM.t, shapeRefFor(targetNe));
-            maskFullShared = ggml_repeat(ctx, annM.t, shapeRefFor(targetNe));
             maskFullSK = SK; maskFullSQ = SQ; maskFullN = N;
           }
           registerOut(ggml_soft_max_ext(ctx, annS.t, maskFullShared, f.scale, 0.0f),
@@ -2421,6 +2420,22 @@ struct ComputeHandle {
     ggml_build_forward_expand(graph, outValue);
     ggml_build_forward_expand(graph, outScoreValue);
     ggml_build_forward_expand(graph, outOwnership);
+
+    // KATAGO_VK_MMPREC_F32 (default off = bit-identical): force F32 accumulation
+    // on every mul_mat with an F16 src0 (f16acc -> f32acc, F16 storage kept).
+    // This targets exactly the error sources measured in stage-1 scalar-path
+    // testing (fused QKV proj, 1x1-conv trunk, b' scores/sv all fall to f16acc
+    // under PREC_DEFAULT+fp16, GV:7729-7743). F32xF16 nodes from matmul() are
+    // unconditionally f32acc (GV:7723/4886) and correctly left untouched;
+    // future Q8_0 nodes have non-F16 src0 and are skipped.
+    if(getenv("KATAGO_VK_MMPREC_F32") != nullptr && getenv("KATAGO_VK_MMPREC_F32")[0] == '1') {
+      const int nNodes = ggml_graph_n_nodes(graph);
+      for(int i = 0; i < nNodes; i++) {
+        ggml_tensor* node = ggml_graph_node(graph, i);
+        if(node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F16)
+          ggml_mul_mat_set_prec(node, GGML_PREC_F32);
+      }
+    }
 
     // --- Allocate and upload weights ---
     // Weights get their own buffers first (either per-tensor in the debug
