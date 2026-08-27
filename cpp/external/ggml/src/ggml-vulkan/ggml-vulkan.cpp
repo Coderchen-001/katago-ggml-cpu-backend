@@ -978,6 +978,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f16;
+    vk_pipeline pipeline_rms_norm_mul_mul_f32;
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
 
@@ -1685,6 +1686,15 @@ struct vk_op_rms_norm_mul_rope_push_constants {
     vk_op_binary_push_constants bin;
     vk_op_rope_push_constants rope;
 };
+
+// C-N25: fused rms_norm + mul(gamma) + mul(mask). bin carries src0(x)/src1(gamma)/dst
+// ne+nb (element units); the trailing block carries the second mul src (mask).
+struct vk_op_rms_norm_mul_mul_push_constants {
+    vk_op_binary_push_constants bin;
+    uint32_t mne00; uint32_t mne01; uint32_t mne02; uint32_t mne03;
+    uint32_t mnb00; uint32_t mnb01; uint32_t mnb02; uint32_t mnb03;
+};
+static_assert(sizeof(vk_op_rms_norm_mul_mul_push_constants) <= 256, "sizeof(vk_op_rms_norm_mul_mul_push_constants) must be <= 256");
 
 struct vk_op_soft_max_push_constants {
     uint32_t KX;
@@ -5512,6 +5522,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (sizeof(vk_op_rms_norm_mul_rope_push_constants) <= device->properties.limits.maxPushConstantsSize) {
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_rope_f32_f32, "rms_norm_mul_rope_f32_f32", rms_norm_mul_rope_f32_f32_len, rms_norm_mul_rope_f32_f32_data, "main", 7, sizeof(vk_op_rms_norm_mul_rope_push_constants), {1, 1, 1}, {0, 1}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_rope_f32_f16, "rms_norm_mul_rope_f32_f16", rms_norm_mul_rope_f32_f16_len, rms_norm_mul_rope_f32_f16_data, "main", 7, sizeof(vk_op_rms_norm_mul_rope_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+    }
+    if (sizeof(vk_op_rms_norm_mul_mul_push_constants) <= device->properties.limits.maxPushConstantsSize) {
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_mul_f32, "rms_norm_mul_mul_f32", rms_norm_dual_mul_f32_len, rms_norm_dual_mul_f32_data, "main", 4, sizeof(vk_op_rms_norm_mul_mul_push_constants), {1, 1, 1}, {}, 1, true);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
@@ -13345,16 +13358,64 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
         op_params[0], 0.0f, (int32_t)param3,
     };
 
-    // more than one fused op means rms_norm+mul+rope
+    // more than one fused op means rms_norm+mul+rope, or C-N25 rms_norm+mul+mul
     if (ctx->num_additional_fused_ops > 1) {
         static constexpr uint32_t max_tensors = 7;
         const ggml_tensor *tensors[max_tensors] {};
 
         ggml_tensor *rms = cgraph->nodes[node_idx + 0];
         ggml_tensor *mul = cgraph->nodes[node_idx + 1];
-        ggml_tensor *rope = cgraph->nodes[node_idx + 2];
 
-        ggml_tensor *other_src = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+        if (cgraph->nodes[node_idx + 2]->op == GGML_OP_MUL) {
+            // C-N25: rms_norm + mul(gamma) + mul(mask). gamma is a per-channel
+            // [C] row-broadcast operand, mask a per-position [1,S,N] column-
+            // broadcast operand; both addressed by their own nb in the shader.
+            ggml_tensor *gamma = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+            ggml_tensor *mask  = cgraph->nodes[node_idx + 2]->src[0] == mul ? cgraph->nodes[node_idx + 2]->src[1] : cgraph->nodes[node_idx + 2]->src[0];
+            ggml_tensor *dsty  = cgraph->nodes[node_idx + 2];
+
+            vk_op_rms_norm_mul_mul_push_constants pc;
+            pc.bin = bin;   // src0=x, src1=gamma, dst (mul1 and mul2 share shape/nb)
+            init_pushconst_tensor_offsets(ctx, pc.bin, rms->src[0], gamma, nullptr, nullptr, dsty);
+            const uint32_t mtype_size = ggml_type_size(mask->type);
+            pc.mne00 = (uint32_t)mask->ne[0]; pc.mne01 = (uint32_t)mask->ne[1];
+            pc.mne02 = (uint32_t)mask->ne[2]; pc.mne03 = (uint32_t)mask->ne[3];
+            pc.mnb00 = (uint32_t)(mask->nb[0] / mtype_size); pc.mnb01 = (uint32_t)(mask->nb[1] / mtype_size);
+            pc.mnb02 = (uint32_t)(mask->nb[2] / mtype_size); pc.mnb03 = (uint32_t)(mask->nb[3] / mtype_size);
+
+            vk_pipeline pipeline = ctx->device->pipeline_rms_norm_mul_mul_f32;
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+            ggml_backend_vk_buffer_context * buf_ctx[4];
+            vk_buffer buf[4];
+            size_t offset[4];
+            bool uma[4];
+            const ggml_tensor * tlist[4] = { rms->src[0], gamma, mask, dsty };
+            for (uint32_t i = 0; i < 4; ++i) {
+                buf_ctx[i] = (ggml_backend_vk_buffer_context *)tlist[i]->buffer->context;
+                buf[i] = nullptr; offset[i] = 0; uma[i] = false;
+                if (ctx->device->uma) {
+                    ggml_vk_host_get(ctx->device, tlist[i]->data, buf[i], offset[i]);
+                    uma[i] = buf[i] != nullptr;
+                }
+                if (!uma[i]) {
+                    buf[i] = buf_ctx[i]->dev_buffer;
+                    offset[i] = vk_tensor_offset(tlist[i]) + tlist[i]->view_offs;
+                }
+                GGML_ASSERT(buf[i] != nullptr);
+            }
+
+            std::array<uint32_t, 3> elements = { (uint32_t)rms->src[0]->ne[1], (uint32_t)rms->src[0]->ne[2], (uint32_t)rms->src[0]->ne[3] };
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                {
+                    ggml_vk_subbuffer(ctx, buf[0], offset[0]),
+                    ggml_vk_subbuffer(ctx, buf[1], offset[1]),
+                    ggml_vk_subbuffer(ctx, buf[2], offset[2]),
+                    ggml_vk_subbuffer(ctx, buf[3], offset[3]),
+                }, pc, elements);
+        } else {
+            ggml_tensor *rope = cgraph->nodes[node_idx + 2];
+            ggml_tensor *other_src = mul->src[0] == rms ? mul->src[1] : mul->src[0];
 
         bool do_set_rows = ctx->num_additional_fused_ops == 4;
 
@@ -13422,6 +13483,7 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
                 ggml_vk_subbuffer(ctx, buf[5], offset[5]),
                 ggml_vk_subbuffer(ctx, buf[6], offset[6]),
             }, pc, elements);
+        }
     } else {
         ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
     }
@@ -17050,6 +17112,35 @@ static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, co
     return true;
 }
 
+static bool ggml_vk_can_fuse_rms_norm_mul_mul(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                               int node_idx) {
+    const ggml_tensor *rms  = cgraph->nodes[node_idx + 0];
+    const ggml_tensor *mul1 = cgraph->nodes[node_idx + 1];
+    const ggml_tensor *mul2 = cgraph->nodes[node_idx + 2];
+
+    // noncontig tensors aren't tested
+    if (!ggml_is_contiguous(rms) ||
+        !ggml_is_contiguous(mul1) ||
+        !ggml_is_contiguous(mul2)) {
+        return false;
+    }
+    // both muls must be F32 (gamma weight + mask broadcast)
+    if (mul1->type != GGML_TYPE_F32 || mul2->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // the second mul's src (mask) has no per-element offset encoding in the
+    // push constants (only a/b/d offsets exist), so it must be aligned
+    ggml_tensor *other2 = mul2->src[0] == mul1 ? mul2->src[1] : mul2->src[0];
+    if (get_misalign_bytes(ctx, other2) != 0) {
+        return false;
+    }
+    // conditions for pipeline creation
+    if (sizeof(vk_op_rms_norm_mul_mul_push_constants) > ctx->device->properties.limits.maxPushConstantsSize) {
+        return false;
+    }
+    return true;
+}
+
 static uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
 
     const ggml_tensor *first_node = cgraph->nodes[node_idx];
@@ -17325,6 +17416,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "RMS_NORM_MUL_ROPE";
                 // rope is approximately elementwise - whole rows are done by a single workgroup and it's row-wise
                 op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL }) &&
+                       ggml_vk_can_fuse_rms_norm_mul_mul(ctx, cgraph, i)) {
+                // C-N25: rms_norm + mul(gamma) + mul(mask). MUST precede the
+                // two-node RMS_NORM_MUL branch below (else-if chain), or the
+                // dual version eats the first two nodes and this never fires.
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "RMS_NORM_MUL_MUL";
+                op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
