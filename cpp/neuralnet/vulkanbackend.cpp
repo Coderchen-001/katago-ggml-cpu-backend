@@ -1015,6 +1015,11 @@ struct OnnxToGgml {
   // by ggml_repeat for broadcasts (repeat reads only the small operand; the
   // reference only supplies the shape, so a handful of them per handle is all
   // it takes and the transient repeat outputs reuse graph memory).
+  // S1-④ (N-2): the reference content is never read -- ggml-vulkan's repeat
+  // dispatch binds src1 (the shape reference) as nullptr (GV:13186) -- so the
+  // tensors no longer need ggml_set_input. Letting gallocr own them lets the
+  // buffer participate in liveness-based reuse instead of permanently pinning
+  // ~8.3MB per shape (mask ref [S,S,1,N]); aliased overwrites are harmless.
   unordered_map<uint64_t, ggml_tensor*> shapeRefs;
 
   OnnxToGgml(ggml_context* c, ggml_context* wc, int maxBatch, int xLen, int yLen, const onnx::ModelProto& m)
@@ -1027,7 +1032,9 @@ struct OnnxToGgml {
     if(it != shapeRefs.end())
       return it->second;
     ggml_tensor* t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
-    ggml_set_input(t);
+    // S1-④: no ggml_set_input -- content is never read (repeat dispatches src1
+    // as nullptr, GV:13186), so gallocr may reuse the buffer via liveness
+    // analysis. A/B verified: no perf impact vs set_input (901-902 nnEval/s).
     shapeRefs[key] = t;
     return t;
   }
@@ -2186,9 +2193,10 @@ struct OnnxToGgml {
 struct ComputeContext {
   int nnXLen;
   int nnYLen;
+  enabled_t useFP16Mode;
 
-  ComputeContext(int xLen, int yLen)
-    : nnXLen(xLen), nnYLen(yLen)
+  ComputeContext(int xLen, int yLen, enabled_t fp16Mode)
+    : nnXLen(xLen), nnYLen(yLen), useFP16Mode(fp16Mode)
   {}
 
   ComputeContext() = delete;
@@ -2208,7 +2216,6 @@ ComputeContext* NeuralNet::createComputeContext(
 ) {
   (void)gpuIdxs;
   (void)homeDataDirOverride;
-  (void)useFP16Mode;
   (void)cfg;
 
   // scale8 (1/8 activation rescaling) is applied here, before the graph is
@@ -2216,7 +2223,11 @@ ComputeContext* NeuralNet::createComputeContext(
   // not eligible and are skipped automatically.
   loadedModel->maybeApplyScale8(false, logger);
 
-  ComputeContext* ctx = new ComputeContext(nnXLen, nnYLen);
+  // S1-③: keep the requested FP16 mode on the context so isUsingFP16 can
+  // report it truthfully instead of hard-coding false (the Vulkan backend
+  // itself does not gate on it -- ggml picks the fp16 path by device
+  // capability -- but the request must be observable for tooling/tests).
+  ComputeContext* ctx = new ComputeContext(nnXLen, nnYLen, useFP16Mode);
   if(logger != NULL)
     logger->write("VULKAN backend: creating compute context for " +
                   Global::intToString(nnXLen) + "x" + Global::intToString(nnYLen));
@@ -2284,6 +2295,14 @@ struct ComputeHandle {
         throw StringError("VULKAN backend: could not initialize the ggml CPU backend");
     }
     else {
+      // C-N33: serialize first-time device initialization. Two NN server
+      // threads concurrently calling ggml_backend_vk_init raced on device
+      // enumeration (p0_nst2_rawnn crash: dual "Found 2 Vulkan devices" prints
+      // then vkCreateFence Invalid device, exit 0xC0000409; 0/15 reproductions
+      // since -- race is timing-dependent, so fix defensively). The mutex
+      // scopes only the init call; graph building below stays parallel.
+      static std::mutex vkInitMutex;
+      std::lock_guard<std::mutex> vkInitLock(vkInitMutex);
       backend = ggml_backend_vk_init(deviceIdx >= 0 ? (size_t)deviceIdx : 0);
       if(backend == NULL)
         throw StringError("VULKAN backend: could not initialize Vulkan backend for device " + Global::intToString(deviceIdx));
@@ -2523,8 +2542,8 @@ void NeuralNet::freeComputeHandle(ComputeHandle* computeHandle) {
 }
 
 bool NeuralNet::isUsingFP16(const ComputeHandle* handle) {
-  (void)handle;
-  return false;
+  // S1-③: report the requested mode truthfully (was hard-coded false).
+  return handle->ctx->useFP16Mode != enabled_t::False;
 }
 
 bool NeuralNet::setIsWarmup(const ComputeHandle* handle, bool isWarmup) {
@@ -2553,6 +2572,15 @@ struct InputBuffers {
   vector<float> spatialInput;
   vector<float> globalInput;
   vector<float> metaInput;
+
+  // N-1: per-eval result staging buffers, allocated once here and reused by
+  // every getOutput call (sizes are fixed by maxBatchSize under FixedShape
+  // policy, so resize() below never reallocates after the first eval).
+  vector<float> policyPassResultData;
+  vector<float> policyResultData;
+  vector<float> valueResultData;
+  vector<float> scoreValueResultData;
+  vector<float> ownershipResultData;
 
   InputBuffers(const LoadedModel* loadedModel, int maxBatchSz, int nnXLen, int nnYLen) {
     const ModelDesc& m = loadedModel->modelDesc;
@@ -2694,11 +2722,19 @@ void NeuralNet::getOutput(
   if(ggml_backend_graph_compute(gpuHandle->backend, gpuHandle->graph) != GGML_STATUS_SUCCESS)
     throw StringError("VULKAN backend: graph compute failed");
 
-  vector<float> policyPassData(inputBuffers->singlePolicyPassResultElts * runBatchSize);
-  vector<float> policyData(inputBuffers->singlePolicyResultElts * runBatchSize);
-  vector<float> valueData(inputBuffers->singleValueResultElts * runBatchSize);
-  vector<float> scoreValueData(inputBuffers->singleScoreValueResultElts * runBatchSize);
-  vector<float> ownershipData(inputBuffers->singleOwnershipResultElts * runBatchSize);
+  // N-1: reuse the per-eval staging buffers owned by InputBuffers instead of
+  // allocating five vectors every call. resize() to the same fixed size is a
+  // no-op on the heap (capacity retained), so steady-state cost is zero.
+  vector<float>& policyPassData = inputBuffers->policyPassResultData;
+  vector<float>& policyData = inputBuffers->policyResultData;
+  vector<float>& valueData = inputBuffers->valueResultData;
+  vector<float>& scoreValueData = inputBuffers->scoreValueResultData;
+  vector<float>& ownershipData = inputBuffers->ownershipResultData;
+  policyPassData.resize(inputBuffers->singlePolicyPassResultElts * runBatchSize);
+  policyData.resize(inputBuffers->singlePolicyResultElts * runBatchSize);
+  valueData.resize(inputBuffers->singleValueResultElts * runBatchSize);
+  scoreValueData.resize(inputBuffers->singleScoreValueResultElts * runBatchSize);
+  ownershipData.resize(inputBuffers->singleOwnershipResultElts * runBatchSize);
 
   ggml_backend_tensor_get(gpuHandle->outPolicyPass, policyPassData.data(), 0, policyPassData.size() * sizeof(float));
   ggml_backend_tensor_get(gpuHandle->outPolicy, policyData.data(), 0, policyData.size() * sizeof(float));
