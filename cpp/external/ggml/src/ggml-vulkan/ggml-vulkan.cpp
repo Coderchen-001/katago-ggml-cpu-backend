@@ -17124,14 +17124,24 @@ static bool ggml_vk_can_fuse_rms_norm_mul_mul(ggml_backend_vk_context * ctx, con
         !ggml_is_contiguous(mul2)) {
         return false;
     }
+    // The shader reads through the SRC tensors with per-element col indexing
+    // (no dim0-stride multiply on data_a/data_b/data_c), so the srcs must be
+    // dim0-contiguous themselves -- node contiguity does NOT imply src
+    // layout (gamma is an initializer weight, mask can come from anywhere).
+    ggml_tensor *gamma = mul1->src[0] == rms ? mul1->src[1] : mul1->src[0];
+    ggml_tensor *mask  = mul2->src[0] == mul1 ? mul2->src[1] : mul2->src[0];
+    if (!ggml_is_contiguous(rms->src[0]) ||
+        !ggml_is_contiguous(gamma) ||
+        !ggml_is_contiguous(mask)) {
+        return false;
+    }
     // both muls must be F32 (gamma weight + mask broadcast)
     if (mul1->type != GGML_TYPE_F32 || mul2->type != GGML_TYPE_F32) {
         return false;
     }
     // the second mul's src (mask) has no per-element offset encoding in the
     // push constants (only a/b/d offsets exist), so it must be aligned
-    ggml_tensor *other2 = mul2->src[0] == mul1 ? mul2->src[1] : mul2->src[0];
-    if (get_misalign_bytes(ctx, other2) != 0) {
+    if (get_misalign_bytes(ctx, mask) != 0) {
         return false;
     }
     // conditions for pipeline creation
@@ -17425,6 +17435,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // dual version eats the first two nodes and this never fires.
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "RMS_NORM_MUL_MUL";
+                // dual-mul has no shmem relay: a single workgroup per row does
+                // stats + both multiplies + write in one pass, so fused ops can
+                // be accounted elementwise (unlike the ROPE variant, which needs
+                // a full-row relay and sets false). Revisit if a relay is added.
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
