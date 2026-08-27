@@ -979,6 +979,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f16;
     vk_pipeline pipeline_rms_norm_mul_mul_f32;
+    vk_pipeline pipeline_rope_fused_f32;
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
 
@@ -1695,6 +1696,20 @@ struct vk_op_rms_norm_mul_mul_push_constants {
     uint32_t mnb00; uint32_t mnb01; uint32_t mnb02; uint32_t mnb03;
 };
 static_assert(sizeof(vk_op_rms_norm_mul_mul_push_constants) <= 256, "sizeof(vk_op_rms_norm_mul_mul_push_constants) must be <= 256");
+
+// S2-⑦: fused RoPE {GET_ROWS, MUL, MUL, ADD}. Five tensors: q2/ids/cos2/sin2/dst,
+// each ne+nb in element units (ids is I32), plus M/D row/col counts.
+struct vk_op_rope_fused_push_constants {
+    uint32_t M; uint32_t D;
+    uint32_t ne00; uint32_t ne01; uint32_t ne02; uint32_t ne03; uint32_t nb00; uint32_t nb01; uint32_t nb02; uint32_t nb03;
+    uint32_t ne10; uint32_t ne11; uint32_t ne12; uint32_t ne13; uint32_t nb10; uint32_t nb11; uint32_t nb12; uint32_t nb13;
+    uint32_t ne20; uint32_t ne21; uint32_t ne22; uint32_t ne23; uint32_t nb20; uint32_t nb21; uint32_t nb22; uint32_t nb23;
+    uint32_t ne30; uint32_t ne31; uint32_t ne32; uint32_t ne33; uint32_t nb30; uint32_t nb31; uint32_t nb32; uint32_t nb33;
+    uint32_t ne40; uint32_t ne41; uint32_t ne42; uint32_t ne43; uint32_t nb40; uint32_t nb41; uint32_t nb42; uint32_t nb43;
+    uint32_t misalign_offsets;
+    float param1; float param2; int32_t param3;
+};
+static_assert(sizeof(vk_op_rope_fused_push_constants) <= 256, "sizeof(vk_op_rope_fused_push_constants) must be <= 256");
 
 struct vk_op_soft_max_push_constants {
     uint32_t KX;
@@ -5525,6 +5540,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     if (sizeof(vk_op_rms_norm_mul_mul_push_constants) <= device->properties.limits.maxPushConstantsSize) {
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_mul_f32, "rms_norm_mul_mul_f32", rms_norm_dual_mul_f32_len, rms_norm_dual_mul_f32_data, "main", 4, sizeof(vk_op_rms_norm_mul_mul_push_constants), {1, 1, 1}, {}, 1, true);
+    }
+    if (sizeof(vk_op_rope_fused_push_constants) <= device->properties.limits.maxPushConstantsSize) {
+        ggml_vk_create_pipeline(device, device->pipeline_rope_fused_f32, "rope_fused_f32", rope_fused_f32_len, rope_fused_f32_data, "main", 5, sizeof(vk_op_rope_fused_push_constants), {1, 1, 1}, {}, 1, true);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
@@ -12466,6 +12484,262 @@ static void ggml_vk_get_rows_back(ggml_backend_vk_context * ctx, vk_context& sub
     });
 }
 
+// ---- S2-⑦ probe (Plan A1, op-level dump): KATAGO_VK_ROPE_DUMP=site,count ----
+// ggml reuses intermediate-tensor buffers across a graph, so reading a site's
+// tensors at the graph boundary returns the LAST writer's values (observed:
+// site1..4 q2 identical, site0 out all-zero). Each site is therefore dumped
+// IMMEDIATELY after its own dispatch instead:
+//   - fused pass : inside ggml_vk_rope_fused
+//   - plain chain: inside ggml_vk_add (identified as ADD of two MULs where one
+//     MUL's src is a GET_ROWS output sharing q2; needs KATAGO_VK_ROPE_DISABLE=1)
+// A ggml_vk_synchronize() precedes the readback so the site's dispatch (still
+// unsubmitted in the compute cmd buffer) is guaranteed to have executed; this
+// breaks batching, acceptable for a probe.
+// Env: site = "all" or station index 0..65; count = elements printed per
+// tensor (default 16, 0 = dims only). Files: rope_dump_<on|off>_g<exec>_s<site>.bin
+// (8 u32 header + q2/cos2/sin2/out floats + ids int32 + 12 summary floats).
+// Only the first 4 graph computations per process are dumped (one per
+// testgpuerror phase); probe code stays uncommitted.
+struct ggml_vk_rope_dump_state {
+    bool enabled = false;
+    bool off_mode = false;
+    int site_filter = -1;   // -1 = all
+    int print_count = 16;
+    int exec = -1;          // graph-compute counter, incremented in begin_graph
+    int site = 0;           // per-graph site counter, reset in begin_graph
+    ggml_vk_rope_dump_state() {
+        const char * env = getenv("KATAGO_VK_ROPE_DUMP");
+        if (env == nullptr || env[0] == '\0') {
+            return;
+        }
+        enabled = true;
+        off_mode = getenv("KATAGO_VK_ROPE_DISABLE") != nullptr;
+        std::string s(env);
+        const size_t comma = s.find(',');
+        const std::string site_str = (comma == std::string::npos) ? s : s.substr(0, comma);
+        const std::string cnt_str  = (comma == std::string::npos) ? "" : s.substr(comma + 1);
+        if (!site_str.empty() && site_str != "all") {
+            site_filter = atoi(site_str.c_str());
+        }
+        if (!cnt_str.empty()) {
+            print_count = atoi(cnt_str.c_str());
+        }
+    }
+};
+
+static ggml_vk_rope_dump_state & ggml_vk_rope_dump() {
+    static ggml_vk_rope_dump_state s;
+    return s;
+}
+
+static void ggml_vk_rope_dump_begin_graph() {
+    ggml_vk_rope_dump_state & s = ggml_vk_rope_dump();
+    if (!s.enabled) {
+        return;
+    }
+    s.exec++;
+    s.site = 0;
+}
+
+static void ggml_vk_rope_dump_site(ggml_backend_vk_context * ctx, vk_context& subctx,
+                                   const ggml_tensor * q2, const ggml_tensor * ids,
+                                   const ggml_tensor * cos2, const ggml_tensor * sin2,
+                                   const ggml_tensor * dst) {
+    ggml_vk_rope_dump_state & s = ggml_vk_rope_dump();
+    if (!s.enabled || s.exec < 0 || s.exec >= 4) {
+        return;
+    }
+    const int site_idx = s.site++;
+    if (s.site_filter >= 0 && s.site_filter != site_idx) {
+        return;
+    }
+
+    // This site's dispatch is still in the unsubmitted compute cmd buffer
+    // (batched with earlier nodes). End/submit/wait it now, then re-begin the
+    // context so graph building continues normally. Unlike ggml_vk_synchronize
+    // this does NOT reset the cmd buffer or destroy the context, so the
+    // build_graph bookkeeping after the op stays valid.
+    ggml_vk_ctx_end(subctx);
+    ggml_vk_submit(subctx, ctx->device->fence);
+    VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX), "rope dump waitForFences", ctx->device);
+    ctx->device->device.resetFences({ ctx->device->fence });
+    ggml_vk_ctx_begin(ctx->device, subctx);
+
+    const char * mode_str = s.off_mode ? "off" : "on";
+    const uint32_t u_mode = s.off_mode ? 1u : 0u;
+    const size_t M = (size_t)q2->ne[1], D = (size_t)q2->ne[0];
+    const size_t cnt = M * D;
+    fprintf(stdout, "ROPE_DUMP mode=%s exec=%d site=%d M=%zu D=%zu cnt=%zu\n", mode_str, s.exec, site_idx, M, D, cnt);
+
+    // sizes from ggml_nelements: ids length is the head-dim count (q2->ne[1]),
+    // NOT q2->ne[0] -- the fused shader indexes ids by head dim d = i / D.
+    const size_t qn = ggml_nelements(q2), cn = ggml_nelements(cos2),
+                 sn = ggml_nelements(sin2), on = ggml_nelements(dst),
+                 idn = ggml_nelements(ids);
+    std::vector<float> qv(qn), cv(cn), sv(sn), ov(on);
+    std::vector<int32_t> idv(idn);
+    ggml_backend_tensor_get(q2,  qv.data(), 0, qn*sizeof(float));
+    ggml_backend_tensor_get(cos2, cv.data(), 0, cn*sizeof(float));
+    ggml_backend_tensor_get(sin2, sv.data(), 0, sn*sizeof(float));
+    ggml_backend_tensor_get(const_cast<ggml_tensor *>(dst), ov.data(), 0, on*sizeof(float));
+    ggml_backend_tensor_get(ids,  idv.data(), 0, idn*sizeof(int32_t));
+
+    if (s.print_count > 0) {
+        auto print_vals = [&](const char * tag, const float * p, size_t n) {
+            const size_t k = std::min<size_t>((size_t)s.print_count, n);
+            fprintf(stdout, "ROPE_DUMP   %s[0..%zu] =", tag, k - 1);
+            for (size_t j = 0; j < k; ++j) fprintf(stdout, " %.7g", p[j]);
+            fprintf(stdout, "\n");
+        };
+        print_vals("q2", qv.data(), qn);
+        print_vals("cos2", cv.data(), cn);
+        print_vals("sin2", sv.data(), sn);
+        print_vals("out", ov.data(), on);
+        const size_t k = std::min<size_t>((size_t)s.print_count, idn);
+        fprintf(stdout, "ROPE_DUMP   ids[0..%zu] =", k - 1);
+        for (size_t j = 0; j < k; ++j) fprintf(stdout, " %d", idv[j]);
+        fprintf(stdout, "\n");
+    }
+
+    char fname[128];
+    snprintf(fname, sizeof(fname), "rope_dump_%s_g%03d_s%03d.bin", mode_str, s.exec, site_idx);
+    FILE * f = fopen(fname, "wb");
+    if (f == nullptr) {
+        fprintf(stderr, "ROPE_DUMP: cannot open %s\n", fname);
+        return;
+    }
+    const uint32_t magic = 0x524F5045u, version = 1u;
+    const uint32_t uM = (uint32_t)M, uD = (uint32_t)D, ucnt = (uint32_t)cnt, uids = (uint32_t)idn;
+    fwrite(&magic, 4, 1, f);
+    fwrite(&version, 4, 1, f);
+    fwrite(&u_mode, 4, 1, f);
+    fwrite(&s.exec, 4, 1, f);
+    fwrite(&site_idx, 4, 1, f);
+    fwrite(&uM, 4, 1, f);
+    fwrite(&uD, 4, 1, f);
+    fwrite(&ucnt, 4, 1, f);
+    fwrite(&uids, 4, 1, f);
+    fwrite(qv.data(), 4, qn, f);
+    fwrite(cv.data(), 4, cn, f);
+    fwrite(sv.data(), 4, sn, f);
+    fwrite(ov.data(), 4, on, f);
+    fwrite(idv.data(), 4, idn, f);
+    auto summary = [](const std::vector<float> & v) -> std::tuple<float,float,float> {
+        double sum = 0; float mn = v[0], mx = v[0];
+        for (size_t j = 0; j < v.size(); ++j) { sum += v[j]; mn = std::min(mn, v[j]); mx = std::max(mx, v[j]); }
+        return std::make_tuple((float)sum, mn, mx);
+    };
+    auto write_summary = [&](const std::vector<float> & v) {
+        const std::tuple<float,float,float> t = summary(v);
+        const float a = std::get<0>(t), b = std::get<1>(t), c = std::get<2>(t);
+        fwrite(&a, 4, 1, f); fwrite(&b, 4, 1, f); fwrite(&c, 4, 1, f);
+    };
+    write_summary(qv);
+    write_summary(cv);
+    write_summary(sv);
+    write_summary(ov);
+    fclose(f);
+}
+
+// S2-⑦ probe: dump plain-chain RoPE outputs (KATAGO_VK_ROPE_DISABLE=1 run)
+// right after the ADD's dispatch. Identify the rope chain ADD: both srcs are
+// MULs; one MUL consumes a GET_ROWS output directly and the other consumes
+// that GET_ROWS' src0 (q2).
+static void ggml_vk_rope_dump_maybe(ggml_backend_vk_context * ctx, vk_context& subctx,
+                                     const ggml_tensor * src0, const ggml_tensor * src1,
+                                     const ggml_tensor * dst) {
+    if (!(src0->op == GGML_OP_MUL && src1->op == GGML_OP_MUL)) {
+        return;
+    }
+    const ggml_tensor * gr = nullptr;
+    for (const ggml_tensor * m : { src0, src1 }) {
+        for (int si = 0; si < 2; ++si) {
+            if (m->src[si] && m->src[si]->op == GGML_OP_GET_ROWS) {
+                gr = m->src[si];
+                break;
+            }
+        }
+        if (gr != nullptr) {
+            break;
+        }
+    }
+    if (gr == nullptr) {
+        return;
+    }
+    const ggml_tensor * q2 = gr->src[0];
+    // m1 consumes q2 directly (mul(q2,cos2)); m2 consumes the get_rows output
+    // (mul(sw2,sin2)).
+    const ggml_tensor * m1 = ((src0->src[0] == q2) || (src0->src[1] == q2)) ? src0 : src1;
+    const ggml_tensor * m2 = (m1 == src0) ? src1 : src0;
+    if (!(m2->src[0] == gr || m2->src[1] == gr)) {
+        return;
+    }
+    const ggml_tensor * cos2 = (m1->src[0] == q2) ? m1->src[1] : m1->src[0];
+    const ggml_tensor * sin2 = (m2->src[0] == gr) ? m2->src[1] : m2->src[0];
+    ggml_vk_rope_dump_site(ctx, subctx, q2, gr->src[1], cos2, sin2, dst);
+}
+
+// S2-⑦: fused RoPE {MUL, GET_ROWS, MUL, ADD} dispatch (cgraph order: t1=mul(q2,cos2)
+// is expanded before the get_rows branch). Shader reads q2/ids/cos2/sin2 linearly
+// and writes dst; guard guarantees all five are contiguous (lesson #28).
+static void ggml_vk_rope_fused(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor *m1  = cgraph->nodes[node_idx + 0];  // MUL(q2, cos2)
+    const ggml_tensor *gr  = cgraph->nodes[node_idx + 1];  // GET_ROWS(q2, ids)
+    const ggml_tensor *m2  = cgraph->nodes[node_idx + 2];  // MUL(sw2, sin2)
+    const ggml_tensor *dsty = cgraph->nodes[node_idx + 3]; // ADD
+    const ggml_tensor *q2  = gr->src[0];
+    const ggml_tensor *ids = gr->src[1];
+    const ggml_tensor *cos2 = (m1->src[0] == q2) ? m1->src[1] : m1->src[0];
+    const ggml_tensor *sin2 = (m2->src[0] == gr) ? m2->src[1] : m2->src[0];
+
+    const ggml_tensor * tl[5] = { q2, ids, cos2, sin2, dsty };
+    uint32_t tsize[5];
+    for (int i = 0; i < 5; ++i) tsize[i] = ggml_type_size(tl[i]->type);
+
+    vk_op_rope_fused_push_constants pc {};
+    pc.M = (uint32_t)q2->ne[1];   // note: named M but holds D (shader uses p.D for
+    pc.D = (uint32_t)q2->ne[0];   // the i/D decomposition; D must be the row count)
+    uint32_t *ne = &pc.ne00, *nb = &pc.nb00;
+    for (int i = 0; i < 5; ++i) {
+        for (int j = 0; j < 4; ++j) { ne[j] = (uint32_t)tl[i]->ne[j]; nb[j] = (uint32_t)(tl[i]->nb[j] / tsize[i]); }
+        ne += 8; nb += 8;
+    }
+
+    vk_pipeline pipeline = ctx->device->pipeline_rope_fused_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    ggml_backend_vk_buffer_context * buf_ctx[5];
+    vk_buffer buf[5];
+    size_t offset[5];
+    bool uma[5];
+    for (uint32_t i = 0; i < 5; ++i) {
+        buf_ctx[i] = (ggml_backend_vk_buffer_context *)tl[i]->buffer->context;
+        buf[i] = nullptr; offset[i] = 0; uma[i] = false;
+        if (ctx->device->uma) {
+            ggml_vk_host_get(ctx->device, tl[i]->data, buf[i], offset[i]);
+            uma[i] = buf[i] != nullptr;
+        }
+        if (!uma[i]) {
+            buf[i] = buf_ctx[i]->dev_buffer;
+            offset[i] = vk_tensor_offset(tl[i]) + tl[i]->view_offs;
+        }
+        GGML_ASSERT(buf[i] != nullptr);
+    }
+
+    const uint64_t total = (uint64_t)q2->ne[0] * q2->ne[1];
+    std::array<uint32_t, 3> elements = { (uint32_t)((total + 127) / 128), 1, 1 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {
+            ggml_vk_subbuffer(ctx, buf[0], offset[0]),
+            ggml_vk_subbuffer(ctx, buf[1], offset[1]),
+            ggml_vk_subbuffer(ctx, buf[2], offset[2]),
+            ggml_vk_subbuffer(ctx, buf[3], offset[3]),
+            ggml_vk_subbuffer(ctx, buf[4], offset[4]),
+        }, pc, elements);
+
+    ggml_vk_rope_dump_site(ctx, subctx, q2, ids, cos2, sin2, dsty);
+}
+
 static void ggml_vk_acc(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = ggml_type_size(src1->type);
@@ -12591,6 +12865,10 @@ static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx,
             ggml_vk_subbuffer(ctx, buf[10], offset[10]),
             ggml_vk_subbuffer(ctx, buf[11], offset[11]),
         }, pc, elements);
+
+    // S2-⑦ probe: a plain-chain rope ADD followed by a residual ADD is fused
+    // into multi_add; dump it here (tensors[0]/tensors[1] are the first ADD's srcs).
+    ggml_vk_rope_dump_maybe(ctx, subctx, tensors[0], tensors[1], dst);
 }
 
 static void ggml_vk_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -12606,6 +12884,9 @@ static void ggml_vk_add(ggml_backend_vk_context * ctx, vk_context& subctx, const
         0,
         0.0f, 0.0f, ctx->do_add_rms_partials,
     });
+
+    // S2-⑦ probe: dump plain-chain RoPE outputs (KATAGO_VK_ROPE_DISABLE=1 run)
+    ggml_vk_rope_dump_maybe(ctx, subctx, src0, src1, dst);
 }
 
 static void ggml_vk_out_prod(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -15541,8 +15822,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_GET_ROWS:
-        ggml_vk_get_rows(ctx, compute_ctx, src0, src1, node);
-
+        if (ctx->num_additional_fused_ops > 0) {
+            // S2-⑦: fused RoPE {GET_ROWS, MUL, MUL, ADD}
+            ggml_vk_rope_fused(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_get_rows(ctx, compute_ctx, src0, src1, node);
+        }
         break;
     case GGML_OP_GET_ROWS_BACK:
         ggml_vk_get_rows_back(ctx, compute_ctx, src0, src1, node);
@@ -15564,7 +15849,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_MUL:
         if (ctx->num_additional_fused_ops) {
-            ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
+            if (cgraph->nodes[node_idx + 1]->op == GGML_OP_GET_ROWS) {
+                // S2-⑦: RoPE {MUL, GET_ROWS, MUL, ADD} fused dispatch
+                ggml_vk_rope_fused(ctx, compute_ctx, cgraph, node_idx);
+            } else {
+                ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
+            }
         } else {
             ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
         }
@@ -17151,6 +17441,45 @@ static bool ggml_vk_can_fuse_rms_norm_mul_mul(ggml_backend_vk_context * ctx, con
     return true;
 }
 
+static bool ggml_vk_can_fuse_rope_gr_mul_mul_add(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                                  int node_idx) {
+    const ggml_tensor *m1 = cgraph->nodes[node_idx + 0];  // MUL(q2, cos2)
+    const ggml_tensor *gr = cgraph->nodes[node_idx + 1];  // GET_ROWS(q2, ids)
+    const ggml_tensor *m2 = cgraph->nodes[node_idx + 2];  // MUL(sw2, sin2)
+    const ggml_tensor *ad = cgraph->nodes[node_idx + 3];  // ADD(t1, t2)
+
+    // node contiguity
+    if (!ggml_is_contiguous(m1) || !ggml_is_contiguous(gr) ||
+        !ggml_is_contiguous(m2) || !ggml_is_contiguous(ad)) {
+        return false;
+    }
+    // structure: m1 multiplies q2 (= gr's src0), m2 multiplies gr's output, add combines both
+    const ggml_tensor *q2 = gr->src[0];
+    if (!(m1->src[0] == q2 || m1->src[1] == q2)) return false;
+    if (!(m2->src[0] == gr || m2->src[1] == gr)) return false;
+    if (!((ad->src[0] == m1 && ad->src[1] == m2) || (ad->src[0] == m2 && ad->src[1] == m1))) return false;
+    // types: q2/cos2/sin2/dst F32, ids I32
+    if (q2->type != GGML_TYPE_F32 || gr->src[1]->type != GGML_TYPE_I32) {
+        return false;
+    }
+    const ggml_tensor *cos2 = (m1->src[0] == q2) ? m1->src[1] : m1->src[0];
+    const ggml_tensor *sin2 = (m2->src[0] == gr) ? m2->src[1] : m2->src[0];
+    if (cos2->type != GGML_TYPE_F32 || sin2->type != GGML_TYPE_F32) return false;
+
+    // The shader uses per-element linear indexing without dim0-stride
+    // multiplies, so every SRC must be contiguous itself (node contiguity
+    // does NOT imply src layout -- lesson #28).
+    if (!ggml_is_contiguous(q2) || !ggml_is_contiguous(gr->src[1]) ||
+        !ggml_is_contiguous(cos2) || !ggml_is_contiguous(sin2)) {
+        return false;
+    }
+    // conditions for pipeline creation
+    if (sizeof(vk_op_rope_fused_push_constants) > ctx->device->properties.limits.maxPushConstantsSize) {
+        return false;
+    }
+    return true;
+}
+
 static uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
 
     const ggml_tensor *first_node = cgraph->nodes[node_idx];
@@ -17235,6 +17564,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->prealloc_size_add_rms_partials_offset = 0;
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
+
+    ggml_vk_rope_dump_begin_graph();
 
     int last_node = cgraph->n_nodes - 1;
 
@@ -17462,6 +17793,20 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "SSM_CONV_SILU";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (getenv("KATAGO_VK_ROPE_DISABLE") == nullptr &&
+                       ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_GET_ROWS, GGML_OP_MUL, GGML_OP_ADD }, { i + 3 }) &&
+                       ggml_vk_can_fuse_rope_gr_mul_mul_add(ctx, cgraph, i)) {
+                // S2-⑦: RoPE chain fused into rope_fused.comp. Actual cgraph order
+                // is {MUL(q2*cos2), GET_ROWS(q2,ids), MUL(sw2*sin2), ADD} -- add's
+                // src0 (t1) is expanded before the get_rows branch. NOT a linear
+                // chain (mul1 consumes q2, not get_rows' output), so
+                // ggml_can_fuse_subgraph is required (ggml-impl.h:687 linearity).
+                ctx->num_additional_fused_ops = 3;
+                fusion_string = "GET_ROWS_MUL_MUL_ADD";
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+                op_srcs_fused_elementwise[3] = true;
             } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 2 }) &&
                        ggml_check_edges(cgraph, i, rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i)) {
