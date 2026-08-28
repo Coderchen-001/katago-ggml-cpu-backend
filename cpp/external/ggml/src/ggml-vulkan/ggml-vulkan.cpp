@@ -17803,10 +17803,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // ggml_can_fuse_subgraph is required (ggml-impl.h:687 linearity).
                 ctx->num_additional_fused_ops = 3;
                 fusion_string = "GET_ROWS_MUL_MUL_ADD";
-                op_srcs_fused_elementwise[0] = true;
-                op_srcs_fused_elementwise[1] = true;
-                op_srcs_fused_elementwise[2] = true;
-                op_srcs_fused_elementwise[3] = true;
+                // S2-7 defensive (2026-08-28): op_srcs_fused_elementwise is
+                // FALSE, mirroring the RMS_NORM_MUL_ROPE_VIEW_SET_ROWS and
+                // ROPE_VIEW_SET_ROWS precedents (all false). The get_rows
+                // gather (out2[d] reads q2[d^1]) is a permuted read, NOT
+                // elementwise: if gallocr ever aliases the rope output into the
+                // q2/sw2 region, the fused kernel would read its own overwritten
+                // data. The overlap check (GV:17359 elementwise exemption)
+                // must not waive that case; with false it rejects alias groups
+                // and they degrade back to the chain. (The 08-28 b11 1.44x was
+                // traced to a stale FMA SPIR-V artifact, not aliasing; the flag
+                // stays false as defensive insurance for future graph shapes.)
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
+                op_srcs_fused_elementwise[2] = false;
+                op_srcs_fused_elementwise[3] = false;
             } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 2 }) &&
                        ggml_check_edges(cgraph, i, rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i)) {
