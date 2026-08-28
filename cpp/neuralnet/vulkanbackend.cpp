@@ -152,6 +152,19 @@ struct OnnxToGgml {
   // them; C10-4②).
   unordered_map<string, AnnotatedTensor> annTensors;
 
+  // S3-8/C-N28: layout hint table (production-side domain assignment, O5
+  // two-layer structure). registerOut consults it to decide a tensor's output
+  // domain instead of the caller's hardcoded default; consume-side ensure()
+  // stays untouched as the fallback for dynamic/unhinted tensors.
+  // Env-gated KATAGO_VK_LAYOUT_HINT, default OFF = current behavior
+  // (bit-identical baseline). Skeleton: empty map, populated by the prescan
+  // layout assignment (7-edge greedy, see s3-8-design.md).
+  unordered_map<string, Layout> layoutHints;
+  static bool layoutHintEnabled() {
+    static const bool e = getenv("KATAGO_VK_LAYOUT_HINT") != nullptr;
+    return e;
+  }
+
   // Host-side data of initializer tensors, set into device memory after graph
   // allocation.
   unordered_map<string, vector<uint8_t>> initData;
@@ -1210,6 +1223,14 @@ struct OnnxToGgml {
   ggml_tensor* toCS(ggml_tensor* x) {
     GGML_ASSERT(ggml_n_dims(x) <= 4);
     const int64_t C = x->ne[2], S = x->ne[0] * x->ne[1], N = x->ne[3];
+    if(S == 1 && ggml_is_contiguous(x)) {
+      // S3-8/O8 identity short-circuit: NCHW [1,1,C,N] and CS [C,1,N] share
+      // the same memory layout; permute+cont would be an identity copy
+      // (observed: all 1x1xCx1 bias/scale parameter edges). Return a
+      // zero-copy reshape view -- same ne/nb semantics as the materialized
+      // result, no CONT node, no dispatch.
+      return ggml_reshape_3d(ctx, x, C, S, N);
+    }
     ggml_tensor* p = ggml_permute(ctx, x, 1, 2, 0, 3);
     ggml_tensor* c = ggml_cont(ctx, p);
     return ggml_reshape_3d(ctx, c, C, S, N);
@@ -1229,6 +1250,12 @@ struct OnnxToGgml {
     else {
       GGML_ASSERT(S == (int64_t)nnXLen * nnYLen);
       W = nnXLen; H = nnYLen;
+    }
+    if(S == 1 && ggml_is_contiguous(x)) {
+      // S3-8/O8 identity short-circuit: CS [C,1,N] and NCHW [1,1,C,N] share
+      // the same memory layout; reshape+permute+cont would be an identity
+      // copy. Zero-copy view with identical ne/nb semantics.
+      return ggml_reshape_4d(ctx, x, 1, 1, C, N);
     }
     ggml_tensor* r4 = ggml_reshape_4d(ctx, x, C, W, H, N);
     ggml_tensor* p = ggml_permute(ctx, r4, 2, 0, 1, 3);
@@ -1253,6 +1280,12 @@ struct OnnxToGgml {
         if(cached == NULL) {
           cached = toCS(t);
           nConvToCS++;
+          if(getenv("KATAGO_VK_LAYOUTDBG_EDGE") != nullptr) {
+            // S3-8 step-0 edge audit: one line per materialized conversion edge.
+            fprintf(stderr, "LAYOUT-EDGE|op=%s|dir=toCS|srcNe=%lldx%lldx%lldx%lld|n=%d\n",
+                currentOpName.c_str(), (long long)t->ne[0], (long long)t->ne[1],
+                (long long)t->ne[2], (long long)t->ne[3], nConvToCS);
+          }
         }
         t = cached;
       } else if(wantLayout == Layout::L_NCHW) {
@@ -1261,6 +1294,11 @@ struct OnnxToGgml {
         if(cached == NULL) {
           cached = toNCHW(t);
           nConvToNCHW++;
+          if(getenv("KATAGO_VK_LAYOUTDBG_EDGE") != nullptr) {
+            fprintf(stderr, "LAYOUT-EDGE|op=%s|dir=toNCHW|srcNe=%lldx%lldx%lldx%lld|n=%d\n",
+                currentOpName.c_str(), (long long)t->ne[0], (long long)t->ne[1],
+                (long long)t->ne[2], (long long)t->ne[3], nConvToNCHW);
+          }
         }
         t = cached;
       }
@@ -1662,6 +1700,13 @@ struct OnnxToGgml {
         throw StringError("VULKAN backend: tensor '" + name + "' used by op " + op + " was not produced yet (graph not topologically ordered?)");
       };
       auto registerOut = [&](ggml_tensor* t, Layout lay = Layout::L_NCHW, ggml_type dt = GGML_TYPE_F32) {
+        if(layoutHintEnabled()) {
+          // S3-8 production-side domain assignment: a hint overrides the
+          // caller's hardcoded output domain for this tensor name.
+          auto it = layoutHints.find(outName);
+          if(it != layoutHints.end())
+            lay = it->second;
+        }
         tensors[outName] = t;
         annTensors[outName] = {t, lay, dt};
       };
