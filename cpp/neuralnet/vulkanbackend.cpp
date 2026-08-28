@@ -152,6 +152,18 @@ struct OnnxToGgml {
   // them; C10-4②).
   unordered_map<string, AnnotatedTensor> annTensors;
 
+  // C-N34 (2026-08-28): fa-feed GEMM pointer set for selective f32acc (R1).
+  // Filled at graph-build time with the fused qkv projection GEMM output (Y
+  // in buildFusedProjections) and the unfused q/k/v projection GEMM outputs
+  // (1x1-conv branch when the conv output name is in faFeedConvOuts).
+  unordered_set<const ggml_tensor*> faFeedGemmPtrs;
+  // q/k/v conv output names that feed fa (prescan-collected; fused + unfused).
+  unordered_set<string> faFeedConvOuts;
+  static bool faEnabled() {
+    static const bool e = getenv("KATAGO_VK_FA") != nullptr;
+    return e;
+  }
+
   // S3-8/C-N28: layout hint table (production-side domain assignment, O5
   // two-layer structure). registerOut consults it to decide a tensor's output
   // domain instead of the caller's hardcoded default; consume-side ensure()
@@ -717,6 +729,73 @@ struct OnnxToGgml {
       projSegOf[kConv] = xSrc;
       projSegOf[vConv] = xSrc;
     }
+
+    // C-N34: collect every q/k/v projection conv output that feeds fa.
+    // - fused: the triple detected above (q/k/v convOuts).
+    // - unfused: trace ropeSites (q/k reshape inputs) and faSites.vName back
+    //   to their nearest upstream Conv. Unfused q/k may not appear in ropeSites
+    //   (fa's own rope path), so also trace the fa qName/kName; the v path is
+    //   traced via faSites.vName (v may be roped or not).
+    if(faEnabled()) {
+      auto findConvOut = [&](const string& start) -> string {
+        string cur = start;
+        for(int hop = 0; hop < 5; hop++) {
+          auto it = producer.find(cur);
+          if(it == producer.end())
+            return "";
+          const onnx::NodeProto& pn = nodes[it->second];
+          if(pn.op_type() == "Conv" && pn.output_size() > 0)
+            return pn.output(0);
+          if(pn.input_size() == 0)
+            return "";
+          cur = pn.input(0);
+        }
+        return "";
+      };
+      for(auto& kv : projFusions) {
+        if(!kv.second.qConvOut.empty()) faFeedConvOuts.insert(kv.second.qConvOut);
+        if(!kv.second.kConvOut.empty()) faFeedConvOuts.insert(kv.second.kConvOut);
+        if(!kv.second.vConvOut.empty()) faFeedConvOuts.insert(kv.second.vConvOut);
+      }
+      for(auto& kv : ropeSites) {
+        string c = findConvOut(kv.first);
+        if(!c.empty()) faFeedConvOuts.insert(c);
+      }
+      for(auto& kv : faSites) {
+        string cq = findConvOut(kv.second.qName);
+        string ck = findConvOut(kv.second.kName);
+        string cv = findConvOut(kv.second.vName);
+        if(!cq.empty()) faFeedConvOuts.insert(cq);
+        if(!ck.empty()) faFeedConvOuts.insert(ck);
+        if(!cv.empty()) faFeedConvOuts.insert(cv);
+        // R2 (MMPREC='3'): also the out-projection 1x1 Conv consuming the fa sv
+        // output, via its Transpose/Reshape chain.
+        const char* mmp = getenv("KATAGO_VK_MMPREC_F32");
+        if(mmp != nullptr && mmp[0] == '3') {
+          string cur = kv.second.svOut;
+          for(int hop = 0; hop < 5; hop++) {
+            int next = -1;
+            for(int i = 0; i < (int)nodes.size(); i++) {
+              const onnx::NodeProto& pn = nodes[i];
+              if(pn.input_size() < 1 || pn.input(0) != cur)
+                continue;
+              if(pn.op_type() == "Conv") {
+                const onnx::TensorProto* w = findInitializer(pn.input(1));
+                if(w != NULL && w->dims_size() == 4 && w->dims(2) == 1 && w->dims(3) == 1)
+                  faFeedConvOuts.insert(pn.output(0));
+                next = -2;
+                break;
+              }
+              next = i;
+              break;
+            }
+            if(next < 0)
+              break;
+            cur = nodes[next].output(0);
+          }
+        }
+      }
+    }
   }
 
   // Conv weight with the RMSNorm gamma absorbed by input channel (Sequence ①).
@@ -791,6 +870,8 @@ struct OnnxToGgml {
     ggml_tensor* W = ggml_reshape_2d(ctx, tensors[wname], f.IC, 3 * f.OC);  // view
     ggml_tensor* x2 = ggml_reshape_2d(ctx, x, f.IC, S * N);                 // view
     ggml_tensor* Y = ggml_mul_mat(ctx, W, x2);                              // [3*OC, S*N] F32
+    if(faEnabled())
+      faFeedGemmPtrs.insert(Y);   // C-N34 R1: fused qkv GEMM feeds fa directly
     const size_t es = ggml_element_size(Y);
     const int64_t segNe[4] = {f.OC, S, N, 1};
     struct { const char* out; } segs[3] = {{f.qConvOut.c_str()}, {f.kConvOut.c_str()}, {f.vConvOut.c_str()}};
@@ -1643,7 +1724,11 @@ struct OnnxToGgml {
     prescanRms();
     prescanMaskReassoc();
     prescanSoftmaxScale();
-    // prescanFa();  // EXPERIMENT b': disabled to test F16 scores GEMM path
+    // C-N34: fa is opt-in via KATAGO_VK_FA (default off = bit-identical to
+    // the previous build). Must run BEFORE prescanRope: prescanFa builds
+    // faSites (q/k/v names) which prescanRope consumes to decide rope for v.
+    if(faEnabled())
+      prescanFa();  // EXPERIMENT b'
     prescanRope();
     prescanProjFusion();
     // prescanGammaAbsorb();  // sequence-1 path A: margin gate fails (1.04x), disabled
@@ -1781,6 +1866,9 @@ struct OnnxToGgml {
           ggml_tensor* W = ggml_reshape_2d(ctx, w, IC, OC);
           ggml_tensor* x2 = ggml_reshape_2d(ctx, x, IC, S * N);
           ggml_tensor* Y = ggml_mul_mat(ctx, W, x2);            // [OC, S*N]
+          // C-N34 R1: unfused q/k/v projection GEMM that feeds fa.
+          if(faEnabled() && faFeedConvOuts.count(outName) > 0)
+            faFeedGemmPtrs.insert(Y);
           ggml_tensor* out = ggml_reshape_3d(ctx, Y, OC, S, N); // [OC, S, N]
           registerOut(out, Layout::L_CS, GGML_TYPE_F32);
         }
@@ -2486,18 +2574,26 @@ struct ComputeHandle {
     ggml_build_forward_expand(graph, outOwnership);
 
     // KATAGO_VK_MMPREC_F32 (default off = bit-identical): force F32 accumulation
-    // on every mul_mat with an F16 src0 (f16acc -> f32acc, F16 storage kept).
-    // This targets exactly the error sources measured in stage-1 scalar-path
-    // testing (fused QKV proj, 1x1-conv trunk, b' scores/sv all fall to f16acc
-    // under PREC_DEFAULT+fp16, GV:7729-7743). F32xF16 nodes from matmul() are
-    // unconditionally f32acc (GV:7723/4886) and correctly left untouched;
-    // future Q8_0 nodes have non-F16 src0 and are skipped.
-    if(getenv("KATAGO_VK_MMPREC_F32") != nullptr && getenv("KATAGO_VK_MMPREC_F32")[0] == '1') {
-      const int nNodes = ggml_graph_n_nodes(graph);
-      for(int i = 0; i < nNodes; i++) {
-        ggml_tensor* node = ggml_graph_node(graph, i);
-        if(node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F16)
-          ggml_mul_mat_set_prec(node, GGML_PREC_F32);
+    // on mul_mat with an F16 src0 (f16acc -> f32acc, F16 storage kept).
+    //   '1' = global: every F16-src0 mul_mat (stage-1 scalar-path error sources:
+    //         fused QKV proj, 1x1-conv trunk, b' scores/sv all fall to f16acc
+    //         under PREC_DEFAULT+fp16, GV:7729-7743).
+    //   '2' = C-N34 R1: only the fa-feed qkv projection GEMMs (needs KATAGO_VK_FA;
+    //         empty set otherwise = no-op).
+    //   '3' = C-N34 R2: R1 + the fa out-projection conv GEMM.
+    // F32xF16 nodes from matmul() are unconditionally f32acc (GV:7723/4886) and
+    // correctly left untouched; future Q8_0 nodes have non-F16 src0 and skip.
+    if(getenv("KATAGO_VK_MMPREC_F32") != nullptr) {
+      const char mmp = getenv("KATAGO_VK_MMPREC_F32")[0];
+      if(mmp == '1' || mmp == '2' || mmp == '3') {
+        const bool global = (mmp == '1');
+        const int nNodes = ggml_graph_n_nodes(graph);
+        for(int i = 0; i < nNodes; i++) {
+          ggml_tensor* node = ggml_graph_node(graph, i);
+          if(node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F16)
+            if(global || builder.faFeedGemmPtrs.count(node) > 0)
+              ggml_mul_mat_set_prec(node, GGML_PREC_F32);
+        }
       }
     }
 
