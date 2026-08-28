@@ -8844,6 +8844,17 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         const uint32_t tiles_l = CEIL_DIV(m, mmp->a_l->wg_denoms[0]) * CEIL_DIV(n, mmp->a_l->wg_denoms[1]);
         const uint32_t tiles_m = CEIL_DIV(m, mmp->a_m->wg_denoms[0]) * CEIL_DIV(n, mmp->a_m->wg_denoms[1]);
 
+        // S3-9a micro-scan finding (2026-08-28): small-M shapes run faster
+        // with the small tile -- measured on b11-b8: scores m=32 -33%,
+        // m=192 -64%, m=96 -36%, m=1 -38%; large M degrades (m=384 +12%,
+        // m=768 +8%, m=2888 +9%). Small M under-fills the large tiles
+        // (few workgroups, wasted lanes). Threshold m<=192 keeps the wins
+        // without touching the big GEMMs. Tile choice affects the summation
+        // order -> margin gate must be re-verified after this.
+        if (mm_s && m <= 192) {
+            return aligned ? mmp->a_s : mmp->s;
+        }
+
         // Use large shader when the N dimension is greater than the medium shader's tile size
         uint32_t crossover_large = mmp->m->wg_denoms[1];
 
