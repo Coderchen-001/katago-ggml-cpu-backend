@@ -2101,6 +2101,18 @@ typedef std::weak_ptr<vk_context_struct> vk_context_ref;
 // alloc/destroy tracing (which happens during device/gallocr init) works too.
 static bool g_dtrace = getenv("KATAGO_VK_DISPATCH_TRACE") != nullptr;
 static int  g_dtrace_eval = 0;
+// E-B/E-C: prealloc poison diagnostics (env KATAGO_VK_POISON=1, default off).
+// Before each replay, fill all four prealloc buffers with a run-distinct value;
+// after the replay, dump the first word of each. Distinguishes "read-untouched
+// residue" (poison survives -> H-A) from "accumulate across exec" (value =
+// poison + partial sums -> H-B) and captures exec-1 output state.
+static bool g_poison = getenv("KATAGO_VK_POISON") != nullptr;
+static int  g_poison_run = 0;
+// V3-T3 (N-2-spike): pool-leak sentinel (env KATAGO_VK_PR_LEAKTRACE=1, default off).
+// Prints compute_cmd_pool size/usage once per N graph cleanups in pr mode so a
+// per-eval cb leak (old N-2) shows up as unbounded pool growth across a long run.
+static bool g_pr_leaktrace = getenv("KATAGO_VK_PR_LEAKTRACE") != nullptr;
+static int  g_pr_cleanup_count = 0;
 
 struct ggml_vk_garbage_collector {
     std::vector<vk_semaphore> tl_semaphores;
@@ -2434,8 +2446,18 @@ struct ggml_backend_vk_context {
     bool pr_recording {};   // first eval: record mode
     bool pr_recorded {};    // cache ready: subsequent evals replay
     bool pr_replay_only {}; // '2': record-only diagnostic (no replay)
-    vk_command_buffer* pr_recorded_cb = nullptr;             // the recorded cb (kept alive, never reset)
-    std::vector<vk::SubmitInfo> pr_submit_infos;             // cached submit infos (single-cb: no semaphores)
+    // Multi-segment replay cache: the graph may be recorded as several command
+    // buffers (op-internal intermediate submissions), so we cache ALL segments'
+    // SubmitInfos and resubmit them in one vkQueueSubmit (same-queue order =
+    // execution order; no inter-segment semaphores exist in the recording path).
+    std::vector<vk_command_buffer*> pr_recorded_cbs;   // keep segment cbs alive (never reset)
+    std::vector<vk::SubmitInfo> pr_submit_infos;       // cached per-segment submit infos (no semaphores)
+    bool pr_ar_zeroed {};   // per-eval: reduction accumulator zeroed lazily in the graph cb
+    int  pr_evals {};       // P0-1: graph_compute call counter (record from eval >= 2)
+    bool pr_bad {};         // P0-2: preallocate split detected during recording -> abandon
+    int  pr_fp_nodes {};    // P1: graph fingerprint (node count + first/last node)
+    ggml_tensor* pr_fp_first = nullptr;
+    ggml_tensor* pr_fp_last = nullptr;
 
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
@@ -8300,9 +8322,6 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
     if (g_dtrace) {
-        // Dispatch-trace: one line per dispatch with everything premise-relevant.
-        // diff across evals must be byte-identical (record-only) and pre-record
-        // eval 1 must match record-only eval 1.
         char hexbuf[512];
         size_t hexlen = 0;
         const uint8_t* pc = (const uint8_t*)push_constant_data(push_constants);
@@ -8323,6 +8342,9 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
         fprintf(stderr, "DTRACE e%d s%zu d%u: %s wg=%ux%ux%u pc=%s %s\n",
             g_dtrace_eval, subctx->seqs.size(), ctx->descriptor_set_idx,
             pipeline->name, wg0, wg1, wg2, hexbuf, desc.c_str());
+    }
+    if (g_poison) {
+        GGML_LOG_INFO("ggml_vulkan: DISP cb=%p %s\n", (void*)(VkCommandBuffer)subctx->s->buffer->buf, pipeline->name);
     }
 
     vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
@@ -8851,7 +8873,11 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
 
 static void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_memset_async(" << offset << ", " << c << ", " << size << ")");
-
+    if (g_poison) {
+        GGML_LOG_INFO("ggml_vulkan: MEMSET buf=%p off=%llu val=%08x size=%llu cb=%p\n",
+            (void*)(VkBuffer)dst->buffer, (unsigned long long)offset, c, (unsigned long long)size,
+            (void*)(VkCommandBuffer)ctx->s->buffer->buf);
+    }
     if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
         dst->device->uma) {
         deferred_memset((uint8_t*)dst->ptr + offset, c, size, &ctx->memsets);
@@ -15636,6 +15662,14 @@ static void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m,
 #endif
 
 static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx) {
+    // P0-2: if a preallocate is reached mid-recording, the subctx block at the
+    // bottom ends/submits/re-begins the segment (graph split) and the recorded
+    // segments become incomplete (early cbs would reference realloc'd buffers).
+    // Mark the recording bad; the graph tail then abandons it and the next eval
+    // re-records (P0-1 makes this unreachable in steady state — pure insurance).
+    if (ctx->pr_recording && subctx != nullptr) {
+        ctx->pr_bad = true;
+    }
 #if defined(GGML_VULKAN_RUN_TESTS)
     const std::vector<size_t> vals {
         512, 512, 128,
@@ -15810,6 +15844,18 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     }
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+
+    // V3-T3: lazy first-use zeroing of the two-stage reduction accumulator during
+    // recording. The pre-walk eager memset lands in a different cb than the graph
+    // commands (compute_ctx weak_ptr split between pre-walk and build_graph), so
+    // it never reaches the recorded cb. Zeroing HERE uses the SAME compute_ctx
+    // as this node's dispatch, guaranteeing the fillBuffer is in the same cb as
+    // the graph commands (recorded cb is self-contained per eval).
+    if (ctx->pr_recording && !ctx->pr_ar_zeroed &&
+        ctx->prealloc_add_rms_partials != nullptr && ctx->prealloc_size_add_rms_partials) {
+        ggml_vk_buffer_memset_async(compute_ctx, ctx->prealloc_add_rms_partials, 0, 0, ctx->prealloc_size_add_rms_partials);
+        ctx->pr_ar_zeroed = true;
+    }
 
     {
         // This logic detects dependencies between modes in the graph and calls ggml_vk_sync_buffers
@@ -16342,11 +16388,20 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             memset(mset.dst, mset.val, mset.n);
         }
 
-        // V3-T3: capture the recorded cb BEFORE ggml_vk_submit (which clears seqs).
-        // Single-cb mode: only the final last_node submission reaches here, so this
-        // is the whole-graph cb.
+        // V3-T3: capture this segment's cb + SubmitInfo BEFORE ggml_vk_submit
+        // (which clears seqs). Every submitted segment during recording is
+        // cached; replay resubmits them all in one vkQueueSubmit.
         if (ctx->pr_recording && !subctx->seqs.empty()) {
-            ctx->pr_recorded_cb = subctx->seqs.back().back().buffer;
+            vk::SubmitInfo si{
+                0, nullptr, nullptr,
+                1, &subctx->seqs.back().back().buffer->buf,
+                0, nullptr, nullptr
+            };
+            if (g_poison) {
+                GGML_LOG_INFO("ggml_vulkan: CAPTURE seg=%zu cb=%p\n", ctx->pr_submit_infos.size(), (void*)(VkCommandBuffer)subctx->seqs.back().back().buffer->buf);
+            }
+            ctx->pr_submit_infos.push_back(si);
+            ctx->pr_recorded_cbs.push_back(subctx->seqs.back().back().buffer);
         }
 
         if (ctx->device->serialize_submissions) {
@@ -16387,12 +16442,44 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->unsynced_nodes_read.clear();
     ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
 
-    // V3-T3: in pre-record mode the command pool must NOT be reset -- resetCommandPool
-    // would wipe the recorded cb that replay keeps re-submitting (path A, the only
-    // per-eval threat to the recorded cb). Non-recorded cbs are reset individually
-    // in ggml_vk_synchronize, so the pool stays healthy.
+    // V3-T3 (N-2-spike): in pre-record mode resetCommandPool is NEVER called —
+    // it would wipe the recorded cbs that replay keeps re-submitting. Instead
+    // selectively reset only the NON-recorded cbs (input-upload cbs etc.) so
+    // they stay reusable; recorded cbs keep their contents and in_use flag.
     if (!ctx->pr_enabled) {
         ggml_vk_command_pool_cleanup(ctx->device, ctx->compute_cmd_pool);
+        if (ctx->device->async_use_transfer_queue) {
+            ggml_vk_command_pool_cleanup(ctx->device, ctx->transfer_cmd_pool);
+        }
+    } else {
+        size_t n_reset = 0, n_keep = 0;
+        for (auto& cb : ctx->compute_cmd_pool.cmd_buffers) {
+            bool is_pr = false;
+            for (auto* pc : ctx->pr_recorded_cbs) {
+                if (pc == &cb) {
+                    is_pr = true;
+                    break;
+                }
+            }
+            if (is_pr) {
+                n_keep++;
+            } else {
+                cb.in_use = false;
+                cb.buf.reset();
+                n_reset++;
+            }
+        }
+        if (g_poison || g_pr_leaktrace) {
+            GGML_LOG_INFO("ggml_vulkan: CLEANUP selective reset (pr_enabled=%d recorded=%d nseg=%zu reset=%zu keep=%zu)\n",
+                (int)ctx->pr_enabled, (int)ctx->pr_recorded, ctx->pr_submit_infos.size(), n_reset, n_keep);
+        }
+        // N-2-spike leak sentinel: pool must not grow across evals (recorded cbs
+        // are frozen, upload cbs are recycled). Print every 1000 cleanups.
+        if (g_pr_leaktrace && (++g_pr_cleanup_count % 1000 == 0)) {
+            GGML_LOG_INFO("ggml_vulkan: PRLEAK cleanup=%d pool=%zu inuse=%zu reset=%zu keep=%zu\n",
+                g_pr_cleanup_count, ctx->compute_cmd_pool.cmd_buffers.size(),
+                ctx->compute_cmd_pool.buffers_in_use(), n_reset, n_keep);
+        }
         if (ctx->device->async_use_transfer_queue) {
             ggml_vk_command_pool_cleanup(ctx->device, ctx->transfer_cmd_pool);
         }
@@ -17020,9 +17107,18 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             ggml_vk_wait_for_fence(ctx);
         }
         ctx->submit_pending = false;
-        // V3-T3: never reset the recorded cb (replay re-submits it). All other
-        // cbs (input uploads etc.) reset normally so they can be reused.
-        if (cmd_buf && !(ctx->pr_enabled && cmd_buf == ctx->pr_recorded_cb)) {
+        // V3-T3 (normal mode only): this block is reached only when cmd_buf was
+        // taken from compute_ctx->s (do_transfer path). In pre-record REPLAY
+        // mode the compute_ctx is released by ggml_vk_pr_flush_uploads, so
+        // cmd_buf is nullptr here and recorded cbs are untouched; their
+        // recycling is handled selectively in ggml_vk_graph_cleanup (N-2-spike).
+        bool is_pr_cb = false;
+        if (ctx->pr_enabled && cmd_buf != nullptr) {
+            for (auto* pc : ctx->pr_recorded_cbs) {
+                if (pc == cmd_buf) { is_pr_cb = true; break; }
+            }
+        }
+        if (cmd_buf && !is_pr_cb) {
             cmd_buf->in_use = false;
             cmd_buf->buf.reset();
         }
@@ -17666,6 +17762,26 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+// N-1: flush pending input uploads held in compute_ctx (set_input path stores
+// memcpys/memsets there without submitting) and release the shared ctx so the
+// next get_compute_ctx starts a FRESH cb. Used by both the replay branch and
+// the record-start branch — a bare compute_ctx.reset() would DROP the pending
+// uploads (eval output would be garbage on the first recorded/replayed eval).
+static void ggml_vk_pr_flush_uploads(ggml_backend_vk_context * ctx) {
+    if (!ctx->compute_ctx.expired()) {
+        vk_context ic = ctx->compute_ctx.lock();
+        ggml_vk_ctx_end(ic);
+        for (auto& cpy : ic->in_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+        for (auto& mset : ic->memsets) {
+            memset(mset.dst, mset.val, mset.n);
+        }
+        ggml_vk_submit(ic, {});
+        ctx->compute_ctx.reset();
+    }
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -17681,33 +17797,85 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // pr_enabled/pr_replay_only are set once in ggml_vk_init (must precede the
     // first set_input so upload cbs are also re-submittable).
     if (ctx->pr_enabled && ctx->pr_recorded && !ctx->pr_replay_only) {
-        // REPLAY: flush any pending input uploads recorded since the last compute
-        // (set_input path holds them in compute_ctx), then re-submit the recorded
-        // single-cb. Same-queue ordering guarantees the cb reads the new inputs.
-        if (!ctx->compute_ctx.expired()) {
-            vk_context ic = ctx->compute_ctx.lock();
-            ggml_vk_ctx_end(ic);
-            for (auto& cpy : ic->in_memcpys) {
-                memcpy(cpy.dst, cpy.src, cpy.n);
+        // P1: fingerprint check — if the graph shape changed (dynamic shapes,
+        // model reload, etc.), the recorded cbs are stale. Discard the cache
+        // and fall through to re-record this eval.
+        const bool fp_ok = cgraph->n_nodes > 0 && ctx->pr_fp_nodes == cgraph->n_nodes &&
+            ctx->pr_fp_first == cgraph->nodes[0] &&
+            ctx->pr_fp_last == cgraph->nodes[cgraph->n_nodes - 1];
+        if (!fp_ok) {
+            ctx->pr_recorded = false;
+            ctx->pr_submit_infos.clear();
+            ctx->pr_recorded_cbs.clear();
+            GGML_LOG_INFO("ggml_vulkan: pre-record fingerprint mismatch (%d nodes, have %d) -> re-recording\n",
+                (int)cgraph->n_nodes, ctx->pr_fp_nodes);
+        } else {
+            // REPLAY: flush any pending input uploads recorded since the last compute
+            // (set_input path holds them in compute_ctx), then re-submit the recorded
+            // cbs. Same-queue ordering guarantees the cbs read the new inputs.
+            ggml_vk_pr_flush_uploads(ctx);
+            if (g_poison) {
+                GGML_LOG_INFO("ggml_vulkan: REPLAY submit %zu seg(s) cb0=%p\n", ctx->pr_submit_infos.size(),
+                    ctx->pr_submit_infos.empty() ? nullptr : (void*)(VkCommandBuffer)ctx->pr_submit_infos[0].pCommandBuffers[0]);
             }
-            for (auto& mset : ic->memsets) {
-                memset(mset.dst, mset.val, mset.n);
+            ctx->device->compute_queue->handle->submit(ctx->pr_submit_infos, {});
+            // 语义对齐: replay submission is pending work — the caller's
+            // ggml_vk_synchronize waits on this flag via an empty fence submit.
+            ctx->submit_pending = true;
+            // E-B/E-C: poison prealloc buffers before/after the replay.
+            if (g_poison) {
+                g_poison_run++;
+                const uint32_t val = 0x3F800000u + (uint32_t)g_poison_run;
+                vk_context pctx = ggml_vk_create_temporary_context(ctx->compute_cmd_pool);
+                ggml_vk_ctx_begin(ctx->device, pctx);
+                struct { vk_buffer* b; size_t* s; } pre[4] = {
+                    { &ctx->prealloc_x, &ctx->prealloc_size_x },
+                    { &ctx->prealloc_y, &ctx->prealloc_size_y },
+                    { &ctx->prealloc_split_k, &ctx->prealloc_size_split_k },
+                    { &ctx->prealloc_add_rms_partials, &ctx->prealloc_size_add_rms_partials },
+                };
+                for (int i = 0; i < 4; i++) {
+                    if (*pre[i].b && *pre[i].s) {
+                        ggml_vk_buffer_memset_async(pctx, *pre[i].b, 0, val, *pre[i].s);
+                    }
+                }
+                ggml_vk_ctx_end(pctx);
+                ggml_vk_submit(pctx, {});
+                ctx->device->compute_queue->handle->queue.waitIdle();
+                ctx->device->compute_queue->handle->submit(ctx->pr_submit_infos, {});
+                ctx->device->compute_queue->handle->queue.waitIdle();
+                uint32_t d[4] = { 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF };
+                for (int i = 0; i < 4; i++) {
+                    if (*pre[i].b && *pre[i].s) {
+                        ggml_vk_buffer_read(*pre[i].b, 0, &d[i], 4);
+                    }
+                }
+                GGML_LOG_INFO("ggml_vulkan: POISON run=%d val=%08x x=%08x y=%08x sk=%08x ar=%08x\n",
+                    g_poison_run, val, d[0], d[1], d[2], d[3]);
             }
-            ggml_vk_submit(ic, {});
-            ctx->compute_ctx.reset();
+            // Async semantics unchanged: the caller (ggml_backend_vk_synchronize)
+            // waits via an empty fence submit on the same queue.
+            return GGML_STATUS_SUCCESS;
         }
-        ctx->device->compute_queue->handle->submit(ctx->pr_submit_infos, {});
-        // Async semantics unchanged: the caller (ggml_backend_vk_synchronize)
-        // waits via an empty fence submit on the same queue.
-        return GGML_STATUS_SUCCESS;
     }
     if (ctx->pr_enabled) {
-        // First eval: record. Reset the shared compute ctx so the graph commands
-        // go into a FRESH cb that contains ONLY graph commands -- the recorded cb
-        // must not carry eval-1's input-upload commands (their staging buffers
-        // die after eval 1; replaying them would read freed memory).
-        ctx->compute_ctx.reset();
-        ctx->pr_recording = true;
+        ctx->pr_evals++;
+        // P0-1: record from eval >= 2. Eval 1 runs in normal mode so the
+        // preallocate sizes (and all other caches) warm up; with FixedShape
+        // graphs eval >= 2 sees zero preallocate splits, so the recorded graph
+        // is a single contiguous segment set.
+        if (ctx->pr_evals >= 2 && !ctx->pr_recorded) {
+            // N-1: flush pending input uploads held in compute_ctx (set_input
+            // path) instead of dropping them, and reset the shared compute ctx
+            // so the graph commands go into a FRESH cb that contains ONLY graph
+            // commands — the recorded cbs must not carry input-upload commands
+            // (their staging buffers die after the eval; replaying them would
+            // read freed memory).
+            ggml_vk_pr_flush_uploads(ctx);
+            ctx->pr_recording = true;
+            ctx->pr_ar_zeroed = false;   // lazy accumulator zeroing (see build_graph)
+            ctx->pr_bad = false;
+        }
     }
 
     ctx->device->diag_cgraph = nullptr;
@@ -17779,7 +17947,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->prealloc_y_last_decode_vector_staging = false;
 
-    if (ctx->prealloc_size_add_rms_partials) {
+    if (ctx->prealloc_size_add_rms_partials && !ctx->pr_recording) {
         ggml_vk_preallocate_buffers(ctx, nullptr);
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         // initialize partial sums to zero.
@@ -18165,19 +18333,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ctx->last_total_flops = total_flops;
 
-    // V3-T3: end of the recording eval — cache the recorded single-cb submission.
+    // V3-T3: end of the recording eval — segments were cached in compute_forward.
     if (ctx->pr_recording) {
-        if (ctx->pr_recorded_cb != nullptr) {
-            // Same SubmitInfo shape as ggml_vk_submit's single-submission case:
-            // no wait/signal semaphores (all barrier work is in-cb), 1 command buffer.
-            vk::SubmitInfo si{
-                0, nullptr, nullptr,
-                1, &ctx->pr_recorded_cb->buf,
-                0, nullptr, nullptr
-            };
-            ctx->pr_submit_infos = { si };
+        if (ctx->pr_bad) {
+            // P0-2: preallocate split the graph mid-recording; the captured
+            // segments are incomplete (early cbs reference realloc'd buffers).
+            // Discard the cache; the next eval re-records (sizes are stable now).
+            ctx->pr_submit_infos.clear();
+            ctx->pr_recorded_cbs.clear();
+            GGML_LOG_INFO("ggml_vulkan: pre-record ABANDONED (split during recording), retry next eval\n");
+        } else if (!ctx->pr_submit_infos.empty()) {
             ctx->pr_recorded = true;
-            GGML_LOG_INFO("ggml_vulkan: pre-record complete (%zu node(s) -> 1 cb, cb=%p)\n", (size_t)cgraph->n_nodes, (void*)&ctx->pr_recorded_cb->buf);
+            // P1: record a graph fingerprint (node count + first/last node ptrs)
+            // so replay can detect shape changes and re-record.
+            ctx->pr_fp_nodes = cgraph->n_nodes;
+            ctx->pr_fp_first = cgraph->n_nodes > 0 ? cgraph->nodes[0] : nullptr;
+            ctx->pr_fp_last = cgraph->n_nodes > 0 ? cgraph->nodes[cgraph->n_nodes - 1] : nullptr;
+            GGML_LOG_INFO("ggml_vulkan: pre-record complete (%zu segment(s), %zu nodes)\n", ctx->pr_submit_infos.size(), (size_t)cgraph->n_nodes);
         } else {
             GGML_LOG_ERROR("ggml_vulkan: pre-record failed: no recorded command buffer\n");
         }
