@@ -2092,6 +2092,16 @@ struct vk_context_struct {
 typedef std::shared_ptr<vk_context_struct> vk_context;
 typedef std::weak_ptr<vk_context_struct> vk_context_ref;
 
+// V3-T3: dispatch-trace diagnostics (env KATAGO_VK_DISPATCH_TRACE=1, default off).
+// Pure prints, no effect on recording. Used to diff recording decisions across
+// evals (record-only e1/e2/e3 must be byte-identical; pre-record e1 must match
+// record-only e1) -- validates premises 2/3/4 and the descriptor cursor order.
+// Declared here (before sync_buffers) since the barrier trace uses it.
+// Static init: read the env before any backend/buffer construction so buffer
+// alloc/destroy tracing (which happens during device/gallocr init) works too.
+static bool g_dtrace = getenv("KATAGO_VK_DISPATCH_TRACE") != nullptr;
+static int  g_dtrace_eval = 0;
+
 struct ggml_vk_garbage_collector {
     std::vector<vk_semaphore> tl_semaphores;
     std::vector<vk_semaphore> semaphores;
@@ -2414,6 +2424,18 @@ struct ggml_backend_vk_context {
 
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
+
+    // V3-T3 spike (C-N27): command-buffer pre-record / replay.
+    // env KATAGO_VK_PRE_RECORD=1, default off (bit-identical to previous build).
+    // First eval records the whole graph as ONE command buffer (one_time=false,
+    // all split conditions disabled); subsequent evals skip the entire node
+    // traversal and re-submit the cached single-cb submission.
+    bool pr_enabled {};
+    bool pr_recording {};   // first eval: record mode
+    bool pr_recorded {};    // cache ready: subsequent evals replay
+    bool pr_replay_only {}; // '2': record-only diagnostic (no replay)
+    vk_command_buffer* pr_recorded_cb = nullptr;             // the recorded cb (kept alive, never reset)
+    std::vector<vk::SubmitInfo> pr_submit_infos;             // cached submit infos (single-cb: no semaphores)
 
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
@@ -3443,6 +3465,9 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
 static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
                                        void *import_ptr = nullptr) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
+    if (g_dtrace) {
+        fprintf(stderr, "DTRACE e%d: BUF+ size=%llu\n", g_dtrace_eval, (unsigned long long)size);
+    }
     if (size > device->max_buffer_size) {
         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
     }
@@ -3650,6 +3675,9 @@ static void ggml_vk_destroy_buffer(vk_buffer& buf) {
     if (buf == nullptr) {
         return;
     }
+    if (g_dtrace) {
+        fprintf(stderr, "DTRACE e%d: BUF- size=%llu\n", g_dtrace_eval, (unsigned long long)buf->size);
+    }
 
     if (buf->device != nullptr) {
         buf->device->memory_logger->log_deallocation(buf);
@@ -3669,6 +3697,12 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
 
     if (ctx) {
         ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+    }
+
+    if (g_dtrace) {
+        fprintf(stderr, "DTRACE e%d s%zu: BAR sync_buffers stage=%x\n",
+            g_dtrace_eval, subctx->seqs.size(),
+            (unsigned int)(VkPipelineStageFlags)subctx->p->q->stage_flags);
     }
 
     subctx->s->buffer->buf.pipelineBarrier(
@@ -7666,17 +7700,40 @@ static void ggml_vk_instance_init() {
     }
 }
 
+// V3-T3: global pre-record gate for begin_submission (set in ggml_vk_init).
+// The recorded cb can be created by any ctx_begin path, so the flag is global.
+// Declared before ggml_vk_init which sets it.
+static bool ggml_vk_pr_global = false;
+
 static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     VK_LOG_DEBUG("ggml_vk_init(" << ctx->name << ", " << idx << ")");
     ggml_vk_instance_init();
     GGML_ASSERT(idx < vk_instance.device_indices.size());
 
     ctx->name = GGML_VK_NAME + std::to_string(idx);
-
     ctx->device = ggml_vk_get_device(idx);
 
     ctx->semaphore_idx = 0;
     ctx->event_idx = 0;
+
+    // V3-T3: initialize the pre-record gate HERE (backend init), NOT lazily in
+    // graph_compute -- set_input runs before the first graph_compute and must
+    // already see pr_enabled so its upload cb is recorded re-submittable too.
+    const char* pr_env = getenv("KATAGO_VK_PRE_RECORD");
+    ctx->pr_enabled = pr_env != nullptr;
+    ctx->pr_replay_only = pr_env != nullptr && pr_env[0] == '2';
+    g_dtrace = g_dtrace || (getenv("KATAGO_VK_DISPATCH_TRACE") != nullptr);   // idempotent
+    if (ctx->pr_enabled) {
+        // Scope-shrink 3 (design): the transfer-queue async path is incompatible
+        // with pre-record replay (cross-queue semaphore chains, OneTimeSubmit
+        // upload cbs on a different queue). Force it off.
+        ctx->device->async_use_transfer_queue = false;
+        ggml_vk_pr_global = true;
+        GGML_LOG_INFO("ggml_vulkan: pr mode enabled (replay_only=%d, transfer-queue forced off)\n", (int)ctx->pr_replay_only);
+    }
+    GGML_LOG_INFO("ggml_vulkan: device %s support_async=%d (readback path: %s)\n",
+        ctx->device->name.c_str(), (int)ctx->device->support_async,
+        ctx->device->support_async ? "async get_tensor" : "framework synchronize + sync read");
 
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
@@ -8186,10 +8243,14 @@ static vk_command_buffer* ggml_vk_get_or_create_cmd_buffer(vk_device& device, vk
 static vk_submission ggml_vk_begin_submission(vk_device& device, vk_command_pool& p, bool one_time = true) {
     vk_submission s;
     s.buffer = ggml_vk_get_or_create_cmd_buffer(device, p);
-    if (one_time) {
+    if (one_time && !ggml_vk_pr_global) {
         s.buffer->buf.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
     } else {
-        s.buffer->buf.begin({ vk::CommandBufferUsageFlags{} });
+        // V3-T3: in pre-record mode EVERY cb is recorded re-submittable
+        // (SimultaneousUse). The recorded cb can be created by paths other than
+        // get_compute_ctx (set_input/prealloc buffer IO use their own ctx_begin
+        // with default one_time=true), so the gate is global, not per-call-site.
+        s.buffer->buf.begin({ vk::CommandBufferUsageFlagBits::eSimultaneousUse });
     }
 
     return s;
@@ -8238,6 +8299,32 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
+    if (g_dtrace) {
+        // Dispatch-trace: one line per dispatch with everything premise-relevant.
+        // diff across evals must be byte-identical (record-only) and pre-record
+        // eval 1 must match record-only eval 1.
+        char hexbuf[512];
+        size_t hexlen = 0;
+        const uint8_t* pc = (const uint8_t*)push_constant_data(push_constants);
+        size_t pcs = push_constant_size(push_constants);
+        for (size_t i = 0; i < pcs && hexlen + 2 < sizeof(hexbuf); i++) {
+            static const char hx[] = "0123456789abcdef";
+            hexbuf[hexlen++] = hx[pc[i] >> 4];
+            hexbuf[hexlen++] = hx[pc[i] & 0xF];
+        }
+        hexbuf[hexlen] = 0;
+        std::string desc;
+        for (auto& d : descriptor_buffer_infos) {
+            char db[96];
+            sprintf(db, "(%llx,%llu,%llu) ", (unsigned long long)(VkBuffer)d.buffer,
+                    (unsigned long long)d.offset, (unsigned long long)d.range);
+            desc += db;
+        }
+        fprintf(stderr, "DTRACE e%d s%zu d%u: %s wg=%ux%ux%u pc=%s %s\n",
+            g_dtrace_eval, subctx->seqs.size(), ctx->descriptor_set_idx,
+            pipeline->name, wg0, wg1, wg2, hexbuf, desc.c_str());
+    }
+
     vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
     vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
     ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
@@ -8257,18 +8344,21 @@ static void ggml_vk_ctx_end(vk_context& ctx) {
     if (ctx->s == nullptr) {
         return;
     }
+    if (g_dtrace) {
+        fprintf(stderr, "DTRACE e%d: SEGEND nseqs=%zu\n", g_dtrace_eval, ctx->seqs.size());
+    }
 
     ctx->s->buffer->buf.end();
     ctx->s = nullptr;
 }
 
-static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
+static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx, bool one_time = true) {
     VK_LOG_DEBUG("ggml_vk_ctx_begin(" << device->name << ")");
     if (subctx->s != nullptr) {
         ggml_vk_ctx_end(subctx);
     }
 
-    subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p) });
+    subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p, one_time) });
     subctx->s = subctx->seqs[subctx->seqs.size() - 1].data();
 }
 
@@ -8280,7 +8370,10 @@ static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
         result = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
 
         ctx->compute_ctx = result;
-        ggml_vk_ctx_begin(ctx->device, result);
+        // V3-T3: in pre-record mode the whole eval (input uploads + graph) shares
+        // one re-submittable cb (set_input creates the ctx BEFORE pr_recording is
+        // set, so gate on pr_enabled, not pr_recording). Non-pr mode unchanged.
+        ggml_vk_ctx_begin(ctx->device, result, /*one_time=*/!ctx->pr_enabled);
     }
 
     if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
@@ -8672,6 +8765,9 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
         vk_context subctx = ggml_vk_create_temporary_context(src->device->compute_queue->cmd_pool);
         ggml_vk_ctx_begin(src->device, subctx);
+        if (g_dtrace) {
+            fprintf(stderr, "DTRACE e%d: BAR host-readback stage=compute|transfer->host\n", g_dtrace_eval);
+        }
         subctx->s->buffer->buf.pipelineBarrier(
             vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
             vk::PipelineStageFlagBits::eHost,
@@ -16246,6 +16342,13 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             memset(mset.dst, mset.val, mset.n);
         }
 
+        // V3-T3: capture the recorded cb BEFORE ggml_vk_submit (which clears seqs).
+        // Single-cb mode: only the final last_node submission reaches here, so this
+        // is the whole-graph cb.
+        if (ctx->pr_recording && !subctx->seqs.empty()) {
+            ctx->pr_recorded_cb = subctx->seqs.back().back().buffer;
+        }
+
         if (ctx->device->serialize_submissions) {
             ggml_vk_submit(subctx, ctx->fence);
         } else if (almost_ready && !ctx->almost_ready_fence_pending) {
@@ -16284,9 +16387,15 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->unsynced_nodes_read.clear();
     ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
 
-    ggml_vk_command_pool_cleanup(ctx->device, ctx->compute_cmd_pool);
-    if (ctx->device->async_use_transfer_queue) {
-        ggml_vk_command_pool_cleanup(ctx->device, ctx->transfer_cmd_pool);
+    // V3-T3: in pre-record mode the command pool must NOT be reset -- resetCommandPool
+    // would wipe the recorded cb that replay keeps re-submitting (path A, the only
+    // per-eval threat to the recorded cb). Non-recorded cbs are reset individually
+    // in ggml_vk_synchronize, so the pool stays healthy.
+    if (!ctx->pr_enabled) {
+        ggml_vk_command_pool_cleanup(ctx->device, ctx->compute_cmd_pool);
+        if (ctx->device->async_use_transfer_queue) {
+            ggml_vk_command_pool_cleanup(ctx->device, ctx->transfer_cmd_pool);
+        }
     }
 
     for (size_t i = 0; i < ctx->gc.semaphores.size(); i++) {
@@ -16911,7 +17020,9 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             ggml_vk_wait_for_fence(ctx);
         }
         ctx->submit_pending = false;
-        if (cmd_buf) {
+        // V3-T3: never reset the recorded cb (replay re-submits it). All other
+        // cbs (input uploads etc.) reset normally so they can be reused.
+        if (cmd_buf && !(ctx->pr_enabled && cmd_buf == ctx->pr_recorded_cb)) {
             cmd_buf->in_use = false;
             cmd_buf->buf.reset();
         }
@@ -17559,6 +17670,46 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
+    if (g_dtrace) {
+        g_dtrace_eval++;
+        if (g_dtrace_eval > 4) {
+            g_dtrace = false;   // only trace the first 4 evals (file size)
+        }
+    }
+
+    // V3-T3 spike: pre-record / replay state machine.
+    // pr_enabled/pr_replay_only are set once in ggml_vk_init (must precede the
+    // first set_input so upload cbs are also re-submittable).
+    if (ctx->pr_enabled && ctx->pr_recorded && !ctx->pr_replay_only) {
+        // REPLAY: flush any pending input uploads recorded since the last compute
+        // (set_input path holds them in compute_ctx), then re-submit the recorded
+        // single-cb. Same-queue ordering guarantees the cb reads the new inputs.
+        if (!ctx->compute_ctx.expired()) {
+            vk_context ic = ctx->compute_ctx.lock();
+            ggml_vk_ctx_end(ic);
+            for (auto& cpy : ic->in_memcpys) {
+                memcpy(cpy.dst, cpy.src, cpy.n);
+            }
+            for (auto& mset : ic->memsets) {
+                memset(mset.dst, mset.val, mset.n);
+            }
+            ggml_vk_submit(ic, {});
+            ctx->compute_ctx.reset();
+        }
+        ctx->device->compute_queue->handle->submit(ctx->pr_submit_infos, {});
+        // Async semantics unchanged: the caller (ggml_backend_vk_synchronize)
+        // waits via an empty fence submit on the same queue.
+        return GGML_STATUS_SUCCESS;
+    }
+    if (ctx->pr_enabled) {
+        // First eval: record. Reset the shared compute ctx so the graph commands
+        // go into a FRESH cb that contains ONLY graph commands -- the recorded cb
+        // must not carry eval-1's input-upload commands (their staging buffers
+        // die after eval 1; replaying them would read freed memory).
+        ctx->compute_ctx.reset();
+        ctx->pr_recording = true;
+    }
+
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
     ctx->device->diag_prev_end = -1;
@@ -17696,7 +17847,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             total_flops += node_flops;
 
             // Flush the current batch before recording a node that would push it over the flop threshold
-            if (flops_per_submit != 0 && submitted_nodes > 0 && batch_flops + node_flops >= flops_per_submit) {
+            // V3-T3: disabled during recording (single-cb requires no intermediate flushes)
+            if (!ctx->pr_recording && flops_per_submit != 0 && submitted_nodes > 0 && batch_flops + node_flops >= flops_per_submit) {
                 vk_context flush_ctx = ggml_vk_get_compute_ctx(ctx);
                 ggml_vk_ctx_end(flush_ctx);
                 flush_ctx->exit_tensor_idx = -1;
@@ -17966,10 +18118,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
-        bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
-                      (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
-                      (i + ctx->num_additional_fused_ops >= last_node) ||
-                      (almost_ready && !ctx->almost_ready_fence_pending);
+        // V3-T3: during recording, disable all split conditions (single cb for the
+        // whole graph; the final submission is triggered by `last_node` inside
+        // ggml_vk_build_graph). Split exists only to overlap host recording with
+        // GPU execution, which the replay mode eliminates.
+        bool submit = !ctx->pr_recording && (
+            (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
+            (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
+            (i + ctx->num_additional_fused_ops >= last_node) ||
+            (almost_ready && !ctx->almost_ready_fence_pending));
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
@@ -18007,6 +18164,25 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     ctx->last_total_flops = total_flops;
+
+    // V3-T3: end of the recording eval — cache the recorded single-cb submission.
+    if (ctx->pr_recording) {
+        if (ctx->pr_recorded_cb != nullptr) {
+            // Same SubmitInfo shape as ggml_vk_submit's single-submission case:
+            // no wait/signal semaphores (all barrier work is in-cb), 1 command buffer.
+            vk::SubmitInfo si{
+                0, nullptr, nullptr,
+                1, &ctx->pr_recorded_cb->buf,
+                0, nullptr, nullptr
+            };
+            ctx->pr_submit_infos = { si };
+            ctx->pr_recorded = true;
+            GGML_LOG_INFO("ggml_vulkan: pre-record complete (%zu node(s) -> 1 cb, cb=%p)\n", (size_t)cgraph->n_nodes, (void*)&ctx->pr_recorded_cb->buf);
+        } else {
+            GGML_LOG_ERROR("ggml_vulkan: pre-record failed: no recorded command buffer\n");
+        }
+        ctx->pr_recording = false;
+    }
 
     if (vk_perf_logger_enabled) {
         // End the command buffer and submit/wait
