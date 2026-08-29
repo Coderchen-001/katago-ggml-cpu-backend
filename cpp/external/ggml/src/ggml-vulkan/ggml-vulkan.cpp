@@ -1,8 +1,8 @@
 #include "ggml-vulkan.h"
 #include <vulkan/vulkan_core.h>
 #include <fstream>
+#include <chrono>   // V3-T3: host-side replay timing (KATAGO_VK_PR_TIMING)
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
-#include <chrono>
 #include "ggml-cpu.h"
 #endif
 
@@ -2092,27 +2092,25 @@ struct vk_context_struct {
 typedef std::shared_ptr<vk_context_struct> vk_context;
 typedef std::weak_ptr<vk_context_struct> vk_context_ref;
 
-// V3-T3: dispatch-trace diagnostics (env KATAGO_VK_DISPATCH_TRACE=1, default off).
-// Pure prints, no effect on recording. Used to diff recording decisions across
-// evals (record-only e1/e2/e3 must be byte-identical; pre-record e1 must match
-// record-only e1) -- validates premises 2/3/4 and the descriptor cursor order.
-// Declared here (before sync_buffers) since the barrier trace uses it.
-// Static init: read the env before any backend/buffer construction so buffer
-// alloc/destroy tracing (which happens during device/gallocr init) works too.
-static bool g_dtrace = getenv("KATAGO_VK_DISPATCH_TRACE") != nullptr;
-static int  g_dtrace_eval = 0;
-// E-B/E-C: prealloc poison diagnostics (env KATAGO_VK_POISON=1, default off).
-// Before each replay, fill all four prealloc buffers with a run-distinct value;
-// after the replay, dump the first word of each. Distinguishes "read-untouched
-// residue" (poison survives -> H-A) from "accumulate across exec" (value =
-// poison + partial sums -> H-B) and captures exec-1 output state.
-static bool g_poison = getenv("KATAGO_VK_POISON") != nullptr;
-static int  g_poison_run = 0;
 // V3-T3 (N-2-spike): pool-leak sentinel (env KATAGO_VK_PR_LEAKTRACE=1, default off).
 // Prints compute_cmd_pool size/usage once per N graph cleanups in pr mode so a
 // per-eval cb leak (old N-2) shows up as unbounded pool growth across a long run.
 static bool g_pr_leaktrace = getenv("KATAGO_VK_PR_LEAKTRACE") != nullptr;
 static int  g_pr_cleanup_count = 0;
+// V3-T3: host-side graph_compute timing sentinel (env KATAGO_VK_PR_TIMING=1,
+// default off). Measures the CPU time of the replay vs normal paths per eval —
+// the §5-2 host-time -80% criterion's measurement channel.
+static bool g_pr_timing = getenv("KATAGO_VK_PR_TIMING") != nullptr;
+static uint64_t g_pr_timing_replay_us = 0, g_pr_timing_normal_us = 0;
+static uint32_t g_pr_timing_replay_n = 0, g_pr_timing_normal_n = 0;
+
+static void ggml_vk_pr_timing_report(bool replay) {
+    if (g_pr_timing && ((replay ? ++g_pr_timing_replay_n : ++g_pr_timing_normal_n) % 1000 == 0)) {
+        GGML_LOG_INFO("ggml_vulkan: PRTIMING replay_avg_us=%.1f (n=%u) normal_avg_us=%.1f (n=%u)\n",
+            g_pr_timing_replay_n ? (double)g_pr_timing_replay_us / g_pr_timing_replay_n : 0.0, g_pr_timing_replay_n,
+            g_pr_timing_normal_n ? (double)g_pr_timing_normal_us / g_pr_timing_normal_n : 0.0, g_pr_timing_normal_n);
+    }
+}
 
 struct ggml_vk_garbage_collector {
     std::vector<vk_semaphore> tl_semaphores;
@@ -2443,9 +2441,8 @@ struct ggml_backend_vk_context {
     // all split conditions disabled); subsequent evals skip the entire node
     // traversal and re-submit the cached single-cb submission.
     bool pr_enabled {};
-    bool pr_recording {};   // first eval: record mode
+    bool pr_recording {};   // eval >= 2: record mode
     bool pr_recorded {};    // cache ready: subsequent evals replay
-    bool pr_replay_only {}; // '2': record-only diagnostic (no replay)
     // Multi-segment replay cache: the graph may be recorded as several command
     // buffers (op-internal intermediate submissions), so we cache ALL segments'
     // SubmitInfos and resubmit them in one vkQueueSubmit (same-queue order =
@@ -3487,9 +3484,6 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
 static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
                                        void *import_ptr = nullptr) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
-    if (g_dtrace) {
-        fprintf(stderr, "DTRACE e%d: BUF+ size=%llu\n", g_dtrace_eval, (unsigned long long)size);
-    }
     if (size > device->max_buffer_size) {
         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
     }
@@ -3697,9 +3691,6 @@ static void ggml_vk_destroy_buffer(vk_buffer& buf) {
     if (buf == nullptr) {
         return;
     }
-    if (g_dtrace) {
-        fprintf(stderr, "DTRACE e%d: BUF- size=%llu\n", g_dtrace_eval, (unsigned long long)buf->size);
-    }
 
     if (buf->device != nullptr) {
         buf->device->memory_logger->log_deallocation(buf);
@@ -3719,12 +3710,6 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
 
     if (ctx) {
         ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
-    }
-
-    if (g_dtrace) {
-        fprintf(stderr, "DTRACE e%d s%zu: BAR sync_buffers stage=%x\n",
-            g_dtrace_eval, subctx->seqs.size(),
-            (unsigned int)(VkPipelineStageFlags)subctx->p->q->stage_flags);
     }
 
     subctx->s->buffer->buf.pipelineBarrier(
@@ -7741,17 +7726,39 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     // V3-T3: initialize the pre-record gate HERE (backend init), NOT lazily in
     // graph_compute -- set_input runs before the first graph_compute and must
     // already see pr_enabled so its upload cb is recorded re-submittable too.
-    const char* pr_env = getenv("KATAGO_VK_PRE_RECORD");
-    ctx->pr_enabled = pr_env != nullptr;
-    ctx->pr_replay_only = pr_env != nullptr && pr_env[0] == '2';
-    g_dtrace = g_dtrace || (getenv("KATAGO_VK_DISPATCH_TRACE") != nullptr);   // idempotent
+    ctx->pr_enabled = getenv("KATAGO_VK_PRE_RECORD") != nullptr;
+    if (ctx->pr_enabled) {
+        // N-3 gate 1: rope_dump×pr mutual exclusion — rope_dump splits the graph
+        // mid-recording (ctx_end→submit→wait→ctx_begin, bypassing the capture
+        // hook), so pre-recording while it dumps would silently record only the
+        // tail segments. pr_bad cannot see this (it only guards preallocate).
+        const char* rd_env = getenv("KATAGO_VK_ROPE_DUMP");
+        if (rd_env != nullptr && rd_env[0] != '\0') {
+            GGML_LOG_ERROR("ggml_vulkan: KATAGO_VK_ROPE_DUMP is incompatible with KATAGO_VK_PRE_RECORD (rope dump splits the graph mid-recording, bypassing the capture hook); disabling pre-record\n");
+            ctx->pr_enabled = false;
+        }
+        // N-3 gate 2: PERF_LOGGER×pr combination — the perf logger's timestamp
+        // queries are written during graph build; the replay path skips build
+        // entirely, so combined use would log stale/garbage timings.
+        if (vk_perf_logger_enabled) {
+            GGML_LOG_ERROR("ggml_vulkan: GGML_VK_PERF_LOGGER is incompatible with KATAGO_VK_PRE_RECORD (replay path skips graph build); disabling pre-record\n");
+            ctx->pr_enabled = false;
+        }
+        // N-3 gate 3: UMA — v1 pre-record targets discrete GPUs only (integrated
+        // GPUs take the host-visible memset path whose deferred memsets are not
+        // part of the recorded cb).
+        if (ctx->device->uma) {
+            GGML_LOG_ERROR("ggml_vulkan: integrated GPU (UMA) is not supported by KATAGO_VK_PRE_RECORD (v1 is discrete-only); disabling pre-record\n");
+            ctx->pr_enabled = false;
+        }
+    }
     if (ctx->pr_enabled) {
         // Scope-shrink 3 (design): the transfer-queue async path is incompatible
         // with pre-record replay (cross-queue semaphore chains, OneTimeSubmit
         // upload cbs on a different queue). Force it off.
         ctx->device->async_use_transfer_queue = false;
         ggml_vk_pr_global = true;
-        GGML_LOG_INFO("ggml_vulkan: pr mode enabled (replay_only=%d, transfer-queue forced off)\n", (int)ctx->pr_replay_only);
+        GGML_LOG_INFO("ggml_vulkan: pr mode enabled (transfer-queue forced off)\n");
     }
     GGML_LOG_INFO("ggml_vulkan: device %s support_async=%d (readback path: %s)\n",
         ctx->device->name.c_str(), (int)ctx->device->support_async,
@@ -8321,32 +8328,6 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
-    if (g_dtrace) {
-        char hexbuf[512];
-        size_t hexlen = 0;
-        const uint8_t* pc = (const uint8_t*)push_constant_data(push_constants);
-        size_t pcs = push_constant_size(push_constants);
-        for (size_t i = 0; i < pcs && hexlen + 2 < sizeof(hexbuf); i++) {
-            static const char hx[] = "0123456789abcdef";
-            hexbuf[hexlen++] = hx[pc[i] >> 4];
-            hexbuf[hexlen++] = hx[pc[i] & 0xF];
-        }
-        hexbuf[hexlen] = 0;
-        std::string desc;
-        for (auto& d : descriptor_buffer_infos) {
-            char db[96];
-            sprintf(db, "(%llx,%llu,%llu) ", (unsigned long long)(VkBuffer)d.buffer,
-                    (unsigned long long)d.offset, (unsigned long long)d.range);
-            desc += db;
-        }
-        fprintf(stderr, "DTRACE e%d s%zu d%u: %s wg=%ux%ux%u pc=%s %s\n",
-            g_dtrace_eval, subctx->seqs.size(), ctx->descriptor_set_idx,
-            pipeline->name, wg0, wg1, wg2, hexbuf, desc.c_str());
-    }
-    if (g_poison) {
-        GGML_LOG_INFO("ggml_vulkan: DISP cb=%p %s\n", (void*)(VkCommandBuffer)subctx->s->buffer->buf, pipeline->name);
-    }
-
     vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
     vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
     ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
@@ -8365,9 +8346,6 @@ static void ggml_vk_ctx_end(vk_context& ctx) {
     VK_LOG_DEBUG("ggml_vk_ctx_end(" << ctx << ", " << ctx->seqs.size() << ")");
     if (ctx->s == nullptr) {
         return;
-    }
-    if (g_dtrace) {
-        fprintf(stderr, "DTRACE e%d: SEGEND nseqs=%zu\n", g_dtrace_eval, ctx->seqs.size());
     }
 
     ctx->s->buffer->buf.end();
@@ -8787,9 +8765,6 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
         vk_context subctx = ggml_vk_create_temporary_context(src->device->compute_queue->cmd_pool);
         ggml_vk_ctx_begin(src->device, subctx);
-        if (g_dtrace) {
-            fprintf(stderr, "DTRACE e%d: BAR host-readback stage=compute|transfer->host\n", g_dtrace_eval);
-        }
         subctx->s->buffer->buf.pipelineBarrier(
             vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
             vk::PipelineStageFlagBits::eHost,
@@ -8873,11 +8848,6 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
 
 static void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_memset_async(" << offset << ", " << c << ", " << size << ")");
-    if (g_poison) {
-        GGML_LOG_INFO("ggml_vulkan: MEMSET buf=%p off=%llu val=%08x size=%llu cb=%p\n",
-            (void*)(VkBuffer)dst->buffer, (unsigned long long)offset, c, (unsigned long long)size,
-            (void*)(VkCommandBuffer)ctx->s->buffer->buf);
-    }
     if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
         dst->device->uma) {
         deferred_memset((uint8_t*)dst->ptr + offset, c, size, &ctx->memsets);
@@ -16397,9 +16367,6 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
                 1, &subctx->seqs.back().back().buffer->buf,
                 0, nullptr, nullptr
             };
-            if (g_poison) {
-                GGML_LOG_INFO("ggml_vulkan: CAPTURE seg=%zu cb=%p\n", ctx->pr_submit_infos.size(), (void*)(VkCommandBuffer)subctx->seqs.back().back().buffer->buf);
-            }
             ctx->pr_submit_infos.push_back(si);
             ctx->pr_recorded_cbs.push_back(subctx->seqs.back().back().buffer);
         }
@@ -16469,7 +16436,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
                 n_reset++;
             }
         }
-        if (g_poison || g_pr_leaktrace) {
+        if (g_pr_leaktrace) {
             GGML_LOG_INFO("ggml_vulkan: CLEANUP selective reset (pr_enabled=%d recorded=%d nseg=%zu reset=%zu keep=%zu)\n",
                 (int)ctx->pr_enabled, (int)ctx->pr_recorded, ctx->pr_submit_infos.size(), n_reset, n_keep);
         }
@@ -17786,17 +17753,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
-    if (g_dtrace) {
-        g_dtrace_eval++;
-        if (g_dtrace_eval > 4) {
-            g_dtrace = false;   // only trace the first 4 evals (file size)
-        }
-    }
+    const auto pr_t0 = std::chrono::high_resolution_clock::now();
+    const bool pr_was_replay = ctx->pr_enabled && ctx->pr_recorded;
 
-    // V3-T3 spike: pre-record / replay state machine.
-    // pr_enabled/pr_replay_only are set once in ggml_vk_init (must precede the
-    // first set_input so upload cbs are also re-submittable).
-    if (ctx->pr_enabled && ctx->pr_recorded && !ctx->pr_replay_only) {
+    // V3-T3: pre-record / replay state machine.
+    // pr_enabled is set once in ggml_vk_init (must precede the first set_input
+    // so upload cbs are also re-submittable).
+    if (ctx->pr_enabled && ctx->pr_recorded) {
         // P1: fingerprint check — if the graph shape changed (dynamic shapes,
         // model reload, etc.), the recorded cbs are stale. Discard the cache
         // and fall through to re-record this eval.
@@ -17814,47 +17777,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // (set_input path holds them in compute_ctx), then re-submit the recorded
             // cbs. Same-queue ordering guarantees the cbs read the new inputs.
             ggml_vk_pr_flush_uploads(ctx);
-            if (g_poison) {
-                GGML_LOG_INFO("ggml_vulkan: REPLAY submit %zu seg(s) cb0=%p\n", ctx->pr_submit_infos.size(),
-                    ctx->pr_submit_infos.empty() ? nullptr : (void*)(VkCommandBuffer)ctx->pr_submit_infos[0].pCommandBuffers[0]);
-            }
             ctx->device->compute_queue->handle->submit(ctx->pr_submit_infos, {});
             // 语义对齐: replay submission is pending work — the caller's
             // ggml_vk_synchronize waits on this flag via an empty fence submit.
             ctx->submit_pending = true;
-            // E-B/E-C: poison prealloc buffers before/after the replay.
-            if (g_poison) {
-                g_poison_run++;
-                const uint32_t val = 0x3F800000u + (uint32_t)g_poison_run;
-                vk_context pctx = ggml_vk_create_temporary_context(ctx->compute_cmd_pool);
-                ggml_vk_ctx_begin(ctx->device, pctx);
-                struct { vk_buffer* b; size_t* s; } pre[4] = {
-                    { &ctx->prealloc_x, &ctx->prealloc_size_x },
-                    { &ctx->prealloc_y, &ctx->prealloc_size_y },
-                    { &ctx->prealloc_split_k, &ctx->prealloc_size_split_k },
-                    { &ctx->prealloc_add_rms_partials, &ctx->prealloc_size_add_rms_partials },
-                };
-                for (int i = 0; i < 4; i++) {
-                    if (*pre[i].b && *pre[i].s) {
-                        ggml_vk_buffer_memset_async(pctx, *pre[i].b, 0, val, *pre[i].s);
-                    }
-                }
-                ggml_vk_ctx_end(pctx);
-                ggml_vk_submit(pctx, {});
-                ctx->device->compute_queue->handle->queue.waitIdle();
-                ctx->device->compute_queue->handle->submit(ctx->pr_submit_infos, {});
-                ctx->device->compute_queue->handle->queue.waitIdle();
-                uint32_t d[4] = { 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF };
-                for (int i = 0; i < 4; i++) {
-                    if (*pre[i].b && *pre[i].s) {
-                        ggml_vk_buffer_read(*pre[i].b, 0, &d[i], 4);
-                    }
-                }
-                GGML_LOG_INFO("ggml_vulkan: POISON run=%d val=%08x x=%08x y=%08x sk=%08x ar=%08x\n",
-                    g_poison_run, val, d[0], d[1], d[2], d[3]);
-            }
             // Async semantics unchanged: the caller (ggml_backend_vk_synchronize)
             // waits via an empty fence submit on the same queue.
+            if (g_pr_timing) {
+                g_pr_timing_replay_us += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::high_resolution_clock::now() - pr_t0).count();
+                ggml_vk_pr_timing_report(true);
+            }
             return GGML_STATUS_SUCCESS;
         }
     }
@@ -18401,6 +18334,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     if (!ctx->device->support_async) {
         ggml_vk_synchronize(ctx);
+    }
+
+    if (g_pr_timing && !pr_was_replay) {
+        g_pr_timing_normal_us += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - pr_t0).count();
+        ggml_vk_pr_timing_report(false);
     }
 
     return GGML_STATUS_SUCCESS;
