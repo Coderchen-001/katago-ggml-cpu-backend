@@ -2101,6 +2101,12 @@ static int  g_pr_cleanup_count = 0;
 // default off). Measures the CPU time of the replay vs normal paths per eval —
 // the §5-2 host-time -80% criterion's measurement channel.
 static bool g_pr_timing = getenv("KATAGO_VK_PR_TIMING") != nullptr;
+// C-N35: narrow in-graph memory barriers (env KATAGO_VK_NARROW_BARRIER=1,
+// default off = bit-identical to previous build). When ON, sync_buffers emits
+// the narrow COMPUTE-only barrier unless a fillBuffer wrote prealloc since the
+// last sync (prealloc_transfer_pending) or ctx==nullptr (staging-transfer
+// sites, GV:16874/16930 must stay wide).
+static bool g_narrow_barrier = getenv("KATAGO_VK_NARROW_BARRIER") != nullptr;
 static uint64_t g_pr_timing_replay_us = 0, g_pr_timing_normal_us = 0;
 static uint32_t g_pr_timing_replay_n = 0, g_pr_timing_normal_n = 0;
 
@@ -2455,6 +2461,13 @@ struct ggml_backend_vk_context {
     int  pr_fp_nodes {};    // P1: graph fingerprint (node count + first/last node)
     ggml_tensor* pr_fp_first = nullptr;
     ggml_tensor* pr_fp_last = nullptr;
+
+    // C-N35: in-cb transfer-write tracking for barrier narrowing. Set when a
+    // fillBuffer writes a prealloc buffer (add_rms_partials); the next
+    // sync_buffers consumes it and emits the WIDE barrier (with TRANSFER bits,
+    // needed for fillBuffer -> dispatch visibility). All other sync_buffers
+    // narrow to pure compute (COMPUTE_SHADER / SHADER_* only, no L2 flush).
+    bool prealloc_transfer_pending {};
 
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
@@ -3709,9 +3722,31 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
     const bool transfer_queue = subctx->p->q->transfer_only;
 
     if (ctx) {
+        const bool need_wide = ctx->prealloc_transfer_pending;   // C-N35
         ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+        ctx->prealloc_transfer_pending = false;                  // C-N35: consumed
+        if (!transfer_queue && !need_wide && g_narrow_barrier) {
+            // C-N35 narrow form: pure compute dispatch -> dispatch. No TRANSFER
+            // bits => no L2 flush/invalidate on NVIDIA. Only prealloc_x/y/split_k
+            // are covered (their sole writers are compute dispatches, verified
+            // GV:9595-9600 etc.); the fillBuffer case (add_rms_partials) is kept
+            // WIDE via prealloc_transfer_pending.
+            subctx->s->buffer->buf.pipelineBarrier(
+                vk::PipelineStageFlagBits::eComputeShader,
+                vk::PipelineStageFlagBits::eComputeShader,
+                {},
+                { {
+                  { vk::AccessFlagBits::eShaderWrite,
+                    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite },
+                } },
+                {}, {});
+            return;
+        }
     }
 
+    // WIDE form (current behavior): covers transfer-visible prealloc writes
+    // (add_rms fillBuffer), the staging-transfer sites (ctx==nullptr,
+    // GV:16874/16930), transfer queue, and the g_narrow_barrier=off default.
     subctx->s->buffer->buf.pipelineBarrier(
         subctx->p->q->stage_flags,
         subctx->p->q->stage_flags,
@@ -15825,6 +15860,13 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ctx->prealloc_add_rms_partials != nullptr && ctx->prealloc_size_add_rms_partials) {
         ggml_vk_buffer_memset_async(compute_ctx, ctx->prealloc_add_rms_partials, 0, 0, ctx->prealloc_size_add_rms_partials);
         ctx->pr_ar_zeroed = true;
+        // C-N35 (C-4): explicit barrier right after the fillBuffer. The partials
+        // buffer is READ by ADD/RMS_NORM dispatches (a_buf, GV:12513-12519), so
+        // the fillBuffer's TRANSFER_WRITE must be made visible to shader reads
+        // (WIDE). Emitting it here (instead of relying on a later need_sync that
+        // may never fire) makes correctness structural, not topological.
+        ctx->prealloc_transfer_pending = true;
+        ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
     {
@@ -16408,6 +16450,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->unsynced_nodes_written.clear();
     ctx->unsynced_nodes_read.clear();
     ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+    ctx->prealloc_transfer_pending = false;   // C-N35: clear per-eval residue (set->consume is intra-eval)
 
     // V3-T3 (N-2-spike): in pre-record mode resetCommandPool is NEVER called —
     // it would wipe the recorded cbs that replay keeps re-submitting. Instead
@@ -17885,6 +17928,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         // initialize partial sums to zero.
         ggml_vk_buffer_memset_async(compute_ctx, ctx->prealloc_add_rms_partials, 0, 0, ctx->prealloc_size_add_rms_partials);
+        ctx->prealloc_transfer_pending = true;   // C-N35: consumed by the sync below
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
