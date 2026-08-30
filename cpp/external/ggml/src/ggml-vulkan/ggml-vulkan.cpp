@@ -9004,6 +9004,25 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         return aligned ? mmp->a_s : mmp->s;
     }
 
+    // KATAGO_VK_MM_TILE: force a specific tile for the scalar (non-coopmat2)
+    // path. Probe tool for candidate-0 (mul_mm tile tuning); default off (env
+    // unset) preserves the default heuristic exactly (bit-identical). Placed
+    // inside this function so ggml_vk_guess_matmul_pipeline_align (which calls
+    // back with aligned=true) computes kpad from the same forced tile.
+    const char * mm_tile_env = getenv("KATAGO_VK_MM_TILE");
+    if (mm_tile_env != nullptr) {
+        if (strcmp(mm_tile_env, "l") == 0 && mm_l) {
+            return aligned ? mmp->a_l : mmp->l;
+        }
+        if (strcmp(mm_tile_env, "m") == 0 && mm_m) {
+            return aligned ? mmp->a_m : mmp->m;
+        }
+        if (strcmp(mm_tile_env, "s") == 0 && mm_s) {
+            return aligned ? mmp->a_s : mmp->s;
+        }
+        // Unknown value or unavailable tile: fall through to the default heuristic.
+    }
+
     if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
         return aligned ? mmp->a_s : mmp->s;
     }
