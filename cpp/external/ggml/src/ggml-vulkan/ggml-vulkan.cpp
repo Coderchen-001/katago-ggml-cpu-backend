@@ -254,6 +254,11 @@ static void ggml_vk_destroy_pipeline(vk::Device& device, vk_pipeline& pipeline);
 struct vk_matmul_pipeline_struct {
     vk_pipeline l, m, s;
     vk_pipeline a_l, a_m, a_s;
+    // P3a probe slots: custom scalar tile registered per-device when
+    // KATAGO_VK_MM_TILE=custom:... (must be per-device -- a global slot gets
+    // overwritten by the last device's init on multi-GPU hosts and dispatches
+    // with a foreign-device pipeline => garbage output; lesson #42).
+    vk_pipeline custom_l, custom_a_l;
     // Returns true when all unaligned pipelines are null.
     // We only check for unaligned variants since one of the unaligned pipelines must exist
     // while aligned pipelines are optional
@@ -2176,6 +2181,12 @@ static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
+
+// P2/P3a probe state: spec id=12/13 overrides (SHMEM_STRIDE_PAD / APPLY_SLM_A_RESHAPE),
+// -1 = use shader default. The custom pipeline itself lives per-device
+// (vk_matmul_pipeline_struct::custom_l/custom_a_l), see lesson #42.
+static int mm_spec_pad = -1;
+static int mm_spec_reshape = -1;
 
 static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
@@ -4700,6 +4711,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
             spec.push_back(0u);  // constantID=12: SHMEM_STRIDE_PAD = 0
             spec.push_back(1u);  // constantID=13: APPLY_SLM_A_RESHAPE = true
+        } else if (mm_spec_pad >= 0 || mm_spec_reshape >= 0) {
+            // P2 probe knobs: inject 12/13 as a PAIR (position-mapped constantIDs,
+            // GG:3058), defaults 1/false = bit-identical to shader defaults.
+            spec.push_back(mm_spec_pad >= 0 ? (uint32_t)mm_spec_pad : 1u);
+            spec.push_back(mm_spec_reshape >= 0 ? (mm_spec_reshape ? 1u : 0u) : 0u);
         }
         return spec;
     };
@@ -4987,6 +5003,67 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_f16, matmul_f32_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16_f32, matmul_f16_f32, wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
+
+        // P3a: custom scalar tile probe (candidate-0 sweep, X/Y/Z etc.)
+        // KATAGO_VK_MM_TILE=custom:BM,BN,WM,WN,WMITER,TM,TN,BLOCK_SIZE[,PAD,RESHAPE]
+        // Registers an extra f32acc pipeline pair (unaligned/aligned) into the
+        // global custom slots; guess_matmul_pipeline returns them when the env
+        // carries the custom: prefix. Validity = hw-tuner §3.1 constraint family
+        // (BLOCK_SIZE must equal the warp grid exactly, else silent wrong results).
+        {
+            const char* mm_tile_env = getenv("KATAGO_VK_MM_TILE");
+            if (mm_tile_env != nullptr && strncmp(mm_tile_env, "custom:", 7) == 0) {
+                const char* p = mm_tile_env + 7;
+                int vals[10] = {0};
+                int n = 0;
+                while (*p != '\0' && n < 10) {
+                    while (*p == ',' || *p == ' ' || *p == '\t') p++;
+                    if (*p == '\0') break;
+                    char* end = nullptr;
+                    vals[n++] = (int)strtol(p, &end, 10);
+                    p = end;
+                }
+                if (n >= 8) {
+                    const uint32_t BM = (uint32_t)vals[0], BN = (uint32_t)vals[1];
+                    const uint32_t WM = (uint32_t)vals[2], WN = (uint32_t)vals[3];
+                    const uint32_t WMITER = (uint32_t)vals[4], TM = (uint32_t)vals[5], TN = (uint32_t)vals[6];
+                    const uint32_t BS = (uint32_t)vals[7];
+                    const int PAD = n >= 9 ? vals[8] : -1;
+                    const int RESHAPE = n >= 10 ? vals[9] : -1;
+                    const uint32_t num_warps = (BM / WM) * (BN / WN);
+                    const uint32_t wniter = WM * WN / (32 * TM * TN * WMITER);
+                    const bool ok = BM % WM == 0 && BN % WN == 0 && WM % WMITER == 0 &&
+                                    (WM / WMITER) % TM == 0 && wniter >= 1 && WN % wniter == 0 &&
+                                    (WN / wniter) % TN == 0 && BS == num_warps * 32 &&
+                                    TM * TN <= WM * WN / 32 && BS <= 1024 &&
+                                    (PAD < 0 || (PAD >= 0 && PAD <= 4)) &&
+                                    (RESHAPE < 0 || RESHAPE == 0 || RESHAPE == 1);
+                    if (ok) {
+                        const std::array<uint32_t, 3> custom_wg_denoms = { BM, BN, 1 };
+                        const std::vector<uint32_t> custom_warptile = { BS, BM, BN, 16, WM, WN, WMITER, TM, TN, 1, 32 };
+                        const uint32_t custom_align = std::max(BM, BN);  // conservative: too-small align = vec8 reads across rows (silent wrong); too-large = slower only
+                        mm_spec_pad = PAD;
+                        mm_spec_reshape = RESHAPE;
+                        // Per-device slots on the PRODUCTION family pipeline_matmul_f16_f32.f32acc
+                        // (prec path, F16 x F32, GV:7960). Lessons: #42 global slot = wrong-device
+                        // pipeline on multi-GPU hosts; #43 bit-equality cannot prove dispatch
+                        // (custom must be compared by op-table timings). The f16/f16acc families are
+                        // intentionally NOT registered: guess falls through to the default heuristic
+                        // there, avoiding dispatching an f16_f32 shader against f16 operands
+                        // (dtype mismatch bomb). dot2 variants not followed (dot2_f16=false on
+                        // 1660/5080; parameterize if a dot2 host ever needs custom).
+                        ggml_vk_create_pipeline(device, device->pipeline_matmul_f16_f32.f32acc->custom_l, "matmul_f16_f32_custom_l", matmul_f16_f32_len, matmul_f16_f32_data, "main", 3, sizeof(vk_mat_mat_push_constants), custom_wg_denoms, ggml_vk_mul_mm_spec(custom_warptile, false), 1, false, false, 0);
+                        ggml_vk_create_pipeline(device, device->pipeline_matmul_f16_f32.f32acc->custom_a_l, "matmul_f16_f32_custom_aligned_l", matmul_f16_f32_len, matmul_f16_f32_data, "main", 3, sizeof(vk_mat_mat_push_constants), custom_wg_denoms, ggml_vk_mul_mm_spec(custom_warptile, true), custom_align, false, false, 0);
+                        GGML_LOG_DEBUG("ggml_vulkan: custom scalar tile registered (dev %s): BM=%u BN=%u WM=%u WN=%u WMITER=%u TM=%u TN=%u BLOCK_SIZE=%u PAD=%d RESHAPE=%d | spec12=%d spec13=%d warptile={%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u}\n", device->name.c_str(), BM, BN, WM, WN, WMITER, TM, TN, BS, PAD, RESHAPE, mm_spec_pad, mm_spec_reshape, custom_warptile[0], custom_warptile[1], custom_warptile[2], custom_warptile[3], custom_warptile[4], custom_warptile[5], custom_warptile[6], custom_warptile[7], custom_warptile[8], custom_warptile[9], custom_warptile[10]);
+                        GGML_LOG_DEBUG("ggml_vulkan:   m_warptile={%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u} l_warptile={%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u} coopmat_support=%d coopmat2=%d subgroup=%u\n", m_warptile[0], m_warptile[1], m_warptile[2], m_warptile[3], m_warptile[4], m_warptile[5], m_warptile[6], m_warptile[7], m_warptile[8], m_warptile[9], m_warptile[10], l_warptile[0], l_warptile[1], l_warptile[2], l_warptile[3], l_warptile[4], l_warptile[5], l_warptile[6], l_warptile[7], l_warptile[8], l_warptile[9], l_warptile[10], device->coopmat_support, device->coopmat2, device->subgroup_size);
+                    } else {
+                        GGML_LOG_ERROR("ggml_vulkan: invalid KATAGO_VK_MM_TILE=custom spec (constraints, hw-tuner 3.1); ignoring\n");
+                    }
+                } else {
+                    GGML_LOG_ERROR("ggml_vulkan: KATAGO_VK_MM_TILE=custom needs >=8 comma-separated ints; ignoring\n");
+                }
+            }
+        }
 
         CREATE_MM_NODOT2(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
 
@@ -9019,6 +9096,11 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         }
         if (strcmp(mm_tile_env, "s") == 0 && mm_s) {
             return aligned ? mmp->a_s : mmp->s;
+        }
+        if (strncmp(mm_tile_env, "custom:", 7) == 0 && mmp->custom_l != nullptr) {
+            // P3a: custom scalar tile registered at init (KATAGO_VK_MM_TILE=custom:...)
+            // per-device slot (lesson #42)
+            return aligned ? mmp->custom_a_l : mmp->custom_l;
         }
         // Unknown value or unavailable tile: fall through to the default heuristic.
     }
