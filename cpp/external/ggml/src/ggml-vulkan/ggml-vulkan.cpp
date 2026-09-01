@@ -5035,7 +5035,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     const bool ok = BM % WM == 0 && BN % WN == 0 && WM % WMITER == 0 &&
                                     (WM / WMITER) % TM == 0 && wniter >= 1 && WN % wniter == 0 &&
                                     (WN / wniter) % TN == 0 && BS == num_warps * 32 &&
-                                    TM * TN <= WM * WN / 32 && BS <= 1024 &&
+                                    TM * TN <= WM * WN / 32 && BS <= 1024 && TM % 2 == 0 &&
                                     (PAD < 0 || (PAD >= 0 && PAD <= 4)) &&
                                     (RESHAPE < 0 || RESHAPE == 0 || RESHAPE == 1);
                     if (ok) {
