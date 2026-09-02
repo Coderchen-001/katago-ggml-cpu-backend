@@ -1105,6 +1105,7 @@ add_executable(katago
   command/analysis.cpp
   command/benchmark.cpp
   command/benchmarknn.cpp
+  command/benchgemm.cpp
   command/contribute.cpp
   command/dumponnx.cpp
   command/evalsgf.cpp

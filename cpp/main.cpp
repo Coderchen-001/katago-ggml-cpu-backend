@@ -88,6 +88,8 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
     return MainCmds::benchmark(subArgs);
   else if(subcommand == "benchmarknn")
     return MainCmds::benchmarknn(subArgs);
+  else if(subcommand == "benchgemm")
+    return MainCmds::benchgemm(subArgs);
   else if(subcommand == "contribute")
     return MainCmds::contribute(subArgs);
   else if(subcommand == "evalsgf")
