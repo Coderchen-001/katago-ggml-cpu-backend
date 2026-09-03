@@ -160,7 +160,10 @@ struct OnnxToGgml {
   // q/k/v conv output names that feed fa (prescan-collected; fused + unfused).
   unordered_set<string> faFeedConvOuts;
   static bool faEnabled() {
-    static const bool e = getenv("KATAGO_VK_FA") != nullptr;
+    // fa-default (2026-09-02, fa-default-exec.md): ON by default; KATAGO_VK_FA=0
+    // is the explicit opt-out (rollback channel). Char compare, no <cstring>.
+    const char* v = getenv("KATAGO_VK_FA");
+    static const bool e = (v == nullptr) || !(v[0] == '0' && v[1] == '\0');
     return e;
   }
 
