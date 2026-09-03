@@ -9102,6 +9102,22 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
             // per-device slot (lesson #42)
             return aligned ? mmp->custom_a_l : mmp->custom_l;
         }
+        if (strncmp(mm_tile_env, "custom:", 7) == 0 && mmp->custom_l == nullptr) {
+            // Lesson #46 (2026-09-02): custom tile env is set but the custom slot
+            // was NOT registered on the pipeline family this shape resolves to.
+            // This happens when the family differs from where custom registered
+            // (e.g. custom registered on f32acc, prec=DEFAULT resolves f16acc) --
+            // silently falling through to the heuristic produced several rounds of
+            // invalid measurements. MUST be loud: this is a measurement-integrity
+            // error, not a benign fallback. Report once per process (guess is
+            // called per shape per eval; a broken config would otherwise spam).
+            static bool custom_fallback_reported = false;
+            if (!custom_fallback_reported) {
+                custom_fallback_reported = true;
+                GGML_LOG_ERROR("ggml_vulkan: KATAGO_VK_MM_TILE=%s set but custom_l is NULL on the resolved pipeline family (src0=%s src1=%s) -- custom tile NOT applied, falling back to heuristic. Check that the custom slot family matches the production prec family (lesson #46).\n",
+                               mm_tile_env, ggml_type_name(src0_type), ggml_type_name(src1_type));
+            }
+        }
         // Unknown value or unavailable tile: fall through to the default heuristic.
     }
 
