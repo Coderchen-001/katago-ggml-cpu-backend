@@ -7838,7 +7838,14 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     // V3-T3: initialize the pre-record gate HERE (backend init), NOT lazily in
     // graph_compute -- set_input runs before the first graph_compute and must
     // already see pr_enabled so its upload cb is recorded re-submittable too.
-    ctx->pr_enabled = getenv("KATAGO_VK_PRE_RECORD") != nullptr;
+    // pr default-on (2026-09-03, next-temp.md N26): unset = ON, "0" = opt-out.
+    // Measured gains (batch3, MMPREC=1): 5080 +2.4~+9.1%, 1660 +0.6~+1.2%
+    // (3-4 reps, all positive; model/device-size dependent). Replay issues the
+    // SAME command sequence -> no numerical change (pr-on margin bit-identical
+    // to pr-off, 0.656x). Conflict gates below (ROPE_DUMP / PERF_LOGGER / UMA)
+    // still auto-disable.
+    const char* pr_env = getenv("KATAGO_VK_PRE_RECORD");
+    ctx->pr_enabled = (pr_env == nullptr) || !(pr_env[0] == '0' && pr_env[1] == '\0');
     if (ctx->pr_enabled) {
         // N-3 gate 1: rope_dump×pr mutual exclusion — rope_dump splits the graph
         // mid-recording (ctx_end→submit→wait→ctx_begin, bypassing the capture
