@@ -3880,6 +3880,36 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
 
+    // KATAGO_VK_FA_TILE (hw-tuner B3 probe, test-only): override the scalar FA
+    // tile after the heuristic, before the shmem-support check below. Spec =
+    // "Br,Bc,Dsplit". Constraints (next-temp.md §2.6): Dsplit | workgroup_size,
+    // Bc % (workgroup_size/Dsplit) == 0, else silently wrong results are possible
+    // (cols_per_iter/cols_per_thread must divide). Rejected specs fall back to the
+    // heuristic with an ERROR so a bad probe spec cannot masquerade as a result.
+    {
+        const char* fa_tile_env = getenv("KATAGO_VK_FA_TILE");
+        if (fa_tile_env != nullptr) {
+            unsigned br = 0, bc = 0, ds = 0;
+            if (sscanf(fa_tile_env, "%u,%u,%u", &br, &bc, &ds) == 3) {
+                const uint32_t wg = result.workgroup_size;
+                if (br >= 1 && bc >= 1 && ds >= 1 && (wg % ds) == 0 && (bc % (wg / ds)) == 0) {
+                    result.block_rows = br;
+                    result.block_cols = bc;
+                    result.d_split = ds;
+                    std::cerr << "ggml_vulkan: KATAGO_VK_FA_TILE=" << fa_tile_env
+                              << " applied (Br=" << br << " Bc=" << bc << " Dsplit=" << ds
+                              << " WG=" << wg << " row_split=" << result.row_split << ")\n";
+                } else {
+                    std::cerr << "ggml_vulkan: KATAGO_VK_FA_TILE=" << fa_tile_env
+                              << " rejected (need Dsplit|WG and Bc%(WG/Dsplit)==0); using heuristic\n";
+                }
+            } else {
+                std::cerr << "ggml_vulkan: KATAGO_VK_FA_TILE invalid spec '" << fa_tile_env
+                          << "' (need Br,Bc,Dsplit); using heuristic\n";
+            }
+        }
+    }
+
     if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
         result.block_rows /= 2;
     }
