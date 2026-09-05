@@ -1119,8 +1119,14 @@ struct OnnxToGgml {
   // ~8.3MB per shape (mask ref [S,S,1,N]); aliased overwrites are harmless.
   unordered_map<uint64_t, ggml_tensor*> shapeRefs;
 
-  OnnxToGgml(ggml_context* c, ggml_context* wc, int maxBatch, int xLen, int yLen, const onnx::ModelProto& m)
-    : ctx(c), wctx(wc), maxBatchSize(maxBatch), nnXLen(xLen), nnYLen(yLen), model(m)
+  // B2a (next-temp §10.11): when true, FA sites are built WITHOUT a mask tensor
+  // (skip repeat+cast, pass NULL). Valid only when the batch mask is guaranteed
+  // all-ones (requireExactNNLen handle) or under the test-only KATAGO_VK_FA_NULL
+  // env with full-board inputs; additive mask all-zero is equivalent to NULL.
+  const bool faNoMask;
+
+  OnnxToGgml(ggml_context* c, ggml_context* wc, int maxBatch, int xLen, int yLen, const onnx::ModelProto& m, bool noMaskFA)
+    : ctx(c), wctx(wc), maxBatchSize(maxBatch), nnXLen(xLen), nnYLen(yLen), model(m), faNoMask(noMaskFA)
   {}
 
   ggml_tensor* shapeRefFor(const int64_t ne[4]) {
@@ -1914,15 +1920,23 @@ struct OnnxToGgml {
               ggml_tensor* vv = ggml_view_4d(ctx, v, D, S, H, N, v->nb[2], v->nb[1], v->nb[3], 0);
               // mask: F16 [S_k,S_q,1,N] from the same source as the fallback
               // (separate cache per review: fallback keeps its F32 cache).
-              auto itM = annTensors.find(f.maskSrc);
-              testAssert(itM != annTensors.end());
-              if(faMaskF16Shared == NULL || faMaskF16SK != S || faMaskF16SQ != S || faMaskF16N != N) {
-                int64_t targetNe[4] = {S, S, 1, N};
-                ggml_tensor* full = ggml_repeat(ctx, itM->second.t, shapeRefFor(targetNe));   // F32
-                faMaskF16Shared = ggml_cast(ctx, full, GGML_TYPE_F16);
-                faMaskF16SK = S; faMaskF16SQ = S; faMaskF16N = N;
+              // B2a: with faNoMask, skip the repeat+cast entirely and pass NULL
+              // (ggml_flash_attn_ext accepts mask==NULL, ggml.c:5433). The ONNX
+              // maskBias producer chain stays as orphan ggml tensors (built but
+              // unreachable from the graph outputs => zero eval cost, §10.11).
+              ggml_tensor* faMask = NULL;
+              if(!faNoMask) {
+                auto itM = annTensors.find(f.maskSrc);
+                testAssert(itM != annTensors.end());
+                if(faMaskF16Shared == NULL || faMaskF16SK != S || faMaskF16SQ != S || faMaskF16N != N) {
+                  int64_t targetNe[4] = {S, S, 1, N};
+                  ggml_tensor* full = ggml_repeat(ctx, itM->second.t, shapeRefFor(targetNe));   // F32
+                  faMaskF16Shared = ggml_cast(ctx, full, GGML_TYPE_F16);
+                  faMaskF16SK = S; faMaskF16SQ = S; faMaskF16N = N;
+                }
+                faMask = faMaskF16Shared;
               }
-              ggml_tensor* r = ggml_flash_attn_ext(ctx, qv, kv, vv, faMaskF16Shared,
+              ggml_tensor* r = ggml_flash_attn_ext(ctx, qv, kv, vv, faMask,
                                                     f.scale, 0.0f, 0.0f);   // [D,H,S,N]
               // Force F32 accumulation: fa defaults to f16 acc on fp16 devices
               // (GV:10864 f32acc = !fp16 || prec==F32 || bf16), which costs
@@ -2421,7 +2435,16 @@ struct ComputeHandle {
       outOwnership(NULL),
       padBatch(true)
   {
-    (void)requireExactNNLen;
+    // B2a (next-temp §10.11): FA sites drop the mask tensor when the handle is
+    // requireExactNNLen (mask provably all-ones, nneval hard-asserts full board).
+    // TEST-ONLY override: KATAGO_VK_FA_NULL unset = flag-driven (production);
+    //   = "1"/any = force on (only valid with full-board inputs);
+    //   = "0"      = force off (A/B legs + rollback under the same binary).
+    const char* faNullEnv = getenv("KATAGO_VK_FA_NULL");
+    const bool faNoMask =
+      (faNullEnv != nullptr && !(faNullEnv[0] == '0' && faNullEnv[1] == '\0'))
+        ? true
+        : (faNullEnv != nullptr ? false : requireExactNNLen);
 
     // Debug cross-check: KATAGO_VULKAN_CPU=1 runs the same graph on the ggml
     // CPU backend instead of Vulkan (validates the interpreter in isolation).
@@ -2511,7 +2534,7 @@ struct ComputeHandle {
     }
 
     // --- Create graph inputs (NCHW, batch = maxBatchSize) ---
-    OnnxToGgml builder(ggmlCtx, wctx, maxBatchSize, ctx->nnXLen, ctx->nnYLen, model);
+    OnnxToGgml builder(ggmlCtx, wctx, maxBatchSize, ctx->nnXLen, ctx->nnYLen, model, faNoMask);
     vector<pair<string, ggml_tensor*>> inputTensors;
 
     // Read the declared input shapes from the graph.
