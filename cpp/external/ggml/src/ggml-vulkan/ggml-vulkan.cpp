@@ -3866,7 +3866,16 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     } else {
         // row_split 1 means higher register use per row, so block size has to be adjusted
         if (result.row_split == 1) {
-            result.block_rows = n_rows == 2 ? 2 : ((n_rows <= 4 || reduce_block_rows) ? 4 : 8);
+            // KataGo vendored change (next-temp.md B3, 2026-09-05): drop the
+            // `|| reduce_block_rows` clamp (Br=4 for n_kv<1024). That heuristic
+            // targets LLM short-KV prefill occupancy; for KataGo scalar FA
+            // (n_rows=n_kv=S in {81,169,361}, hsk=hsv=32) it pinned Br to 4 and
+            // forced K/V reread Tr=ceil(S/4). Measured (1660, b10c384, A-B-B-A,
+            // legs <0.4%): Br8 = +5.4% vs Br4, margin unchanged (0.152x/0.12x
+            // identical for Br4/Br8/Br16), register bound = accumulators Br x 2
+            // (cap ~32 => Br<=16; Br32 -24%, Br64 -70%). Rollback via env
+            // KATAGO_VK_FA_TILE=4,32,8 (probe commit 181dab3c).
+            result.block_rows = n_rows == 2 ? 2 : (n_rows <= 4 ? 4 : 8);
         } else {
             result.block_rows = n_rows <= 4 ? 4 : ((n_rows <= 8 || reduce_block_rows) ? 8 : 16);
         }
