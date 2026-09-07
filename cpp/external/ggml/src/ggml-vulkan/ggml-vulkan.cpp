@@ -6622,6 +6622,23 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+        // AMD host-visible VIDMEM collapse fix (see amd-hostvisible-exec.md):
+        // on AMD proprietary dGPUs the default ReBAR host-visible|host-coherent
+        // allocation makes the Windows driver pay a per-dispatch coherence cost
+        // once per-op fp16 working sets pass ~1.66M elements (c512@bs16
+        // 1289 -> 88 ms/batch). Default to pure DeviceLocal with sysmem fallback
+        // (fast path first, never allocation-fail); opt out value-based with
+        // KATAGO_VK_ALLOW_HOST_VISIBLE_VIDMEM=1 to restore upstream behavior.
+        // NVIDIA/Intel/RADV/UMA untouched (vendor + driver + !uma predicate).
+        const bool amd_proprietary_dgpu =
+            device->vendor_id == VK_VENDOR_ID_AMD &&
+            device->driver_id == vk::DriverId::eAmdProprietary &&
+            !device->uma;
+        if (amd_proprietary_dgpu && getenv("KATAGO_VK_ALLOW_HOST_VISIBLE_VIDMEM") == nullptr) {
+            device->disable_host_visible_vidmem = true;
+            device->allow_sysmem_fallback       = true;
+            GGML_LOG_INFO("ggml_vulkan: AMD proprietary dGPU: host-visible VIDMEM disabled (pure DeviceLocal + sysmem fallback; KATAGO_VK_ALLOW_HOST_VISIBLE_VIDMEM=1 to opt out)\n");
+        }
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
