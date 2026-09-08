@@ -984,6 +984,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f16;
     vk_pipeline pipeline_rms_norm_mul_mul_f32;
+    vk_pipeline pipeline_rms_norm_add_dual_mul_f32;
     vk_pipeline pipeline_rope_fused_f32;
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
@@ -1701,6 +1702,23 @@ struct vk_op_rms_norm_mul_mul_push_constants {
     uint32_t mnb00; uint32_t mnb01; uint32_t mnb02; uint32_t mnb03;
 };
 static_assert(sizeof(vk_op_rms_norm_mul_mul_push_constants) <= 256, "sizeof(vk_op_rms_norm_mul_mul_push_constants) must be <= 256");
+
+// M4 (epilogue-fallback-exec.md §12.15): fused ADD + MUL(mask) + RMS_NORM +
+// MUL(gamma) + MUL(mask). Six bindings (A/B/mask/gamma/t2/y); all ne/nb are in
+// element units. census12/13: mask == the pre-norm and post-norm per-position
+// tensor (the matcher enforces it), gamma is the per-channel RMS scale.
+// Dim0 of every operand has a unit element stride.
+struct vk_op_rms_norm_add_dual_mul_push_constants {
+    uint32_t ne0;
+    uint32_t t2_nb1, t2_nb2, t2_nb3;
+    uint32_t a_nb1, a_nb2, a_nb3, a_ne1, a_ne2, a_ne3;
+    uint32_t b_nb1, b_nb2, b_nb3, b_ne1, b_ne2, b_ne3;
+    uint32_t g_nb1, g_nb2, g_nb3, g_ne0, g_ne1, g_ne2, g_ne3;
+    uint32_t mk_nb1, mk_nb2, mk_nb3, mk_ne0, mk_ne1, mk_ne2, mk_ne3;
+    uint32_t y_nb1, y_nb2, y_nb3;
+    float eps;
+};
+static_assert(sizeof(vk_op_rms_norm_add_dual_mul_push_constants) <= 256, "sizeof(vk_op_rms_norm_add_dual_mul_push_constants) must be <= 256");
 
 // S2-⑦: fused RoPE {GET_ROWS, MUL, MUL, ADD}. Five tensors: q2/ids/cos2/sin2/dst,
 // each ne+nb in element units (ids is I32), plus M/D row/col counts.
@@ -2489,6 +2507,12 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+    // M4 (epilogue-fallback-exec.md §12.15): set by the fusion branch so the
+    // ADD dispatch routes to ggml_vk_m4_fused instead of ggml_vk_multi_add.
+    // A dedicated marker (like fused_topk_moe_mode) is required: the generic
+    // num_additional_fused_ops dispatch would send a 7-span ADD to multi_add,
+    // which binds the span's empty-view srcs as null tensors.
+    bool fused_m4 {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -5732,6 +5756,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     if (sizeof(vk_op_rms_norm_mul_mul_push_constants) <= device->properties.limits.maxPushConstantsSize) {
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_mul_f32, "rms_norm_mul_mul_f32", rms_norm_dual_mul_f32_len, rms_norm_dual_mul_f32_data, "main", 4, sizeof(vk_op_rms_norm_mul_mul_push_constants), {1, 1, 1}, {}, 1, true);
+    }
+    if (sizeof(vk_op_rms_norm_add_dual_mul_push_constants) <= device->properties.limits.maxPushConstantsSize) {
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_add_dual_mul_f32, "rms_norm_add_dual_mul_f32", rms_norm_add_dual_mul_f32_len, rms_norm_add_dual_mul_f32_data, "main", 6, sizeof(vk_op_rms_norm_add_dual_mul_push_constants), {1, 1, 1}, {}, 1, true);
     }
     if (sizeof(vk_op_rope_fused_push_constants) <= device->properties.limits.maxPushConstantsSize) {
         ggml_vk_create_pipeline(device, device->pipeline_rope_fused_f32, "rope_fused_f32", rope_fused_f32_len, rope_fused_f32_data, "main", 5, sizeof(vk_op_rope_fused_push_constants), {1, 1, 1}, {}, 1, true);
@@ -13925,6 +13952,95 @@ static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *
     return rope;
 }
 
+// M4 (epilogue-fallback-exec.md §12.15): dispatch for the 7-span
+//   ADD + MUL(mask) + [view] + [view] + RMS_NORM + MUL(gamma) + MUL(mask)
+// Writes t2 (= the MUL output, materialized because consumers outside the span
+// read it) and the final dst. mask == m2 is enforced by the matcher.
+static void ggml_vk_m4_fused(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * add = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * rms = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * mg  = cgraph->nodes[node_idx + 5];
+    const ggml_tensor * dst = cgraph->nodes[node_idx + 6];
+
+    const ggml_tensor * A     = add->src[0];
+    const ggml_tensor * B     = add->src[1];
+    const ggml_tensor * mask  = mul->src[0] == add ? mul->src[1] : mul->src[0];
+    const ggml_tensor * gamma = mg->src[0] == rms ? mg->src[1] : mg->src[0];
+    const ggml_tensor * t2    = mul;
+
+    vk_op_rms_norm_add_dual_mul_push_constants pc {};
+    pc.ne0    = (uint32_t) t2->ne[0];
+    pc.t2_nb1 = (uint32_t) (t2->nb[1] / sizeof(float));
+    pc.t2_nb2 = (uint32_t) (t2->nb[2] / sizeof(float));
+    pc.t2_nb3 = (uint32_t) (t2->nb[3] / sizeof(float));
+    pc.a_nb1  = (uint32_t) (A->nb[1] / sizeof(float));
+    pc.a_nb2  = (uint32_t) (A->nb[2] / sizeof(float));
+    pc.a_nb3  = (uint32_t) (A->nb[3] / sizeof(float));
+    pc.a_ne1  = (uint32_t) A->ne[1];
+    pc.a_ne2  = (uint32_t) A->ne[2];
+    pc.a_ne3  = (uint32_t) A->ne[3];
+    pc.b_nb1  = (uint32_t) (B->nb[1] / sizeof(float));
+    pc.b_nb2  = (uint32_t) (B->nb[2] / sizeof(float));
+    pc.b_nb3  = (uint32_t) (B->nb[3] / sizeof(float));
+    pc.b_ne1  = (uint32_t) B->ne[1];
+    pc.b_ne2  = (uint32_t) B->ne[2];
+    pc.b_ne3  = (uint32_t) B->ne[3];
+    pc.g_nb1  = (uint32_t) (gamma->nb[1] / sizeof(float));
+    pc.g_nb2  = (uint32_t) (gamma->nb[2] / sizeof(float));
+    pc.g_nb3  = (uint32_t) (gamma->nb[3] / sizeof(float));
+    pc.g_ne0  = (uint32_t) gamma->ne[0];
+    pc.g_ne1  = (uint32_t) gamma->ne[1];
+    pc.g_ne2  = (uint32_t) gamma->ne[2];
+    pc.g_ne3  = (uint32_t) gamma->ne[3];
+    pc.mk_nb1 = (uint32_t) (mask->nb[1] / sizeof(float));
+    pc.mk_nb2 = (uint32_t) (mask->nb[2] / sizeof(float));
+    pc.mk_nb3 = (uint32_t) (mask->nb[3] / sizeof(float));
+    pc.mk_ne0 = (uint32_t) mask->ne[0];
+    pc.mk_ne1 = (uint32_t) mask->ne[1];
+    pc.mk_ne2 = (uint32_t) mask->ne[2];
+    pc.mk_ne3 = (uint32_t) mask->ne[3];
+    pc.y_nb1  = (uint32_t) (dst->nb[1] / sizeof(float));
+    pc.y_nb2  = (uint32_t) (dst->nb[2] / sizeof(float));
+    pc.y_nb3  = (uint32_t) (dst->nb[3] / sizeof(float));
+    pc.eps    = ((const float *) rms->op_params)[0];
+
+    vk_pipeline pipeline = ctx->device->pipeline_rms_norm_add_dual_mul_f32;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const ggml_tensor * tlist[6] = { A, B, mask, gamma, t2, dst };
+    ggml_backend_vk_buffer_context * buf_ctx[6];
+    vk_buffer buf[6];
+    size_t offset[6];
+    bool uma[6];
+    for (uint32_t i = 0; i < 6; ++i) {
+        buf_ctx[i] = (ggml_backend_vk_buffer_context *) tlist[i]->buffer->context;
+        buf[i] = nullptr;
+        offset[i] = 0;
+        uma[i] = false;
+        if (ctx->device->uma) {
+            ggml_vk_host_get(ctx->device, tlist[i]->data, buf[i], offset[i]);
+            uma[i] = buf[i] != nullptr;
+        }
+        if (!uma[i]) {
+            buf[i] = buf_ctx[i]->dev_buffer;
+            offset[i] = vk_tensor_offset(tlist[i]) + tlist[i]->view_offs;
+        }
+        GGML_ASSERT(buf[i] != nullptr);
+    }
+
+    std::array<uint32_t, 3> elements = { (uint32_t) t2->ne[1], (uint32_t) t2->ne[2], (uint32_t) t2->ne[3] };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        ggml_vk_subbuffer(ctx, buf[0], offset[0]),
+        ggml_vk_subbuffer(ctx, buf[1], offset[1]),
+        ggml_vk_subbuffer(ctx, buf[2], offset[2]),
+        ggml_vk_subbuffer(ctx, buf[3], offset[3]),
+        ggml_vk_subbuffer(ctx, buf[4], offset[4]),
+        ggml_vk_subbuffer(ctx, buf[5], offset[5]),
+    }, pc, elements);
+}
+
 static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, float * op_params) {
     ggml_tensor * dst;
     const ggml_tensor * src0;
@@ -16179,7 +16295,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_ADD:
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->fused_m4) {
+            // M4 7-span fusion (epilogue-fallback-exec.md §12.15); dedicated
+            // marker, otherwise a 7-span ADD would be routed to multi_add.
+            ggml_vk_m4_fused(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->num_additional_fused_ops) {
             ggml_vk_multi_add(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_add(ctx, compute_ctx, src0, src1, node);
@@ -17810,6 +17930,102 @@ static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, co
     return true;
 }
 
+// M4 (epilogue-fallback-exec.md §12.15): matcher for the 7-span
+//   ADD, MUL, RESHAPE(view), RESHAPE(view), RMS_NORM, MUL(gamma), MUL(m2)
+// The two RESHAPE nodes are unrelated side-branch views that merely occupy
+// cgraph index slots (census12: their src is always a GGML_OP_NONE leaf and
+// their consumers are MUL_MATs); they are declared as fusion "outputs" so the
+// use-confinement check of ggml_can_fuse_subgraph passes, and they are not
+// written by anyone (they are views).
+//
+// Data edges (census12: 100% of 30/50/55 chains):
+//   MUL.src == ADD, RMS.src[0] == MUL, MUL(gamma).src == RMS, MUL(m2).src == MUL(gamma)
+// plus mask == m2 (the same per-position tensor before and after the norm,
+// census12/census13 100%), all F32, dim0 unit
+// stride, no misalignment.
+static bool ggml_vk_can_fuse_m4(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                int node_idx) {
+    const ggml_tensor * add = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * rms = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * mg  = cgraph->nodes[node_idx + 5];
+    const ggml_tensor * dst = cgraph->nodes[node_idx + 6];
+
+    // data edges (either operand slot is accepted for the muls)
+    if (mul->src[0] != add && mul->src[1] != add) {
+        return false;
+    }
+    if (rms->src[0] != mul) {
+        return false;
+    }
+    if (mg->src[0] != rms && mg->src[1] != rms) {
+        return false;
+    }
+    if (dst->src[0] != mg && dst->src[1] != mg) {
+        return false;
+    }
+
+    const ggml_tensor * A     = add->src[0];
+    const ggml_tensor * B     = add->src[1];
+    const ggml_tensor * mask  = mul->src[0] == add ? mul->src[1] : mul->src[0];
+    const ggml_tensor * gamma = mg->src[0] == rms ? mg->src[1] : mg->src[0];
+    const ggml_tensor * m2    = dst->src[0] == mg ? dst->src[1] : dst->src[0];
+
+    // the kernel is f32-only
+    if (A->type != GGML_TYPE_F32 || B->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F32 ||
+        gamma->type != GGML_TYPE_F32 || m2->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
+        mul->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || mg->type != GGML_TYPE_F32 ||
+        dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // the kernel carries a single per-position mask operand: the pre-norm and
+    // post-norm multipliers must be the same tensor (census12: 100%)
+    if (m2 != mask) {
+        return false;
+    }
+
+    // elementwise shape agreement across the chain
+    if (!ggml_are_same_shape(mul, rms) || !ggml_are_same_shape(mul, mg) || !ggml_are_same_shape(mul, dst)) {
+        return false;
+    }
+
+    // dim0 of every operand must have a unit element stride (col direct indexing)
+    const size_t esz = ggml_type_size(GGML_TYPE_F32);
+    if (A->nb[0] != esz || B->nb[0] != esz || mask->nb[0] != esz || gamma->nb[0] != esz ||
+        mul->nb[0] != esz || dst->nb[0] != esz) {
+        return false;
+    }
+
+    // broadcast compatibility (fastmod based addressing wraps otherwise)
+    for (int k = 1; k < GGML_MAX_DIMS; ++k) {
+        if (A->ne[k] != 1 && A->ne[k] != mul->ne[k]) return false;
+        if (B->ne[k] != 1 && B->ne[k] != mul->ne[k]) return false;
+        if (mask->ne[k] != 1 && mask->ne[k] != mul->ne[k]) return false;
+        if (gamma->ne[k] != 1 && gamma->ne[k] != mul->ne[k]) return false;
+    }
+    if (mask->ne[0] != 1 && mask->ne[0] != mul->ne[0]) return false;
+    if (gamma->ne[0] != 1 && gamma->ne[0] != mul->ne[0]) return false;
+
+    // the shader has no per-tensor misalignment encoding
+    if (get_misalign_bytes(ctx, A) || get_misalign_bytes(ctx, B) || get_misalign_bytes(ctx, mask) ||
+        get_misalign_bytes(ctx, gamma) || get_misalign_bytes(ctx, mul) || get_misalign_bytes(ctx, dst)) {
+        return false;
+    }
+
+    // add_rms_partials is a different two-stage reduction
+    if (ctx->do_add_rms_partials) {
+        return false;
+    }
+
+    // pipeline existence (push-constant size gate at creation time)
+    if (ctx->device->pipeline_rms_norm_add_dual_mul_f32 == nullptr) {
+        return false;
+    }
+
+    return true;
+}
+
 static bool ggml_vk_can_fuse_rms_norm_mul_mul(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     const ggml_tensor *rms  = cgraph->nodes[node_idx + 0];
@@ -18194,10 +18410,34 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
+        ctx->fused_m4 = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
-            uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-            if (num_adds) {
+            // M4 (epilogue-fallback-exec.md §12.15): 7-span
+            //   ADD, MUL, [RESHAPE view], [RESHAPE view], RMS_NORM, MUL, MUL
+            // The two views are unrelated side branches that only occupy cgraph
+            // slots; they are listed as fusion outputs because their uses are
+            // not confined to the span (census12: 100% MUL_MAT consumers), and
+            // they are views, so nothing writes them. t2 (= the MUL output) is
+            // consumed outside the span, hence the extra write-mask bit.
+            static const char * m4_env = getenv("KATAGO_VK_M4_FUSION");
+            const bool m4_enabled = (m4_env == nullptr) || (m4_env[0] != '0');
+            if (m4_enabled &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL },
+                                       { i + 1, i + 2, i + 3, i + 6 }) &&
+                ggml_vk_can_fuse_m4(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 6;
+                fusion_string = "ADD_MUL_RMS_NORM_MUL_MUL";
+                ctx->fused_m4 = true;
+                ctx->fused_ops_write_mask |= 1 << 1;
+                op_srcs_fused_elementwise[0] = true;   // ADD
+                op_srcs_fused_elementwise[1] = true;   // MUL
+                op_srcs_fused_elementwise[2] = false;  // RESHAPE view (conservative)
+                op_srcs_fused_elementwise[3] = false;  // RESHAPE view (conservative)
+                op_srcs_fused_elementwise[4] = true;   // RMS_NORM (one workgroup per row)
+                op_srcs_fused_elementwise[5] = true;   // MUL(gamma)
+                op_srcs_fused_elementwise[6] = true;   // MUL(mask)
+            } else if (uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
@@ -18438,6 +18678,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
+                ctx->fused_m4 = false;
             }
         }
 
