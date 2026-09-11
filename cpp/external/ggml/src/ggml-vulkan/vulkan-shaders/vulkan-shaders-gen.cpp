@@ -810,6 +810,12 @@ void process_shaders() {
     string_to_spv("rms_norm_mul_rope_f32_f16", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
     string_to_spv("rms_norm_dual_mul_f32", "rms_norm_dual_mul.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_add_dual_mul_f32", "rms_norm_add_dual_mul.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+    // N51 (2026-09-11): the same two shaders built with BLOCK_SIZE 128 + a subgroup
+    // reduction + a register relay. Selected at pipeline creation ONLY for the
+    // validated device class (NVIDIA, 32-lane subgroups); every other device keeps
+    // the 512-tree versions above. See precision-class-gate.md 9 / rms-bw-prior.md.
+    string_to_spv("rms_norm_dual_mul_sg128_f32", "rms_norm_dual_mul_sg128.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("rms_norm_add_dual_mul_sg128_f32", "rms_norm_add_dual_mul_sg128.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rope_fused_f32", "rope_fused.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

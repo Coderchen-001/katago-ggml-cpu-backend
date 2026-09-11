@@ -5838,11 +5838,37 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_rope_f32_f32, "rms_norm_mul_rope_f32_f32", rms_norm_mul_rope_f32_f32_len, rms_norm_mul_rope_f32_f32_data, "main", 7, sizeof(vk_op_rms_norm_mul_rope_push_constants), {1, 1, 1}, {0, 1}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_rope_f32_f16, "rms_norm_mul_rope_f32_f16", rms_norm_mul_rope_f32_f16_len, rms_norm_mul_rope_f32_f16_data, "main", 7, sizeof(vk_op_rms_norm_mul_rope_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     }
+    // KataGo vendored change (N51, next-temp.md / precision-class-gate.md 9):
+    // two compiled variants of the two vendored RMS shaders. The sg128 variant
+    // (BLOCK_SIZE 128 + subgroup reduction + register relay) is used ONLY for the
+    // validated device class -- NVIDIA with 32-lane subgroups -- where it measured
+    // +5.44/+4.21/+1.98% end-to-end on the 1660 (legs < 0.15%, margins improve) and
+    // +1.8% on the 5080. AMD b11 fails its margin with it (1.04 > 1.0) and Intel
+    // produced garbage (policyKLDiv 2690x/4040x) with a -27% regression, so both
+    // keep the original 512-tree shaders byte-for-byte (two separate SPIR-V
+    // artifacts on purpose: a "128 threads with subgroups disabled" build would be a
+    // third, unvalidated precision class).
+    // KATAGO_VK_RMS_SUBGROUP=0 forces the legacy variant -- a fine-grained rollback
+    // (KATAGO_VK_M4_FUSION is too coarse: it also changes the kernel form).
+    const char* katago_rms_sg_env = getenv("KATAGO_VK_RMS_SUBGROUP");
+    const bool katago_rms_sg128 =
+        device->vendor_id == VK_VENDOR_ID_NVIDIA && device->subgroup_size == 32 &&
+        !(katago_rms_sg_env != nullptr && katago_rms_sg_env[0] == '0');
+    std::cerr << "ggml_vulkan: RMS shader variant: " << (katago_rms_sg128 ? "sg128 (N51)" : "legacy 512-tree")
+              << (katago_rms_sg_env != nullptr ? " [KATAGO_VK_RMS_SUBGROUP set]" : "") << "\n";
     if (sizeof(vk_op_rms_norm_mul_mul_push_constants) <= device->properties.limits.maxPushConstantsSize) {
-        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_mul_f32, "rms_norm_mul_mul_f32", rms_norm_dual_mul_f32_len, rms_norm_dual_mul_f32_data, "main", 4, sizeof(vk_op_rms_norm_mul_mul_push_constants), {1, 1, 1}, {}, 1, true);
+        if (katago_rms_sg128) {
+            ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_mul_f32, "rms_norm_mul_mul_f32", rms_norm_dual_mul_sg128_f32_len, rms_norm_dual_mul_sg128_f32_data, "main", 4, sizeof(vk_op_rms_norm_mul_mul_push_constants), {1, 1, 1}, {}, 1, true);
+        } else {
+            ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_mul_f32, "rms_norm_mul_mul_f32", rms_norm_dual_mul_f32_len, rms_norm_dual_mul_f32_data, "main", 4, sizeof(vk_op_rms_norm_mul_mul_push_constants), {1, 1, 1}, {}, 1, true);
+        }
     }
     if (sizeof(vk_op_rms_norm_add_dual_mul_push_constants) <= device->properties.limits.maxPushConstantsSize) {
-        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_add_dual_mul_f32, "rms_norm_add_dual_mul_f32", rms_norm_add_dual_mul_f32_len, rms_norm_add_dual_mul_f32_data, "main", 6, sizeof(vk_op_rms_norm_add_dual_mul_push_constants), {1, 1, 1}, {}, 1, true);
+        if (katago_rms_sg128) {
+            ggml_vk_create_pipeline(device, device->pipeline_rms_norm_add_dual_mul_f32, "rms_norm_add_dual_mul_f32", rms_norm_add_dual_mul_sg128_f32_len, rms_norm_add_dual_mul_sg128_f32_data, "main", 6, sizeof(vk_op_rms_norm_add_dual_mul_push_constants), {1, 1, 1}, {}, 1, true);
+        } else {
+            ggml_vk_create_pipeline(device, device->pipeline_rms_norm_add_dual_mul_f32, "rms_norm_add_dual_mul_f32", rms_norm_add_dual_mul_f32_len, rms_norm_add_dual_mul_f32_data, "main", 6, sizeof(vk_op_rms_norm_add_dual_mul_push_constants), {1, 1, 1}, {}, 1, true);
+        }
     }
     if (sizeof(vk_op_rope_fused_push_constants) <= device->properties.limits.maxPushConstantsSize) {
         ggml_vk_create_pipeline(device, device->pipeline_rope_fused_f32, "rope_fused_f32", rope_fused_f32_len, rope_fused_f32_data, "main", 5, sizeof(vk_op_rope_fused_push_constants), {1, 1, 1}, {}, 1, true);

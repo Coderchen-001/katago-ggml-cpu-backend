@@ -1,0 +1,147 @@
+#version 450
+
+#include "utils.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+// N51 (rms-bw-prior.md, 2026-09-10): 512 -> 128 threads, see rms_norm_dual_mul.comp
+// for the rationale (25-62.5% idle lanes at 512 threads + only 2 workgroups/SM).
+// MAX_ITERS sizes the register relay below: with 128 threads the row needs
+// num_iters = ceil(ne0/128) = 2 (ne0 192/256) or 3 (ne0 384) iterations, and
+// rows wider than MAX_ITERS*BLOCK_SIZE fall back to re-reading t2 from memory.
+#define BLOCK_SIZE 128
+#define MAX_ITERS 4
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+// M4 (epilogue fallback, epilogue-fallback-exec.md §12.15): one dispatch for
+//   t  = A + B                          (prologue ADD, elided)
+//   t2 = t * mask                       (prologue MUL, MUST be materialized:
+//                                        t2 has consumers outside the fusion)
+//   y  = t2 * rsqrt(mean(t2^2)+eps) * gamma * mask
+// census12/census13 operand shapes (100% of 30/50/55 chains):
+//   A, B      = [C/2, S, N, 1]   full shape
+//   mask      = [1, S, N, 1]     per-position, used BEFORE and AFTER the norm
+//                                (the same tensor, checked by the matcher)
+//   gamma     = [C/2, 1, 1, 1]   per-channel RMS scale
+//
+// Register relay: each thread keeps its own column of t2 in xval[] across the
+// reduction, so the second pass does not re-read t2 as long as the row needs at
+// most MAX_ITERS iterations (always true for KataGo: ne0 in {192,256,384} =>
+// num_iters in {2,2,3}). Rows wider than MAX_ITERS*BLOCK_SIZE re-read t2 from
+// memory (bit-identical values).
+//
+// All strides are element units. Dim0 of every operand is indexed with a unit
+// element stride (the matcher enforces nb[0] == sizeof(float)).
+layout (push_constant) uniform parameter {
+    uint ne0;                                                          // reduction length (t2->ne[0])
+    uint t2_nb1; uint t2_nb2; uint t2_nb3;
+    uint a_nb1;  uint a_nb2;  uint a_nb3;  uint a_ne1;  uint a_ne2;  uint a_ne3;
+    uint b_nb1;  uint b_nb2;  uint b_nb3;  uint b_ne1;  uint b_ne2;  uint b_ne3;
+    uint g_nb1;  uint g_nb2;  uint g_nb3;  uint g_ne0;  uint g_ne1;  uint g_ne2;  uint g_ne3;
+    uint mk_nb1; uint mk_nb2; uint mk_nb3; uint mk_ne0; uint mk_ne1; uint mk_ne2; uint mk_ne3;
+    uint y_nb1;  uint y_nb2;  uint y_nb3;
+    float eps;
+} p;
+
+layout (binding = 0) readonly  buffer A {float data_a[];};   // ADD src0
+layout (binding = 1) readonly  buffer B {float data_b[];};   // ADD src1
+layout (binding = 2) readonly  buffer C {float data_c[];};   // mask (per-position, both passes)
+layout (binding = 3) readonly  buffer D {float data_d[];};   // gamma (per-channel)
+layout (binding = 4)           buffer E {float data_e[];};   // t2 (written; re-read only when num_iters > 1)
+layout (binding = 5) writeonly buffer F {float data_f[];};   // y (dst)
+
+shared float sumsh[BLOCK_SIZE];
+
+void rms_norm_add_dual_mul(uint num_iters) {
+    const uint ncols   = p.ne0;
+    const uint row     = gl_WorkGroupID.x;
+    const uint channel = gl_WorkGroupID.y;
+    const uint samp    = gl_WorkGroupID.z;
+    const uint tid     = gl_LocalInvocationID.x;
+
+    const uint a_off  = fastmod(row, p.a_ne1) *p.a_nb1  + fastmod(channel, p.a_ne2) *p.a_nb2  + fastmod(samp, p.a_ne3) *p.a_nb3;
+    const uint b_off  = fastmod(row, p.b_ne1) *p.b_nb1  + fastmod(channel, p.b_ne2) *p.b_nb2  + fastmod(samp, p.b_ne3) *p.b_nb3;
+    const uint g_off  = fastmod(row, p.g_ne1) *p.g_nb1  + fastmod(channel, p.g_ne2) *p.g_nb2  + fastmod(samp, p.g_ne3) *p.g_nb3;
+    const uint mk_off = fastmod(row, p.mk_ne1)*p.mk_nb1 + fastmod(channel, p.mk_ne2)*p.mk_nb2 + fastmod(samp, p.mk_ne3)*p.mk_nb3;
+    const uint t2_off = row*p.t2_nb1 + channel*p.t2_nb2 + samp*p.t2_nb3;
+    const uint y_off  = row*p.y_nb1  + channel*p.y_nb2  + samp*p.y_nb3;
+
+    float sum  = 0.0f;
+    float xval[MAX_ITERS];   // t2 of this thread's columns (register relay)
+
+    [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+        if (col < ncols) {
+            float t  = data_a[a_off + col] + data_b[b_off + col];
+            float t2 = t * data_c[mk_off + fastmod(col, p.mk_ne0)];
+            data_e[t2_off + col] = t2;
+            sum += t2 * t2;
+            xval[idx] = t2;
+        }
+    }
+
+    // N51: reduce inside each subgroup first, then across the few subgroups
+    // through shared memory (same shape as add.comp's ADD_RMS path). The
+    // arithmetic order changes vs the old full-width tree => NOT bit-equal.
+    const uint num_subgroups = BLOCK_SIZE / gl_SubgroupSize;
+    sum = subgroupAdd(sum);
+    if (gl_SubgroupInvocationID == 0) {
+        sumsh[gl_SubgroupID] = sum;
+    }
+    barrier();
+    [[unroll]] for (uint s = num_subgroups / 2; s > 0; s >>= 1) {
+        if (gl_SubgroupID < s && gl_SubgroupInvocationID == 0) {
+            sum += sumsh[gl_SubgroupID + s];
+            sumsh[gl_SubgroupID] = sum;
+        }
+        barrier();
+    }
+    sum = sumsh[0];
+
+    const float mean  = sum / float(ncols);
+    const float scale = inversesqrt(mean + p.eps);
+
+    // the reduction above only ordered workgroup-local writes; the re-read path
+    // (rows wider than MAX_ITERS * BLOCK_SIZE) needs them visible to the
+    // workgroup. The register-relay path does not read t2 back at all.
+    if (num_iters > MAX_ITERS) {
+        memoryBarrierBuffer();
+        barrier();
+    }
+
+    [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+        if (col >= ncols) {
+            continue;
+        }
+        float t2    = (num_iters <= MAX_ITERS) ? xval[idx] : data_e[t2_off + col];
+        float gamma = data_d[g_off + fastmod(col, p.g_ne0)];
+        float mask  = data_c[mk_off + fastmod(col, p.mk_ne0)];
+        data_f[y_off + col] = scale * t2 * gamma * mask;
+    }
+}
+
+void main() {
+    uint num_blocks = (p.ne0 + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if (num_blocks > 32) {
+        rms_norm_add_dual_mul(num_blocks);
+    } else if (num_blocks > 16) {
+        rms_norm_add_dual_mul(32);
+    } else if (num_blocks > 12) {
+        rms_norm_add_dual_mul(16);
+    } else if (num_blocks > 10) {
+        rms_norm_add_dual_mul(12);
+    } else if (num_blocks > 8) {
+        rms_norm_add_dual_mul(10);
+    } else if (num_blocks > 4) {
+        rms_norm_add_dual_mul(8);
+    } else if (num_blocks == 4) {
+        rms_norm_add_dual_mul(4);
+    } else if (num_blocks == 3) {
+        rms_norm_add_dual_mul(3);
+    } else if (num_blocks == 2) {
+        rms_norm_add_dual_mul(2);
+    } else if (num_blocks == 1) {
+        rms_norm_add_dual_mul(1);
+    }
+}
