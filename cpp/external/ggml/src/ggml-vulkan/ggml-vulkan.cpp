@@ -4872,6 +4872,39 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
     if (device->coopmat2) {
         auto const &ggml_vk_mul_mm_cm2_spec = [](std::vector<uint32_t> spec, bool aligned, bool mul_mat_id) {
+            // KataGo probe (test-only, 2026-09-11, tuner-exec.md 7 A3 / biteq-source-map.md):
+            // cm2 matmul tile overrides, to answer "which cm2 sweep axes are bit-equal?"
+            // with one error-row comparison per axis. The cm2 spec is
+            // {BLOCK_SIZE, BM, BN, BK, enable_smaller_matrices} (mul_mm_cm2.comp:31-36),
+            // so only spec[3] (BK) resp. spec[1] (BM) is touched => single variable.
+            // Every l/m/s x f16acc/f32acc variant goes through this lambda, so all
+            // buckets are covered. Unset env => the default path is untouched.
+            static const char* cm2_bk_env = getenv("KATAGO_VK_CM2_BK");
+            static const char* cm2_bm_env = getenv("KATAGO_VK_CM2_BM");
+            static bool cm2_bk_logged = false;
+            static bool cm2_bm_logged = false;
+            if (spec.size() >= 5) {
+                if (cm2_bk_env != nullptr) {
+                    const uint32_t v = (uint32_t) atoi(cm2_bk_env);
+                    if (v > 0) {
+                        if (!cm2_bk_logged) {
+                            std::cerr << "ggml_vulkan: KATAGO_VK_CM2_BK=" << v << " (default spec BK was " << spec[3] << ")\n";
+                            cm2_bk_logged = true;
+                        }
+                        spec[3] = v;
+                    }
+                }
+                if (cm2_bm_env != nullptr) {
+                    const uint32_t v = (uint32_t) atoi(cm2_bm_env);
+                    if (v > 0) {
+                        if (!cm2_bm_logged) {
+                            std::cerr << "ggml_vulkan: KATAGO_VK_CM2_BM=" << v << " (default spec BM was " << spec[1] << ")\n";
+                            cm2_bm_logged = true;
+                        }
+                        spec[1] = v;
+                    }
+                }
+            }
             if (mul_mat_id && spec.size() > 5) {
                 spec.insert(spec.begin() + 5, aligned ? 1u : 0u);
             } else {
