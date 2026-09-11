@@ -17,18 +17,30 @@
 // contiguous and of the same shape, src dim0 is contiguous (nb00 == sizeof(float)),
 // and dims 2/3 are 1. Anything else keeps the generic path (see
 // ggml_vk_get_cpy_pipeline). KATAGO_VK_CPY_2D=0 disables it (rollback).
-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+// V2 (2026-09-11, after the 1660 measurement): the first version (1 element per
+// thread, cheap index math) was BIT-EXACT but gave no speedup -- CONT stayed at
+// 145.9 -> 146.5 us per dispatch -- so the index arithmetic is NOT the bottleneck.
+// The contiguous sibling shader contig_copy.comp shows what is: it is not vectorized
+// either, it just keeps FOUR elements in flight per thread (num_threads=128 x
+// num_iter=4 == the 512-element chunk that get_idx()'s arithmetic assumes). This
+// version mirrors that structure and computes the (row, col) pair per element.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
-    const uint idx = get_idx();
+    uint idx = get_idx();
 
-    if (idx >= p.ne) {
-        return;
+    const uint num_threads = 128;
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        if (idx >= p.ne) {
+            continue;
+        }
+
+        // i01 = idx / ne00, i00 = idx % ne00 (ne02 == ne03 == 1)
+        const uint i01 = fastdiv(idx, p.ne0_0mp, fastdiv_L(p.ne0_Ls, 2));
+        const uint i00 = idx - i01 * p.ne00;
+
+        data_d[get_doffset() + idx] = D_TYPE(data_a[get_aoffset() + i01 * p.nb01 + i00 * p.nb00]);
+
+        idx += num_threads;
     }
-
-    // i01 = idx / ne00, i00 = idx % ne00 (ne02 == ne03 == 1)
-    const uint i01 = fastdiv(idx, p.ne0_0mp, fastdiv_L(p.ne0_Ls, 2));
-    const uint i00 = idx - i01 * p.ne00;
-
-    data_d[get_doffset() + idx] = D_TYPE(data_a[get_aoffset() + i01 * p.nb01 + i00 * p.nb00]);
 }
