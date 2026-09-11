@@ -3874,76 +3874,139 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     }
     result.row_split = (n_rows < 4 || hsk <= row_split_max_hsk) ? 1 : 4;
 
-    if (result.subgroup_size > 32 && (n_rows < 4 || hsk < (result.row_split == 1 ? 128 : 64))) {
-        result.workgroup_size = result.subgroup_size * 2;
-    } else {
-        result.workgroup_size = result.subgroup_size * 4;
+    // ---- KATAGO_VK_FA_TILE (hw-tuner B3/N54 probe, test-only) ----------------
+    // Spec = "Br,Bc,Dsplit[,row_split[,shmem_staging[,workgroup_size]]]".
+    // The 3-field form is the original B3 rollback channel (commit 181dab3c) and
+    // MUST keep working: omitted fields keep the heuristic value. N54 (2026-09-10)
+    // added row_split/staging/wg because row_split is about to become a tunable
+    // default -- a 3-field spec alone would silently inherit the new row_split and
+    // stop being a rollback (next-temp.md §0.6 B1).
+    //
+    // The candidate is validated BEFORE it is applied, and an invalid spec falls
+    // back to the heuristic (with an error) instead of being passed through: the
+    // shader's index math uses integer division, so an illegal combination yields
+    // silently wrong results, and unattended sweeps would record them as data.
+    // Constraints, derived from flash_attn.comp:28-34,91-95:
+    //   HSK/HSV_per_thread = HSK(D_split)        -> D_split | hsk, hsv
+    //   rows_per_thread    = Br / row_split      -> row_split | Br
+    //   cols_per_iter      = WG / D_split / rs   -> D_split | WG, rs | (WG/D_split)
+    //   cols_per_thread    = Bc / cols_per_iter  -> cols_per_iter | Bc
+    //   row_tid,col_tid    = idx / (WG/rs), % D_split (the latter is implied by
+    //                        D_split | WG and rs | (WG/D_split))
+    // A probe spec is additionally rejected when the tile does not fit the scalar
+    // FA shared memory (the stock path skips that check for reduce_block_rows).
+    const char* fa_tile_env = getenv("KATAGO_VK_FA_TILE");
+    unsigned fa_tile_br = 0, fa_tile_bc = 0, fa_tile_ds = 0, fa_tile_rs = 0, fa_tile_stg = 0, fa_tile_wg = 0;
+    int fa_tile_n = 0;
+    bool fa_tile_applied = false;
+    if (fa_tile_env != nullptr) {
+        fa_tile_n = sscanf(fa_tile_env, "%u,%u,%u,%u,%u,%u", &fa_tile_br, &fa_tile_bc, &fa_tile_ds,
+                           &fa_tile_rs, &fa_tile_stg, &fa_tile_wg);
+        const uint32_t rs  = fa_tile_n >= 4 ? fa_tile_rs  : result.row_split;
+        // NOTE: the heuristic shmem_staging is assigned later (and skipped when the
+        // probe applies), so reproduce its formula here instead of reading result.
+        const uint32_t heuristic_stg = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
+        const uint32_t stg = fa_tile_n >= 5 ? fa_tile_stg : heuristic_stg;
+        uint32_t wg;
+        if (fa_tile_n >= 6 && fa_tile_wg >= 1) {
+            wg = fa_tile_wg;
+        } else if (result.subgroup_size > 32 && (n_rows < 4 || hsk < (rs == 1 ? 128 : 64))) {
+            wg = result.subgroup_size * 2;
+        } else {
+            wg = result.subgroup_size * 4;
+        }
+
+        // row_split is only valid as 1 or as "one rowgroup == one subgroup": the
+        // cross-subgroup reduction in flash_attn.comp is gated on `row_split == 1`
+        // (lines 552/591/629) and the `else` paths assume every rowgroup fits in a
+        // single subgroup. With row_split == 2 and WG == 4 * subgroup_size the
+        // second subgroup's partial sums are silently dropped -- measured on the
+        // scalar path (b10c384, 5080, coopmat disabled): policyKLDiv max error
+        // 2.7e3x the limit, i.e. garbage, while the divisibility checks below all
+        // pass. SubGroups == 0 (Intel / disable_subgroups) uses the shmem tree and
+        // accepts any row_split.
+        const uint32_t eff_subgroup_size = (result.disable_subgroups || result.subgroup_size == 0) ? 0 : result.subgroup_size;
+        const bool rs_ok = eff_subgroup_size == 0 || rs == 1 || (rs == wg / eff_subgroup_size);
+
+        const bool spec_ok = fa_tile_n >= 3 && fa_tile_br >= 1 && fa_tile_bc >= 1 && fa_tile_ds >= 1 &&
+                             rs >= 1 && stg <= 1 && rs_ok &&
+                             (hsk % fa_tile_ds) == 0 && (hsv % fa_tile_ds) == 0 &&
+                             (wg % fa_tile_ds) == 0 && ((wg / fa_tile_ds) % rs) == 0 &&
+                             (fa_tile_br % rs) == 0 && (fa_tile_bc % (wg / fa_tile_ds / rs)) == 0;
+        if (spec_ok) {
+            vk_fa_tuning_params probe = result;
+            probe.row_split      = rs;
+            probe.workgroup_size = wg;
+            probe.shmem_staging  = stg;
+            probe.block_rows     = fa_tile_br;
+            probe.block_cols     = fa_tile_bc;
+            probe.d_split        = fa_tile_ds;
+            if (ggml_vk_flash_attn_scalar_shmem_support(device, probe, hsk, hsv, f32acc, k_type, v_type)) {
+                result = probe;
+                fa_tile_applied = true;
+                std::cerr << "ggml_vulkan: KATAGO_VK_FA_TILE=" << fa_tile_env << " applied (Br=" << result.block_rows
+                          << " Bc=" << result.block_cols << " Dsplit=" << result.d_split
+                          << " row_split=" << result.row_split << " staging=" << result.shmem_staging
+                          << " WG=" << result.workgroup_size << ")\n";
+            } else {
+                std::cerr << "ggml_vulkan: KATAGO_VK_FA_TILE=" << fa_tile_env
+                          << " rejected (tile exceeds scalar FA shared memory); using heuristic\n";
+            }
+        } else {
+            std::cerr << "ggml_vulkan: KATAGO_VK_FA_TILE=" << fa_tile_env
+                      << " rejected (need >=3 fields, staging<=1, Dsplit|HSK,HSV,WG; row_split|(WG/Dsplit);"
+                         " row_split|Br; (WG/Dsplit/row_split)|Bc; row_split in {1, WG/subgroup_size});"
+                         " using heuristic\n";
+        }
+    }
+    // -------------------------------------------------------------------------
+
+    if (!fa_tile_applied) {
+        if (result.subgroup_size > 32 && (n_rows < 4 || hsk < (result.row_split == 1 ? 128 : 64))) {
+            result.workgroup_size = result.subgroup_size * 2;
+        } else {
+            result.workgroup_size = result.subgroup_size * 4;
+        }
     }
 
     const uint32_t D = hsk | hsv;
 
     const bool reduce_block_rows = D & 8 || n_kv < 1024 || device->vendor_id == VK_VENDOR_ID_INTEL;
 
-    if (n_rows == 1) {
-        result.block_rows = 1;
-        result.block_cols = 64;
-    } else {
-        // row_split 1 means higher register use per row, so block size has to be adjusted
-        if (result.row_split == 1) {
-            // KataGo vendored change (next-temp.md B3, 2026-09-05): drop the
-            // `|| reduce_block_rows` clamp (Br=4 for n_kv<1024). That heuristic
-            // targets LLM short-KV prefill occupancy; for KataGo scalar FA
-            // (n_rows=n_kv=S in {81,169,361}, hsk=hsv=32) it pinned Br to 4 and
-            // forced K/V reread Tr=ceil(S/4). Measured (1660, b10c384, A-B-B-A,
-            // legs <0.4%): Br8 = +5.4% vs Br4, margin unchanged (0.152x/0.12x
-            // identical for Br4/Br8/Br16), register bound = accumulators Br x 2
-            // (cap ~32 => Br<=16; Br32 -24%, Br64 -70%). Rollback via env
-            // KATAGO_VK_FA_TILE=4,32,8 (probe commit 181dab3c).
-            result.block_rows = n_rows == 2 ? 2 : (n_rows <= 4 ? 4 : 8);
+    if (!fa_tile_applied) {
+        if (n_rows == 1) {
+            result.block_rows = 1;
+            result.block_cols = 64;
         } else {
-            result.block_rows = n_rows <= 4 ? 4 : ((n_rows <= 8 || reduce_block_rows) ? 8 : 16);
-        }
-
-        result.block_cols = (D & 8) ? 64 : 32;
-    }
-
-    const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
-
-    result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
-
-    result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
-
-    // KATAGO_VK_FA_TILE (hw-tuner B3 probe, test-only): override the scalar FA
-    // tile after the heuristic, before the shmem-support check below. Spec =
-    // "Br,Bc,Dsplit". Constraints (next-temp.md §2.6): Dsplit | workgroup_size,
-    // Bc % (workgroup_size/Dsplit) == 0, else silently wrong results are possible
-    // (cols_per_iter/cols_per_thread must divide). Rejected specs fall back to the
-    // heuristic with an ERROR so a bad probe spec cannot masquerade as a result.
-    {
-        const char* fa_tile_env = getenv("KATAGO_VK_FA_TILE");
-        if (fa_tile_env != nullptr) {
-            unsigned br = 0, bc = 0, ds = 0;
-            if (sscanf(fa_tile_env, "%u,%u,%u", &br, &bc, &ds) == 3) {
-                const uint32_t wg = result.workgroup_size;
-                if (br >= 1 && bc >= 1 && ds >= 1 && (wg % ds) == 0 && (bc % (wg / ds)) == 0) {
-                    result.block_rows = br;
-                    result.block_cols = bc;
-                    result.d_split = ds;
-                    std::cerr << "ggml_vulkan: KATAGO_VK_FA_TILE=" << fa_tile_env
-                              << " applied (Br=" << br << " Bc=" << bc << " Dsplit=" << ds
-                              << " WG=" << wg << " row_split=" << result.row_split << ")\n";
-                } else {
-                    std::cerr << "ggml_vulkan: KATAGO_VK_FA_TILE=" << fa_tile_env
-                              << " rejected (need Dsplit|WG and Bc%(WG/Dsplit)==0); using heuristic\n";
-                }
+            // row_split 1 means higher register use per row, so block size has to be adjusted
+            if (result.row_split == 1) {
+                // KataGo vendored change (next-temp.md B3, 2026-09-05): drop the
+                // `|| reduce_block_rows` clamp (Br=4 for n_kv<1024). That heuristic
+                // targets LLM short-KV prefill occupancy; for KataGo scalar FA
+                // (n_rows=n_kv=S in {81,169,361}, hsk=hsv=32) it pinned Br to 4 and
+                // forced K/V reread Tr=ceil(S/4). Measured (1660, b10c384, A-B-B-A,
+                // legs <0.4%): Br8 = +5.4% vs Br4, margin unchanged (0.152x/0.12x
+                // identical for Br4/Br8/Br16), register bound = accumulators Br x 2
+                // (cap ~32 => Br<=16; Br32 -24%, Br64 -70%). Rollback via env
+                // KATAGO_VK_FA_TILE=4,32,8 (probe commit 181dab3c).
+                result.block_rows = n_rows == 2 ? 2 : (n_rows <= 4 ? 4 : 8);
             } else {
-                std::cerr << "ggml_vulkan: KATAGO_VK_FA_TILE invalid spec '" << fa_tile_env
-                          << "' (need Br,Bc,Dsplit); using heuristic\n";
+                result.block_rows = n_rows <= 4 ? 4 : ((n_rows <= 8 || reduce_block_rows) ? 8 : 16);
             }
+
+            result.block_cols = (D & 8) ? 64 : 32;
         }
+
+        const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
+
+        result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
+
+        result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
     }
 
-    if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+    // The probe already ran the shared-memory check on the requested tile; do not
+    // silently halve its Br afterwards (that would invalidate the spec).
+    if (!fa_tile_applied && !reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
         result.block_rows /= 2;
     }
 
