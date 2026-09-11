@@ -967,6 +967,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_repeat_i32, pipeline_repeat_back_f32;
     vk_pipeline pipeline_repeat_i16;
     vk_pipeline pipeline_cpy_f32_f32, pipeline_cpy_f32_f16, pipeline_cpy_f16_f16, pipeline_cpy_f16_f32, pipeline_cpy_f32_bf16, pipeline_cpy_bf16_f32, pipeline_cpy_f32_i32, pipeline_cpy_i32_f32;
+    vk_pipeline pipeline_cpy_2d_f32_f32; // KataGo N52: strided-row copy into a contiguous dst
     vk_pipeline pipeline_contig_cpy_f32_f32, pipeline_contig_cpy_f32_f16, pipeline_contig_cpy_f16_f16, pipeline_contig_cpy_f16_f32, pipeline_contig_cpy_f32_bf16, pipeline_contig_cpy_bf16_f32, pipeline_contig_cpy_f32_i32, pipeline_contig_cpy_i32_f32;
     vk_pipeline pipeline_cpy_f32_quant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_quant_f32[GGML_TYPE_COUNT];
@@ -5911,6 +5912,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f32, "cpy_f32_f32", cpy_f32_f32_len, cpy_f32_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_2d_f32_f32, "cpy_2d_f32_f32", cpy_2d_f32_f32_len, cpy_2d_f32_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f16, "cpy_f32_f16", cpy_f32_f16_len, cpy_f32_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f16_f16, "cpy_f16_f16", cpy_f16_f16_len, cpy_f16_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f16_f32, "cpy_f16_f32", cpy_f16_f32_len, cpy_f16_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -9504,6 +9506,33 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         } else if (ggml_type_size(to) == 2) {
             return ctx->device->pipeline_cpy_transpose_02_16;
         }
+    }
+
+    // KataGo vendored fast path (N52, 2026-09-11): strided-row copy into a contiguous
+    // destination. Measured (census13, 1660 op table): this one family is 42.4% of all
+    // CONT bytes with a single uniform shape (ne=[256,2888,1,1], src nb[0]=1 element,
+    // nb[1]=768 elements) and it used to fall through to the fully generic copy.comp,
+    // which pays 4 fastdiv index computations per element on BOTH sides.
+    // Requirements are deliberately narrow so nothing else changes class:
+    //   * f32 -> f32 (the only dtype in this family),
+    //   * destination contiguous + same shape (true for ggml_vk_cpy_to_contiguous; when
+    //     dst == nullptr the caller guarantees a contiguous destination),
+    //   * source dim0 contiguous (nb[0] == sizeof(float)) and dims 2/3 == 1.
+    // The copy is bit-exact by construction (pure load/store), so the gate is u32
+    // bit-equality, not margin. Rollback: KATAGO_VK_CPY_2D=0.
+    static const char* katago_cpy_2d_env = getenv("KATAGO_VK_CPY_2D");
+    const bool katago_cpy_2d = !(katago_cpy_2d_env != nullptr && katago_cpy_2d_env[0] == '0');
+    if (katago_cpy_2d && src->type == GGML_TYPE_F32 && to == GGML_TYPE_F32 && !contig &&
+        src->ne[2] == 1 && src->ne[3] == 1 && src->nb[0] == (size_t) ggml_type_size(GGML_TYPE_F32) &&
+        (!dst || (ggml_is_contiguous(dst) && ggml_are_same_shape(dst, src)))) {
+        // log once per process, so an overnight op table proves the path was taken
+        static bool katago_cpy_2d_logged = false;
+        if (!katago_cpy_2d_logged) {
+            std::cerr << "ggml_vulkan: N52 strided-row copy path used (ne0=" << src->ne[0] << " ne1=" << src->ne[1]
+                      << " src_nb0=" << src->nb[0] << "B src_nb1=" << src->nb[1] << "B dst_contig=1)\n";
+            katago_cpy_2d_logged = true;
+        }
+        return ctx->device->pipeline_cpy_2d_f32_f32;
     }
 
     if (src->type == GGML_TYPE_F32 && to == GGML_TYPE_F32) {
