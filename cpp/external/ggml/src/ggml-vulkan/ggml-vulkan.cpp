@@ -3867,12 +3867,31 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         result.subgroup_size = device->subgroup_size;
     }
 
+    // KataGo vendored change (N54, 2026-09-11): the scalar FA tile
+    // Dsplit=4 + row_split=4 measured on the acceptance device (1660, three models,
+    // A-B-B-A legs < 0.7%): +3.55% / +4.19% / +3.61% end-to-end and every margin
+    // IMPROVED (0.503->0.355, 0.521->0.505, 0.960->0.885 of the limit).
+    // Only the validated class is changed: NVIDIA with 32-lane subgroups and
+    // hsk == hsv == 32. Every other case deliberately keeps the upstream heuristic:
+    //   * AMD (64-lane subgroups): row_split=4 is illegal there (a rowgroup must be
+    //     exactly one subgroup) and the legal row_split=2 gave +0.3% with margins
+    //     FAILING (1.07 / 1.38) -> rejected;
+    //   * Intel: never reaches this function (its FA uses coopmat1);
+    //   * any other shape (hsk/hsv != 32): unmeasured -> untouched.
+    // Rollback: KATAGO_VK_FA_TILE=8,32,8,1 (see b3-tile-default-exec.md). NOTE: the
+    // 3-field form is not a rollback any more -- its row_split is inherited from the
+    // heuristic, which is now 4.
+    // n_rows here is the sequence length S (N = neq1 in ggml_vk_flash_attn), not the
+    // batch, so the n_rows < 4 / == 4 branches never fire for Go boards.
+    const bool katago_fa_tile32 =
+        device->vendor_id == VK_VENDOR_ID_NVIDIA && result.subgroup_size == 32 && hsk == 32 && hsv == 32;
+
     // Row split splits the workgroup so that synchronization only has to happen within subgroups, which avoids barriers
     uint32_t row_split_max_hsk = 64;
     if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN && !device->uma) {
         row_split_max_hsk = n_rows <= 8 ? 64 : 128;
     }
-    result.row_split = (n_rows < 4 || hsk <= row_split_max_hsk) ? 1 : 4;
+    result.row_split = katago_fa_tile32 ? 4 : ((n_rows < 4 || hsk <= row_split_max_hsk) ? 1 : 4);
 
     // ---- KATAGO_VK_FA_TILE (hw-tuner B3/N54 probe, test-only) ----------------
     // Spec = "Br,Bc,Dsplit[,row_split[,shmem_staging[,workgroup_size]]]".
@@ -3999,7 +4018,9 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
         const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
 
-        result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
+        // N54: the validated class also uses a 4-way head-dim split (measured together
+        // with row_split=4; the pair is what keeps the margin better than upstream).
+        result.d_split = katago_fa_tile32 ? 4 : std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
 
         result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
     }
