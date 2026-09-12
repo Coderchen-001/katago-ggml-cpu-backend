@@ -878,22 +878,25 @@ struct OnnxToGgml {
     const size_t es = ggml_element_size(Y);
     const int64_t segNe[4] = {f.OC, S, N, 1};
     struct { const char* out; } segs[3] = {{f.qConvOut.c_str()}, {f.kConvOut.c_str()}, {f.vConvOut.c_str()}};
-    // N57 slice-1 probe (2026-09-11, DEFAULT OFF): hand the strided qkv window
-    // straight to the head-split view instead of materializing it here. The only
-    // consumer of these three tensors is the [0,H,D,S] head-split Reshape below,
-    // whose own result is consumed by either the RoPE cont(permute(...)) or the
-    // FA ggml_view_4d -- both accept arbitrary strides -- and which is turned
-    // into a stride-preserving view when its input is not contiguous. The copy
+    // N57 slice-1 (2026-09-12): hand the strided qkv window straight to the
+    // head-split view instead of materializing it here. The only consumer of
+    // these three tensors is the [0,H,D,S] head-split Reshape below, whose own
+    // result is consumed by either the RoPE cont(permute(...)) or the FA
+    // ggml_view_4d -- both accept arbitrary strides -- and which is turned into
+    // a stride-preserving view when its input is not contiguous. The copy
     // removed here is 42.4% of all CONT bytes (census13: 90 dispatches = 3 x 30
-    // sites). Rollback: unset KATAGO_VK_QKV_NOCONT (or =0).
+    // sites). Measured on the 1660 (A-B-B-A, bit-exact, margins identical):
+    // +2.84% / +3.45% / +2.49% end-to-end (c384/c512/b11) -- the strided read
+    // makes the 125 remaining copies ~38% slower, which eats ~45% of the copy
+    // that disappears. Rollback: KATAGO_VK_QKV_NOCONT=0.
     static const char* katago_qkv_nocont_env = getenv("KATAGO_VK_QKV_NOCONT");
     // Legality: the FA feed leans on vec4 row strides being 8*16B aligned when it
     // takes the "aligned" variant (flash_attn_cm2.comp:196-204 masks stride bits).
     // The strided window's row stride is Y->nb[1] = 3*OC*4 B, so require 128B
-    // alignment (== OC % 32 == 0 for these F32 CS tensors) and 16B element
-    // alignment; otherwise keep the copy -- loudly, never silently.
+    // alignment (== OC % 32 == 0 for these F32 CS tensors); otherwise keep the
+    // copy -- loudly, never silently.
     const bool qkvNoContLegal = (Y->nb[1] % 128) == 0;
-    const bool qkvNoContWanted = katago_qkv_nocont_env != nullptr && katago_qkv_nocont_env[0] == '1';
+    const bool qkvNoContWanted = !(katago_qkv_nocont_env != nullptr && katago_qkv_nocont_env[0] == '0');
     const bool qkvNoCont = qkvNoContWanted && qkvNoContLegal;
     static bool katago_qkv_nocont_logged = false;
     if(qkvNoContWanted && !qkvNoContLegal && !katago_qkv_nocont_logged) {
