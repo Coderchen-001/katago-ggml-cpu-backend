@@ -878,10 +878,50 @@ struct OnnxToGgml {
     const size_t es = ggml_element_size(Y);
     const int64_t segNe[4] = {f.OC, S, N, 1};
     struct { const char* out; } segs[3] = {{f.qConvOut.c_str()}, {f.kConvOut.c_str()}, {f.vConvOut.c_str()}};
+    // N57 slice-1 probe (2026-09-11, DEFAULT OFF): hand the strided qkv window
+    // straight to the head-split view instead of materializing it here. The only
+    // consumer of these three tensors is the [0,H,D,S] head-split Reshape below,
+    // whose own result is consumed by either the RoPE cont(permute(...)) or the
+    // FA ggml_view_4d -- both accept arbitrary strides -- and which is turned
+    // into a stride-preserving view when its input is not contiguous. The copy
+    // removed here is 42.4% of all CONT bytes (census13: 90 dispatches = 3 x 30
+    // sites). Rollback: unset KATAGO_VK_QKV_NOCONT (or =0).
+    static const char* katago_qkv_nocont_env = getenv("KATAGO_VK_QKV_NOCONT");
+    // Legality: the FA feed leans on vec4 row strides being 8*16B aligned when it
+    // takes the "aligned" variant (flash_attn_cm2.comp:196-204 masks stride bits).
+    // The strided window's row stride is Y->nb[1] = 3*OC*4 B, so require 128B
+    // alignment (== OC % 32 == 0 for these F32 CS tensors) and 16B element
+    // alignment; otherwise keep the copy -- loudly, never silently.
+    const bool qkvNoContLegal = (Y->nb[1] % 128) == 0;
+    const bool qkvNoContWanted = katago_qkv_nocont_env != nullptr && katago_qkv_nocont_env[0] == '1';
+    const bool qkvNoCont = qkvNoContWanted && qkvNoContLegal;
+    static bool katago_qkv_nocont_logged = false;
+    if(qkvNoContWanted && !qkvNoContLegal && !katago_qkv_nocont_logged) {
+      katago_qkv_nocont_logged = true;
+      fprintf(stderr, "N57|REJECTED|Y->nb[1]=%zu not 128B aligned (OC=%lld) -- falling back to the copy\n",
+              (size_t)Y->nb[1], (long long)f.OC);
+    }
     for(int seg = 0; seg < 3; seg++) {
-      ggml_tensor* view = ggml_view_2d(ctx, Y, f.OC, S * N, Y->nb[1], (size_t)seg * f.OC * es);
-      ggml_tensor* c = ggml_cont(ctx, view);                                 // [OC, S*N] contiguous
-      ggml_tensor* out = ggml_reshape_3d(ctx, c, f.OC, S, N);                // [OC,S,N] view
+      ggml_tensor* out;
+      if(qkvNoCont) {
+        // [OC,S,N] with the (s,n) pair still merged into Y's row stride: the
+        // fork's CS algebra is flat(c,s,n) = c + C*s + C*S*n (s fastest, n
+        // slowest; l2b3-rope-verify.py:56), so S has stride nb1 and N has
+        // stride nb1*S -- the same element order the contiguous reshape_3d
+        // produces. (Getting this backwards is still a pure permutation of the
+        // same span: silent wrong values, caught only by the bit-eq gate.)
+        out = ggml_view_3d(ctx, Y, f.OC, S, N, Y->nb[1], Y->nb[1] * (size_t)S, (size_t)seg * f.OC * es);
+        if(!katago_qkv_nocont_logged) {
+          katago_qkv_nocont_logged = true;
+          fprintf(stderr, "N57|qkv split copy removed|Y ne0=%lld ne1=%lld nb1=%zu nb0=%zu|OC=%lld S=%lld N=%lld|seg_off=%zu\n",
+                  (long long)Y->ne[0], (long long)Y->ne[1], (size_t)Y->nb[1], (size_t)Y->nb[0],
+                  (long long)f.OC, (long long)S, (long long)N, (size_t)f.OC * es);
+        }
+      } else {
+        ggml_tensor* view = ggml_view_2d(ctx, Y, f.OC, S * N, Y->nb[1], (size_t)seg * f.OC * es);
+        ggml_tensor* c = ggml_cont(ctx, view);                                 // [OC, S*N] contiguous
+        out = ggml_reshape_3d(ctx, c, f.OC, S, N);                             // [OC,S,N] view
+      }
       tensors[segs[seg].out] = out;
       annTensors[segs[seg].out] = {out, Layout::L_CS, GGML_TYPE_F32};
     }
@@ -1347,6 +1387,11 @@ struct OnnxToGgml {
       // copy. Zero-copy view with identical ne/nb semantics.
       return ggml_reshape_4d(ctx, x, 1, 1, C, N);
     }
+    // N57 safety net: a strided CS tensor (the qkv window handed downstream when
+    // KATAGO_VK_QKV_NOCONT=1) cannot go through the reshape below -- ggml_reshape_4d
+    // asserts contiguity (ggml.c:3705). Materialize exactly like the pre-N57 path
+    // would have; for every contiguous input this guard is a no-op.
+    if(!ggml_is_contiguous(x)) { x = ggml_cont(ctx, x); }
     ggml_tensor* r4 = ggml_reshape_4d(ctx, x, C, W, H, N);
     ggml_tensor* p = ggml_permute(ctx, r4, 2, 0, 1, 3);
     return ggml_cont(ctx, p);
@@ -2263,7 +2308,15 @@ struct OnnxToGgml {
                          target[3] == ann.t->ne[1];
         if(headSplit) {
           const int64_t D = target[2], H = target[1], S = target[3], N = ann.t->ne[2];
-          ggml_tensor* v = ggml_reshape_4d(ctx, ann.t, D, H, S, N);
+          // N57 slice-1: a non-contiguous L_CS source (the strided qkv window)
+          // cannot go through ggml_reshape_4d (GGML_ASSERT(ggml_is_contiguous),
+          // ggml.c:3705); express the same head-major c = h*D+d split as a
+          // stride-preserving 4D view instead (identical tensor for a
+          // contiguous source, so that path keeps using RESHAPE).
+          ggml_tensor* v = ggml_is_contiguous(ann.t)
+                             ? ggml_reshape_4d(ctx, ann.t, D, H, S, N)
+                             : ggml_view_4d(ctx, ann.t, D, H, S, N,
+                                            ann.t->nb[0] * (size_t)D, ann.t->nb[1], ann.t->nb[2], 0);
           registerOut(v, Layout::L_MAT, GGML_TYPE_F32);
         }
         else if(ann.layout == Layout::L_MAT && target.size() >= 4 && target[0] == 0 &&
