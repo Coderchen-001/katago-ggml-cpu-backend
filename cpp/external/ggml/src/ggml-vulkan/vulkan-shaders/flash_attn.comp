@@ -530,7 +530,19 @@ void main() {
                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
                 }
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+#ifdef FA_PRECISE
+                    // M1' probe (test-only, 2026-09-12): mark the f16 product precise so
+                    // glslang emits OpDecorate NoContraction and the driver cannot
+                    // contract P*V into a single-rounding f16 FMA (same mechanism as
+                    // rope_fused.comp:49-58). This is the only f16 mul+add in the
+                    // scalar FA path -- the QK dot product is already an explicit f32
+                    // fma() chain (dot_product_funcs.glsl:18-24), so it is not affected
+                    // by contraction freedom.
+                    precise FLOAT_TYPEV4 pv = FLOAT_TYPEV4(Pf[r] * Vf);
+                    Of[r][d] += pv;
+#else
                     Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
+#endif
                 }
             }
         }

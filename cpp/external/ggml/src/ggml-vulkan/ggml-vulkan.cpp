@@ -4728,6 +4728,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // FA scalar has two SPIR-V modules (MMQ vs non-MMQ); FA cm1 has one. K/V
     // quant type is selected at runtime via the FaTypeK / FaTypeV spec constants.
 
+    // M1' probe (test-only, 2026-09-12): KATAGO_VK_FA_PRECISE selects the f16 P*V
+    // no-contraction variant of the scalar FA shader:
+    //   unset/0 -> stock (the driver may contract the f16 product into an FMA)
+    //   1       -> +precise (glslang emits NoContraction on the P*V multiply)
+    //   noopt   -> +precise and the shader is built WITHOUT spirv-opt
+    // Only the fp16 && f32acc && !dot2 scalar combination is wired (KataGo's case; the
+    // QK dot product is an explicit f32 fma() chain and is not affected). Rollback: unset.
+    static const char * katago_fa_precise_env = getenv("KATAGO_VK_FA_PRECISE");
+    static const int katago_fa_precise = (katago_fa_precise_env == nullptr) ? 0
+        : (strcmp(katago_fa_precise_env, "noopt") == 0 ? 2 : (katago_fa_precise_env[0] == '0' ? 0 : 1));
+    static bool katago_fa_precise_logged = false;
+
     for (auto &fa : device->pipeline_flash_attn_f32_f16) {
         if (fa.first.path != FA_SCALAR) continue;
         const uint32_t Br = fa.first.Br;
@@ -4762,15 +4774,38 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 if (device->dot2_f16) {
                     if (f32acc) { spv_data = flash_attn_f32_f16_dot2_data;        spv_size = flash_attn_f32_f16_dot2_len; }
                     else        { spv_data = flash_attn_f32_f16_dot2_f16acc_data; spv_size = flash_attn_f32_f16_dot2_f16acc_len; }
+                } else if (f32acc && katago_fa_precise == 2) {
+                    spv_data = flash_attn_f32_f16_prc_noopt_data;
+                    spv_size = flash_attn_f32_f16_prc_noopt_len;
+                    if (!katago_fa_precise_logged) {
+                        katago_fa_precise_logged = true;
+                        fprintf(stderr, "M1P|FA precise variant wired|mode=precise+noopt|spv=%zu\n", spv_size);
+                    }
+                } else if (f32acc && katago_fa_precise == 1) {
+                    spv_data = flash_attn_f32_f16_prc_data;
+                    spv_size = flash_attn_f32_f16_prc_len;
+                    if (!katago_fa_precise_logged) {
+                        katago_fa_precise_logged = true;
+                        fprintf(stderr, "M1P|FA precise variant wired|mode=precise|spv=%zu\n", spv_size);
+                    }
+                } else if (f32acc) {
+                    spv_data = flash_attn_f32_f16_data;
+                    spv_size = flash_attn_f32_f16_len;
                 } else {
-                    if (f32acc) { spv_data = flash_attn_f32_f16_data;        spv_size = flash_attn_f32_f16_len; }
-                    else        { spv_data = flash_attn_f32_f16_f16acc_data; spv_size = flash_attn_f32_f16_f16acc_len; }
+                    spv_data = flash_attn_f32_f16_f16acc_data;
+                    spv_size = flash_attn_f32_f16_f16acc_len;
                 }
             } else {
                 spv_data = flash_attn_f32_f16_fp32_data;
                 spv_size = flash_attn_f32_f16_fp32_len;
             }
-            name = aligned ? "flash_attn_f32_f16_aligned" : "flash_attn_f32_f16";
+            if (device->fp16 && !device->dot2_f16 && f32acc && katago_fa_precise == 2) {
+                name = aligned ? "flash_attn_f32_f16_prc_noopt_aligned" : "flash_attn_f32_f16_prc_noopt";
+            } else if (device->fp16 && !device->dot2_f16 && f32acc && katago_fa_precise == 1) {
+                name = aligned ? "flash_attn_f32_f16_prc_aligned" : "flash_attn_f32_f16_prc";
+            } else {
+                name = aligned ? "flash_attn_f32_f16_aligned" : "flash_attn_f32_f16";
+            }
         }
         ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
                                 sizeof(vk_flash_attn_push_constants), {Br, 1, 1},

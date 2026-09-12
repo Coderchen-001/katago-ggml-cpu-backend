@@ -348,7 +348,8 @@ void string_to_spv_func(std::string name, std::string in_path, std::string out_p
     // disable spirv-opt for bf16 shaders for https://github.com/ggml-org/llama.cpp/issues/15344
     // disable spirv-opt for rope shaders for https://github.com/ggml-org/llama.cpp/issues/16860
     // disable spirv-opt for dot2 shaders (spirv-opt doesn't recognize SPV_VALVE_mixed_float_dot_product capability)
-    if (!coopmat && name.find("bf16") == std::string::npos && name.find("rope") == std::string::npos && name.find("_dot2") == std::string::npos) {
+    // disable spirv-opt for the KataGo M1' FA probe variant (_noopt), see flash_attn.comp FA_PRECISE
+    if (!coopmat && name.find("bf16") == std::string::npos && name.find("rope") == std::string::npos && name.find("_dot2") == std::string::npos && name.find("_noopt") == std::string::npos) {
         cmd.push_back("-O");
     }
 
@@ -694,6 +695,15 @@ void process_shaders() {
 
             string_to_spv("flash_attn_f32_f16", "flash_attn.comp",
                 merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
+
+            // M1' probe (test-only, 2026-09-12): two extra scalar FA variants that pin the
+            // f16 P*V multiply against driver FMA contraction (FA_PRECISE in flash_attn.comp).
+            // _prc keeps spirv-opt on, _prc_noopt is built without it (see the -O exclusion above).
+            string_to_spv("flash_attn_f32_f16_prc", "flash_attn.comp",
+                merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"FA_PRECISE", "1"}}), fp16, false, false, f16acc);
+
+            string_to_spv("flash_attn_f32_f16_prc_noopt", "flash_attn.comp",
+                merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"FA_PRECISE", "1"}}), fp16, false, false, f16acc);
 
             if (fp16) {
                 string_to_spv("flash_attn_f32_f16_dot2", "flash_attn.comp",
