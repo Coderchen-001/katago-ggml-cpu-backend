@@ -259,6 +259,15 @@ struct vk_matmul_pipeline_struct {
     // overwritten by the last device's init on multi-GPU hosts and dispatches
     // with a foreign-device pipeline => garbage output; lesson #42).
     vk_pipeline custom_l, custom_a_l;
+    // T4 skeleton (T2 bit 8 only logs): the tuned row for this exact
+    // (family, accumulator variant) object.  A row must live here rather than in
+    // the device, because ggml_vk_guess_matmul_pipeline receives the already
+    // acc-specialised object and cannot tell f16acc from f32acc; and it carries
+    // both the unaligned and aligned pipelines because
+    // ggml_vk_guess_matmul_pipeline_align calls back into the same function with
+    // aligned=true, so the two must come from the same geometry.
+    // Never set in T2 (see ggml_vk_t2_log_tuned_row), so selection is unchanged.
+    vk_pipeline tuned_l, tuned_a_l;
     // Returns true when all unaligned pipelines are null.
     // We only check for unaligned variants since one of the unaligned pipelines must exist
     // while aligned pipelines are optional
@@ -2195,6 +2204,16 @@ std::mutex vk_memory_logger::log_mutex;
 
 static bool vk_perf_logger_enabled = false;
 static bool vk_perf_logger_concurrent = false;
+// T2 test-only instrumentation (KATAGO_VK_T2_PROBE bitmask, default 0 = off):
+//   1 = one-shot "matmul family / accumulator variant" line
+//   2 = createComputePipeline timing (cold compile vs pipeline-cache hit)
+//   4 = matmul pipeline histogram (which slot serves which shape)
+//   8 = T4 tuned-row skeleton logging (no selection change; see the struct slot)
+// Every use is guarded, and with the bit off the code path is identical to before.
+static uint32_t vk_t2_probe = 0;
+static std::map<std::string, uint64_t> vk_t2_slot_histogram;
+static uint64_t vk_t2_slot_total = 0;
+static uint64_t vk_t2_slot_dumped = 0;
 static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
@@ -3150,12 +3169,21 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     }
 #endif
 
+    // T2 bit 2: time createComputePipeline only.  The statistics block further
+    // down (getPipelineExecutableStatisticsKHR) sits in the same function and
+    // would otherwise inflate the measurement whenever GGML_VK_PIPELINE_STATS is
+    // set, so t1 is taken immediately after the call.
+    const auto t2_compile_t0 = std::chrono::steady_clock::now();
     try {
         pipeline->pipeline = device->device.createComputePipeline(device->pipeline_cache, compute_pipeline_create_info).value;
     } catch (const vk::SystemError& e) {
         std::cerr << "ggml_vulkan: Compute pipeline creation failed for " << pipeline->name << std::endl;
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
         throw e;
+    }
+    if ((vk_t2_probe & 2u) != 0) {
+        const double t2_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2_compile_t0).count();
+        std::cerr << "ggml_vulkan: [T2] compile name=" << pipeline->name << " ms=" << t2_ms << std::endl;
     }
 
     if (vk_instance.debug_utils_support) {
@@ -7923,6 +7951,32 @@ static void ggml_vk_instance_init() {
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
+    // T2 test-only probe bitmask; "all" = every bit.
+    {
+        const char* t2_env = getenv("KATAGO_VK_T2_PROBE");
+        if (t2_env != nullptr) {
+            if (strcmp(t2_env, "all") == 0) {
+                vk_t2_probe = 0xF;
+            } else {
+                vk_t2_probe = (uint32_t) strtoul(t2_env, nullptr, 10);
+            }
+            const char* t2_tune_env = getenv("KATAGO_VK_TUNE");
+            if (t2_tune_env != nullptr && strcmp(t2_tune_env, "0") == 0) {
+                // TUNE=0 is the "tuner off" reference configuration and must stay
+                // bit-identical to stock.  Probes are diagnostic only, but they
+                // cost time (bit 8 measured +1.7 ms/batch before it was made
+                // one-shot), so refuse to run them rather than silently
+                // distorting a reference run.
+                vk_t2_probe = 0;
+                std::cerr << "ggml_vulkan: WARNING: KATAGO_VK_T2_PROBE was requested but KATAGO_VK_TUNE=0"
+                          << " disables the tuner, so all T2 probes are suppressed (reference run stays clean)" << std::endl;
+            } else {
+                std::cerr << "ggml_vulkan: KATAGO_VK_T2_PROBE=" << vk_t2_probe << " (T2 instrumentation active)"
+                          << " KATAGO_VK_TUNE=" << (t2_tune_env ? t2_tune_env : "(unset)")
+                          << " KATAGO_VK_TUNE_PRIME=" << (getenv("KATAGO_VK_TUNE_PRIME") ? getenv("KATAGO_VK_TUNE_PRIME") : "(unset)") << std::endl;
+            }
+        }
+    }
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
@@ -8241,6 +8295,33 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     }
     if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_BF16) {
         return ctx->device->pipeline_matmul_bf16;
+    }
+    // T2 bit 1: one-shot per distinct (src0, src1, prec) triple.  Prints exactly
+    // what the condition below resolves to, so the "production family + acc
+    // variant" question is answered from the running binary instead of by reading
+    // the callers (G01).  Logging only; no return value is affected.
+    if ((vk_t2_probe & 1u) != 0) {
+        static std::map<std::string, bool> t2_family_logged;
+        const std::string key = std::string(ggml_type_name(src0_type)) + "/" + ggml_type_name(src1_type) + "/" + std::to_string((int) prec);
+        if (t2_family_logged.find(key) == t2_family_logged.end() && t2_family_logged.size() < 8) {
+            t2_family_logged[key] = true;
+            const bool acc_f16 = (prec == GGML_PREC_DEFAULT && ctx->device->fp16 &&
+                                  !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support));
+            const char* fam = "other";
+            if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F16) fam = "matmul_f16";
+            else if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) fam = "matmul_f16_f32";
+            else if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) fam = "matmul_f32";
+            else if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F16) fam = "matmul_f32_f16";
+            else if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_BF16) fam = "matmul_bf16";
+            std::cerr << "ggml_vulkan: [T2] matmul family: src0=" << ggml_type_name(src0_type)
+                      << " src1=" << ggml_type_name(src1_type)
+                      << " prec=" << (int) prec
+                      << " device.fp16=" << (int) ctx->device->fp16
+                      << " coopmat=" << (int) ctx->device->coopmat_support
+                      << " coopmat2=" << (int) ctx->device->coopmat2
+                      << " => family=" << fam
+                      << " acc=" << (acc_f16 ? "f16acc" : "f32acc") << std::endl;
+        }
     }
     if (prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)) {
         if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
@@ -9320,9 +9401,47 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     return split_k;
 }
 
+// T2 bit 8 (T4 skeleton): report when a tuned row exists on this (family, acc)
+// object.  In T2 nothing ever loads a row (tuned_l stays null) and nothing
+// returns early, so selection behaviour is identical to before; the
+// KATAGO_VK_T2_TUNED_FAKE env exists only to exercise this log path on a device.
+static void ggml_vk_t2_log_tuned_row(const vk_matmul_pipeline & mmp, uint32_t m, uint32_t n, const char * chain) {
+    if ((vk_t2_probe & 8u) == 0 || mmp->tuned_l == nullptr) {
+        return;
+    }
+    // One-shot per distinct (chain, pipeline, m, n).  This runs on every matmul
+    // dispatch, and an unconditional print measured +1.7 ms/batch (+24%) on the
+    // 5080 b10c384 smoke run -- that would poison the very timings T2 collects,
+    // so the log must stay off the per-dispatch path.  The cap only guards
+    // against a pathological shape space flooding stderr.
+    static std::map<std::string, bool> t2_tuned_logged;
+    const std::string key = std::string(chain) + "|" + mmp->tuned_l->name
+                          + "|m=" + std::to_string(m) + "|n=" + std::to_string(n);
+    if (t2_tuned_logged.find(key) != t2_tuned_logged.end()) {
+        return;
+    }
+    if (t2_tuned_logged.size() >= 64) {
+        static bool t2_tuned_log_capped = false;
+        if (!t2_tuned_log_capped) {
+            t2_tuned_log_capped = true;
+            std::cerr << "ggml_vulkan: [T2] tuned row hit: further distinct (name,m,n) suppressed (cap 64)" << std::endl;
+        }
+        return;
+    }
+    t2_tuned_logged[key] = true;
+    std::cerr << "ggml_vulkan: [T2] tuned row hit (" << chain << "): name=" << mmp->tuned_l->name
+              << " m=" << m << " n=" << n << " (NOT applied yet)" << std::endl;
+}
+
 static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
-
+    // T2 test-only: pretend a tuned row exists so the log path can be exercised.
+    // Safe because T2 never returns early on tuned_l; the value is only read by
+    // the log helper above.
+    if ((vk_t2_probe & 8u) != 0 && mmp->tuned_l == nullptr && mmp->l != nullptr && getenv("KATAGO_VK_T2_TUNED_FAKE") != nullptr) {
+        mmp->tuned_l = mmp->l;
+        mmp->tuned_a_l = mmp->a_l;
+    }
     // The q8_1 (integer dot) mmq path uses a different shader with its own
     // shared-memory layout, so use the int-specific availability flags.
     const bool is_q8_1 = (src1_type == GGML_TYPE_Q8_1);
@@ -9331,6 +9450,7 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     const bool mm_s = is_q8_1 ? ctx->device->mul_mat_s_int[src0_type] : ctx->device->mul_mat_s[src0_type];
 
     if (ctx->device->coopmat2) {
+        ggml_vk_t2_log_tuned_row(mmp, m, n, "cm2");
         const uint32_t shader_core_count = ctx->device->shader_core_count;
         const uint32_t tiles_l = CEIL_DIV(m, mmp->a_l->wg_denoms[0]) * CEIL_DIV(n, mmp->a_l->wg_denoms[1]);
         const uint32_t tiles_m = CEIL_DIV(m, mmp->a_m->wg_denoms[0]) * CEIL_DIV(n, mmp->a_m->wg_denoms[1]);
@@ -9373,6 +9493,7 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     // unset) preserves the default heuristic exactly (bit-identical). Placed
     // inside this function so ggml_vk_guess_matmul_pipeline_align (which calls
     // back with aligned=true) computes kpad from the same forced tile.
+    ggml_vk_t2_log_tuned_row(mmp, m, n, "scalar");
     const char * mm_tile_env = getenv("KATAGO_VK_MM_TILE");
     if (mm_tile_env != nullptr) {
         if (strcmp(mm_tile_env, "l") == 0 && mm_l) {
@@ -9422,6 +9543,22 @@ static uint32_t ggml_vk_guess_matmul_pipeline_align(ggml_backend_vk_context * ct
     return ggml_vk_guess_matmul_pipeline(ctx, mmp, m, n, true, src0_type, src1_type)->align;
 }
 
+// T2 bit 4: dump the matmul pipeline histogram.  Only prints when something new
+// was seen since the previous dump, so a long run does not spam the log.
+static void ggml_vk_t2_dump_slot_histogram() {
+    if ((vk_t2_probe & 4u) == 0) {
+        return;
+    }
+    if (vk_t2_slot_total == vk_t2_slot_dumped) {
+        return;
+    }
+    vk_t2_slot_dumped = vk_t2_slot_total;
+    std::cerr << "ggml_vulkan: [T2] matmul pipeline histogram (cumulative, dispatches=" << vk_t2_slot_total << "):" << std::endl;
+    for (const auto & kv : vk_t2_slot_histogram) {
+        std::cerr << "ggml_vulkan: [T2]   " << kv.first << " x " << kv.second << std::endl;
+    }
+}
+
 static void ggml_vk_matmul(
         ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline& pipeline,
         vk_subbuffer&& a, vk_subbuffer&& b, vk_subbuffer&& d, vk_subbuffer&& split_k_buffer,
@@ -9430,6 +9567,16 @@ static void ggml_vk_matmul(
         uint32_t split_k, uint32_t batch, uint32_t ne02, uint32_t ne12, uint32_t broadcast2, uint32_t broadcast3,
         uint32_t padded_n) {
         VK_LOG_DEBUG("ggml_vk_matmul(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), split_k: (" << (split_k_buffer.buffer != nullptr ? split_k_buffer.buffer->buffer : VK_NULL_HANDLE) << ", " << split_k_buffer.offset << ", " << split_k_buffer.size << "), m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", split_k: " << split_k << ", batch: " << batch << ", ne02: " << ne02 << ", ne12: " << ne12 << ", broadcast2: " << broadcast2 << ", broadcast3: " << broadcast3 << ", padded_n: " << padded_n << ")");
+    // T2 bit 4: histogram of which pipeline (hence which slot) serves which
+    // shape.  pipeline->name carries the slot marker (..., _l/_m/_s, with an
+    // optional _aligned marker before it), so this one place answers the
+    // measured_slot question without touching any return in the selection code.
+    // NOTE for reports: count==1 means "first time this (name, m, n, k) was
+    // seen", NOT "first use of that pipeline".
+    if ((vk_t2_probe & 4u) != 0) {
+        vk_t2_slot_histogram[pipeline->name + "|m=" + std::to_string(m) + "|n=" + std::to_string(n) + "|k=" + std::to_string(k)] += 1;
+        vk_t2_slot_total += 1;
+    }
     if (split_k == 1) {
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(batch, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
 
@@ -18993,6 +19140,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
         ctx->perf_logger->print_timings();
     }
+
+    ggml_vk_t2_dump_slot_histogram();
 
     if (!ctx->device->support_async) {
         ggml_vk_synchronize(ctx);

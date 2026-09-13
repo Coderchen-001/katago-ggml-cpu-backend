@@ -11,12 +11,32 @@
 #include "../command/commandline.h"
 #include "../main.h"
 
+#include <cstdlib>
 #include <chrono>
 #include <map>
 #include <sstream>
 #include <fstream>
 
 using namespace std;
+
+// T2: make sure the runtime tuner primes every thread count this tool will test.
+// Both benchmark and genconfig rebuild the backend per tested thread count, so
+// without priming each leg would be timed immediately after its own tuning pass.
+// This only sets the variable; the backend side is T3's job (in T2 the backend
+// does not read it yet, so this is a no-op beyond the env itself). The backend is
+// chosen at compile time in this repo, hence the USE_VULKAN_BACKEND guard, and a
+// value the user set themselves is always respected.
+static void setPrimeEnvIfUnset() {
+#if defined(USE_VULKAN_BACKEND)
+  if(getenv("KATAGO_VK_TUNE_PRIME") == NULL) {
+#ifdef _WIN32
+    _putenv_s("KATAGO_VK_TUNE_PRIME", "auto");
+#else
+    setenv("KATAGO_VK_TUNE_PRIME", "auto", 0);
+#endif
+  }
+#endif
+}
 
 static NNEvaluator* createNNEval(int maxNumThreads, Setup::MaxBatchSizeRequest maxBatchSizeRequest, const CompactSgf& sgf, const string& modelFile, Logger& logger, ConfigParser& cfg, const SearchParams& params);
 
@@ -280,6 +300,7 @@ int MainCmds::benchmark(const vector<string>& args) {
   params.searchFactorAfterTwoPass = 1.0;
 
   Setup::initializeSession(cfg);
+  setPrimeEnvIfUnset();
 
   const NeuralNet::BatchPolicy backendPolicy = NeuralNet::getBatchPolicy(cfg);
   const BatchSizeScheme batchSizeScheme =
@@ -1030,6 +1051,7 @@ int MainCmds::genconfig(const vector<string>& args, const string& firstCommand) 
     params.searchFactorAfterTwoPass = 1.0;
 
     Setup::initializeSession(cfg);
+    setPrimeEnvIfUnset();
 
     // Tune with the batch sizing the backend derives on its own per thread count. The generated
     // config deliberately omits nnMaxBatchSize: at runtime the engine rederives the same batch
