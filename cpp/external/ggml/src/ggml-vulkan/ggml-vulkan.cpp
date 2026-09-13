@@ -4740,8 +4740,21 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         : (strcmp(katago_fa_precise_env, "noopt") == 0 ? 2 : (katago_fa_precise_env[0] == '0' ? 0 : 1));
     static bool katago_fa_precise_logged = false;
 
+    // T2 smoke (2026-09-13): env-gated one-shot timing of the scalar FA pipeline
+    // creation block -- answers the runtime tuner's budget question ("can 10-20
+    // candidates be created and tried inside 1-5 s?"). Rollback: unset.
+    static const char * katago_pipe_timing_env = getenv("KATAGO_VK_PIPE_TIMING");
+    const bool katago_pipe_timing = katago_pipe_timing_env != nullptr && katago_pipe_timing_env[0] == '1';
+    // NOTE: ggml_time_us() divides by a frequency initialized by ggml_time_init(),
+    // and this device-init path can run before anything else calls it -> calling
+    // ggml_time_us() on its own crashes with an integer division by zero
+    // (measured: exit 0xC0000094). Init the timer first.
+    const int64_t katago_pipe_t0 = katago_pipe_timing ? (ggml_time_init(), ggml_time_us()) : 0;
+    uint32_t katago_fa_pipes = 0;
+
     for (auto &fa : device->pipeline_flash_attn_f32_f16) {
         if (fa.first.path != FA_SCALAR) continue;
+        katago_fa_pipes++;
         const uint32_t Br = fa.first.Br;
         const uint32_t Bc = fa.first.Bc;
         const bool aligned = fa.first.aligned;
@@ -4811,6 +4824,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                 sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                 get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                 !fa_ds, !fa_ds ? fa_sgs : 0);
+    }
+
+    if (katago_pipe_timing) {
+        const double ms = (ggml_time_us() - katago_pipe_t0) / 1000.0;
+        fprintf(stderr, "T2|FA scalar pipeline creation|pipes=%u|total_ms=%.1f|per_ms=%.2f\n",
+                katago_fa_pipes, ms, katago_fa_pipes ? ms / katago_fa_pipes : 0.0);
     }
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
