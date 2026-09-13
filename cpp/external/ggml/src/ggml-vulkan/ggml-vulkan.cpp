@@ -9401,10 +9401,9 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     return split_k;
 }
 
-// T2 bit 8 (T4 skeleton): report when a tuned row exists on this (family, acc)
-// object.  In T2 nothing ever loads a row (tuned_l stays null) and nothing
-// returns early, so selection behaviour is identical to before; the
-// KATAGO_VK_T2_TUNED_FAKE env exists only to exercise this log path on a device.
+// T3 skeleton note: report when a tuned row exists on this (family, acc) object.
+// Until T3 loads rows this never fires (tuned_l stays null), so selection behaviour
+// is unchanged; it exists so the T4 injection chain can be observed on a device.
 static void ggml_vk_t2_log_tuned_row(const vk_matmul_pipeline & mmp, uint32_t m, uint32_t n, const char * chain) {
     if ((vk_t2_probe & 8u) == 0 || mmp->tuned_l == nullptr) {
         return;
@@ -9433,15 +9432,14 @@ static void ggml_vk_t2_log_tuned_row(const vk_matmul_pipeline & mmp, uint32_t m,
               << " m=" << m << " n=" << n << " (NOT applied yet)" << std::endl;
 }
 
+// T3 step 0 (2026-09-13): the KATAGO_VK_T2_TUNED_FAKE hook was deleted here.
+// It wrote mmp->tuned_l/tuned_a_l under bit 8 only, with no T3 gate, so the moment
+// this file starts reading tuned_l it would have become a way to change selection
+// from a test env var -- i.e. a fabricated-evidence source.  A fake tuned row is
+// never legitimate now: rows come from the tuner (or nothing at all).
+
 static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
-    // T2 test-only: pretend a tuned row exists so the log path can be exercised.
-    // Safe because T2 never returns early on tuned_l; the value is only read by
-    // the log helper above.
-    if ((vk_t2_probe & 8u) != 0 && mmp->tuned_l == nullptr && mmp->l != nullptr && getenv("KATAGO_VK_T2_TUNED_FAKE") != nullptr) {
-        mmp->tuned_l = mmp->l;
-        mmp->tuned_a_l = mmp->a_l;
-    }
     // The q8_1 (integer dot) mmq path uses a different shader with its own
     // shared-memory layout, so use the int-specific availability flags.
     const bool is_q8_1 = (src1_type == GGML_TYPE_Q8_1);
