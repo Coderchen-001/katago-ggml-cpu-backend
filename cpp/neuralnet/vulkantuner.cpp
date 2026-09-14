@@ -285,6 +285,23 @@ namespace VulkanTuner {
     // the rule is per-reason: the reasons are not obviously equal (no-injection-slot is a hard
     // fact about the device, no-entry leans on the model/family), so "they happen to share a rule
     // today" has to be written down instead of being assumed.
+    //
+    // WHERE `full-key-set` IS REDEEMED (a declared rule that nothing redeems is a comment in
+    // disguise, and this struct carries no runtime weight at all): the LOADER's key comparisons --
+    // makeDecision()'s refusal chain (fingerprint, VERSION/TUNER_VERSION, POLICY, BASELINE, then
+    // the outer key item by item, then ROWSET_HASH on the cache channel) together with
+    // parseRowsFile()'s required-key loop, which is fed by REQUIRED_ANY_CHANNEL/REQUIRED_FOR_CACHE.
+    // Nothing mechanically ties the value to those lines: R17 pins the value AND pins that each
+    // named comparison still exists somewhere in this file, and the behavioural half is the
+    // smoke's refusal legs (S6, A5/A6, A14/A15/A16, A18, A31/A32).  Change either side and both
+    // have to be revisited.
+    //
+    // ⚠️ KNOWN GAP, deliberately left visible (2026-09-13, awaiting a ruling): the comparisons
+    // above are written as `file.foundVersion && file.version != SCHEMA_VERSION`, so a file that
+    // simply OMITS VERSION / TUNER_VERSION is neither refused nor REPORTED -- verified by hand:
+    // such a file loads with no `[not key-checked: ...]` note on either channel, while
+    // t1-schema.md section 1 lists both as required.  Adding them to REQUIRED_FOR_CACHE would fix
+    // both halves at once (cache refuses absence, IMPORT notes it) and is the recommended fix.
     struct NegativeReasonSpec {
       const char* reason;
       const char* invalidation;
