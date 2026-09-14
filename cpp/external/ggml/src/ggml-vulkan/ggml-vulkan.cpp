@@ -1,4 +1,5 @@
 #include "ggml-vulkan.h"
+#include "vulkan-tile-validity.h"   // T3 1.7: pure tile-validity rules (shared with the shell)
 #include <vulkan/vulkan_core.h>
 #include <fstream>
 #include <chrono>   // V3-T3: host-side replay timing (KATAGO_VK_PR_TIMING)
@@ -251,6 +252,8 @@ typedef std::weak_ptr<vk_pipeline_struct> vk_pipeline_ref;
 
 static void ggml_vk_destroy_pipeline(vk::Device& device, vk_pipeline& pipeline);
 
+struct vk_matmul_pipeline_struct;   // the row table below only needs the pointer
+
 // One tuned row: the replacement pipeline pair for one routing key, plus the
 // identity data the loader must validate before installing it.
 //
@@ -273,6 +276,82 @@ struct vk_tuned_row {
     uint32_t     key_k = 0;
     vk_pipeline  unaligned;
     vk_pipeline  aligned;
+};
+
+// Pure matching rule (K1 sentinel semantics), shared by the table and the self-test:
+//   key_m == 0 -> whole-slot row, applies to every shape of this (family, acc)
+//   k == 0     -> the caller does not know k, so NO keyed row may match (falling back
+//                 to stock beats matching with a wrong key)
+//   otherwise  -> exact (m, k) match
+static inline bool ggml_vk_tuned_row_matches(const vk_tuned_row & row, uint32_t m, uint32_t k) {
+    if (row.key_m == 0) {
+        return true;
+    }
+    if (k == 0) {
+        return false;
+    }
+    return row.key_m == m && row.key_k == k;
+}
+
+// Which of a row's two pipelines may serve this call.  THIS IS THE P1 RULE
+// (t3-shell-plan.md section 1.4): `aligned == false` means kpad = align_size(k, ...)
+// did not match, i.e. the buffers are NOT padded to the aligned variant's requirement,
+// so dispatching the aligned pipeline would read them as if they were -- out of bounds.
+// The safe direction is one-way:
+//   aligned == true  -> aligned variant if present, else the unaligned one (harmless:
+//                       the unaligned shader handles an arbitrary k, padded or not)
+//   aligned == false -> ONLY the unaligned variant; if the row has none, return nullptr
+//                       so the caller falls back to the stock heuristic (fail-open)
+static inline vk_pipeline ggml_vk_tuned_row_pick(const vk_tuned_row & row, bool aligned) {
+    if (aligned) {
+        return row.aligned != nullptr ? row.aligned : row.unaligned;
+    }
+    return row.unaligned;
+}
+
+// The tuned rows of one backend context, keyed by the (family, acc) object identity.
+//
+// Contract (t3-shell-plan.md section 1.5, guardrail R3): the table is installed ONCE,
+// as a whole, before the first query, and freezes at that first query.  Rows are
+// returned by pointer, so a later insert (vector reallocation) would dangle them; the
+// freeze is what makes the pointers safe, and it is also the same line the pre-record
+// rule needs (rows must be in place before the first graph build).
+struct vk_tuned_row_table {
+    std::map<const vk_matmul_pipeline_struct *, std::vector<vk_tuned_row>> rows;
+    bool frozen = false;
+
+    // The only write point.  Whole-set replacement, refused once frozen.
+    bool install(const vk_matmul_pipeline_struct * target, std::vector<vk_tuned_row> && new_rows, std::string * reject_reason) {
+        if (frozen) {
+            if (reject_reason != nullptr) {
+                *reject_reason = "row table already frozen (first query happened); late install refused";
+            }
+            return false;
+        }
+        if (target == nullptr) {
+            if (reject_reason != nullptr) {
+                *reject_reason = "null target (family, acc) object";
+            }
+            return false;
+        }
+        rows[target] = std::move(new_rows);
+        return true;
+    }
+
+    // Query.  Freezes the table (first query = the commit point).
+    const vk_tuned_row * lookup(const vk_matmul_pipeline_struct * target, uint32_t m, uint32_t k) {
+        frozen = true;
+        auto it = rows.find(target);
+        if (it == rows.end()) {
+            return nullptr;
+        }
+        for (const vk_tuned_row & row : it->second) {
+            if (ggml_vk_tuned_row_matches(row, m, k)) {
+                return &row;
+            }
+        }
+        return nullptr;
+    }
 };
 
 struct vk_matmul_pipeline_struct {
@@ -2255,6 +2334,7 @@ struct vk_t2_stats {
     std::map<std::string, bool> tuned_logged;
     bool tuned_log_capped = false;
     bool selftest_done = false;
+    bool mm_tile_ignored_logged = false;   // S2': "env override ignored" warning, once per context
 };
 static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
@@ -2498,7 +2578,7 @@ struct ggml_backend_vk_context {
     // t1-schema.md section 4 hold by construction (one evaluator creates one context,
     // and every thread-count / board-size / model change rebuilds it).
     // Installed by ggml_backend_vk_tune_install_rows(); empty in production today.
-    std::map<const vk_matmul_pipeline_struct *, std::vector<vk_tuned_row>> tuned_rows;
+    vk_tuned_row_table tuned;
 
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
@@ -5348,14 +5428,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     const uint32_t BS = (uint32_t)vals[7];
                     const int PAD = n >= 9 ? vals[8] : -1;
                     const int RESHAPE = n >= 10 ? vals[9] : -1;
-                    const uint32_t num_warps = (BM / WM) * (BN / WN);
-                    const uint32_t wniter = WM * WN / (32 * TM * TN * WMITER);
-                    const bool ok = BM % WM == 0 && BN % WN == 0 && WM % WMITER == 0 &&
-                                    (WM / WMITER) % TM == 0 && wniter >= 1 && WN % wniter == 0 &&
-                                    (WN / wniter) % TN == 0 && BS == num_warps * 32 &&
-                                    TM * TN <= WM * WN / 32 && BS <= 1024 && TM % 2 == 0 &&
-                                    (PAD < 0 || (PAD >= 0 && PAD <= 4)) &&
-                                    (RESHAPE < 0 || RESHAPE == 0 || RESHAPE == 1);
+                    // T3 1.7: the constraint family lives in vulkan-tile-validity.h so
+                    // the tuner enumerator, the IMPORT parser and this probe all reject
+                    // the same inputs with the same reason string.  Behaviour here is
+                    // unchanged (same accept/reject set; the header adds a leading
+                    // zero-dimension check that also removes a divide-by-zero the inline
+                    // expression had for WM or WN == 0).
+                    vk_tile_geometry tile = {};
+                    tile.BM = BM; tile.BN = BN; tile.WM = WM; tile.WN = WN;
+                    tile.WMITER = WMITER; tile.TM = TM; tile.TN = TN; tile.BS = BS;
+                    tile.pad = PAD; tile.reshape = RESHAPE; tile.smaller = -1;
+                    const char * tile_reason = vk_tile_candidate_reason(VK_TILE_PATH_SCALAR, tile);
+                    const bool ok = (tile_reason == nullptr);
                     if (ok) {
                         const std::array<uint32_t, 3> custom_wg_denoms = { BM, BN, 1 };
                         const std::vector<uint32_t> custom_warptile = { BS, BM, BN, 16, WM, WN, WMITER, TM, TN, 1, 32 };
@@ -5375,7 +5459,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         GGML_LOG_DEBUG("ggml_vulkan: custom scalar tile registered (dev %s): BM=%u BN=%u WM=%u WN=%u WMITER=%u TM=%u TN=%u BLOCK_SIZE=%u PAD=%d RESHAPE=%d | spec12=%d spec13=%d warptile={%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u}\n", device->name.c_str(), BM, BN, WM, WN, WMITER, TM, TN, BS, PAD, RESHAPE, mm_spec_pad, mm_spec_reshape, custom_warptile[0], custom_warptile[1], custom_warptile[2], custom_warptile[3], custom_warptile[4], custom_warptile[5], custom_warptile[6], custom_warptile[7], custom_warptile[8], custom_warptile[9], custom_warptile[10]);
                         GGML_LOG_DEBUG("ggml_vulkan:   m_warptile={%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u} l_warptile={%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u} coopmat_support=%d coopmat2=%d subgroup=%u\n", m_warptile[0], m_warptile[1], m_warptile[2], m_warptile[3], m_warptile[4], m_warptile[5], m_warptile[6], m_warptile[7], m_warptile[8], m_warptile[9], m_warptile[10], l_warptile[0], l_warptile[1], l_warptile[2], l_warptile[3], l_warptile[4], l_warptile[5], l_warptile[6], l_warptile[7], l_warptile[8], l_warptile[9], l_warptile[10], device->coopmat_support, device->coopmat2, device->subgroup_size);
                     } else {
-                        GGML_LOG_ERROR("ggml_vulkan: invalid KATAGO_VK_MM_TILE=custom spec (constraints, hw-tuner 3.1); ignoring\n");
+                        GGML_LOG_ERROR("ggml_vulkan: invalid KATAGO_VK_MM_TILE=custom spec (%s; hw-tuner 3.1); ignoring\n", tile_reason);
                     }
                 } else {
                     GGML_LOG_ERROR("ggml_vulkan: KATAGO_VK_MM_TILE=custom needs >=8 comma-separated ints; ignoring\n");
@@ -9474,36 +9558,12 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     return split_k;
 }
 
-// The pure matching rule, shared by the lookup and the self-test so the sentinel
-// semantics cannot drift from what is tested:
-//   key_m == 0        -> whole-slot row, applies to every shape of this (family, acc)
-//   k == 0            -> the caller does not know k, so NO keyed row may match
-//                        (falling back to stock beats matching with a wrong key)
-//   otherwise         -> exact (m, k) match
-static bool ggml_vk_tuned_row_matches(const vk_tuned_row & row, uint32_t m, uint32_t k) {
-    if (row.key_m == 0) {
-        return true;
-    }
-    if (k == 0) {
-        return false;
-    }
-    return row.key_m == m && row.key_k == k;
-}
-
 // The row that applies to this shape in this context, or nullptr when there is none.
 // v1 installs at most one row per (family, acc) with key_m == 0 ("whole slot"); the
-// multi-row version matches on the exact (m, k) key.
+// multi-row version matches on the exact (m, k) key.  The matching rule and the freeze
+// semantics live in vk_tuned_row_table (defined with the row struct).
 static const vk_tuned_row * ggml_vk_tuned_row_for(ggml_backend_vk_context * ctx, const vk_matmul_pipeline & mmp, uint32_t m, uint32_t k) {
-    auto it = ctx->tuned_rows.find(mmp.get());
-    if (it == ctx->tuned_rows.end()) {
-        return nullptr;
-    }
-    for (const vk_tuned_row & row : it->second) {
-        if (ggml_vk_tuned_row_matches(row, m, k)) {
-            return &row;
-        }
-    }
-    return nullptr;
+    return ctx->tuned.lookup(mmp.get(), m, k);
 }
 
 // Report when a tuned row applies to this (family, acc) for this shape.  Diagnostics
@@ -9596,6 +9656,32 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
     const bool match_keyed_k0    = ggml_vk_tuned_row_matches(keyed, 192, 0);   // must be false
     const bool sentinel_ok = match_whole_any && match_keyed_exact && !match_keyed_m && !match_keyed_k0;
 
+    // G13 (t3-shell-plan.md section 1.4, the P1 rule).  Synthetic pipelines are enough:
+    // only null-ness matters to the rule.  The unaligned pipeline is never obtained
+    // here -- we compare pointers and null-ness, not dispatch anything.
+    vk_tuned_row only_aligned;
+    only_aligned.aligned = ctx->device->pipeline_matmul_f16.f16acc != nullptr
+                         ? ctx->device->pipeline_matmul_f16.f16acc->l : nullptr;
+    vk_tuned_row only_unaligned;
+    only_unaligned.unaligned = ctx->device->pipeline_matmul_f16.f16acc != nullptr
+                             ? ctx->device->pipeline_matmul_f16.f16acc->l : nullptr;
+    const bool pick_aligned_from_aligned_only = ggml_vk_tuned_row_pick(only_aligned, true) != nullptr;
+    const bool pick_unaligned_is_null         = ggml_vk_tuned_row_pick(only_aligned, false) == nullptr;  // the P1 assertion
+    const bool pick_unaligned_ok              = ggml_vk_tuned_row_pick(only_unaligned, false) != nullptr;
+    const bool pick_aligned_falls_back        = ggml_vk_tuned_row_pick(only_unaligned, true) != nullptr;
+    const bool g13_ok = pick_aligned_from_aligned_only && pick_unaligned_is_null
+                     && pick_unaligned_ok && pick_aligned_falls_back;
+
+    // Row-table contract (t3-shell-plan.md section 1.5): a local table, so the context's
+    // real table keeps its freeze state untouched for the production install path.
+    vk_tuned_row_table tab;
+    vk_matmul_pipeline_struct fake_target;
+    const bool install1 = tab.install(&fake_target, std::vector<vk_tuned_row>{}, nullptr);
+    const bool lookup_before_freeze = tab.lookup(&fake_target, 1, 1) == nullptr;   // freezes
+    std::string late_reason;
+    const bool install2 = tab.install(&fake_target, std::vector<vk_tuned_row>{}, &late_reason);
+    const bool table_ok = install1 && lookup_before_freeze && !install2 && !late_reason.empty();
+
     std::cerr << "ggml_vulkan: [T2] tuned-row validator self-test: I1(no stock)="
               << (reason_empty != nullptr ? "rejected" : "ACCEPTED (BUG)")
               << " [" << (reason_empty ? reason_empty : "-") << "]"
@@ -9605,7 +9691,15 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
               << ", K1 sentinel(whole-slot hit, exact hit, m-mismatch miss, k==0 miss)="
               << (sentinel_ok ? "ok" : "FAILED")
               << " [" << (int) match_whole_any << (int) match_keyed_exact
-              << (int) match_keyed_m << (int) match_keyed_k0 << "]" << std::endl;
+              << (int) match_keyed_m << (int) match_keyed_k0 << "]"
+              << ", G13 pick(aligned-only: aligned ok / unaligned null, unaligned-only: both ok)="
+              << (g13_ok ? "ok" : "FAILED")
+              << " [" << (int) pick_aligned_from_aligned_only << (int) pick_unaligned_is_null
+              << (int) pick_unaligned_ok << (int) pick_aligned_falls_back << "]"
+              << ", table(install ok, lookup ok, late install refused)="
+              << (table_ok ? "ok" : "FAILED")
+              << " [" << (int) install1 << (int) lookup_before_freeze << (int) !install2 << "]"
+              << std::endl;
 }
 
 // T3 step 0 (2026-09-13): the KATAGO_VK_T2_TUNED_FAKE hook was deleted here.
@@ -9626,13 +9720,26 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     // the tuned pipeline -- a correctness bug, not a performance one.
     // k == 0 means "caller does not know k" and matches only whole-slot rows (see
     // ggml_vk_tuned_row_matches), so an un-keyed call can never pick a keyed row.
-    {
+    // q8_1 (mmq) is skipped on purpose: its shader has a different shared-memory layout
+    // and its own availability arrays, and is_q8_1 is computed below -- so without this
+    // guard a row installed on a q8_1 object would be short-circuited too
+    // (t3-shell-plan.md section 1.6 / section 7).
+    if (src1_type != GGML_TYPE_Q8_1) {
         const vk_tuned_row * row = ggml_vk_tuned_row_for(ctx, mmp, m, k);
-        if (row != nullptr && (row->unaligned != nullptr || row->aligned != nullptr)) {
-            ggml_vk_t2_log_tuned_row(ctx, mmp, m, n, k, "row");
-            const vk_pipeline picked = aligned ? (row->aligned != nullptr ? row->aligned : row->unaligned)
-                                               : (row->unaligned != nullptr ? row->unaligned : row->aligned);
+        if (row != nullptr) {
+            const vk_pipeline picked = ggml_vk_tuned_row_pick(*row, aligned);
             if (picked != nullptr) {
+                ggml_vk_t2_log_tuned_row(ctx, mmp, m, n, k, "row");
+                // S2' (t1-switches.md section 1.1): the row short-circuits the scalar
+                // env segment, so an env-forced tile is silently ignored from here on.
+                // That is exactly the "set it and nothing happened" trap (lesson #46),
+                // so say it once per context.
+                if (!ctx->t2.mm_tile_ignored_logged && getenv("KATAGO_VK_MM_TILE") != nullptr) {
+                    ctx->t2.mm_tile_ignored_logged = true;
+                    std::cerr << "ggml_vulkan: WARNING: KATAGO_VK_MM_TILE is set but a tuned row intercepts this"
+                              << " (family, acc); the env tile is IGNORED for those shapes"
+                              << " (KATAGO_VK_TUNE=0 or deleting the tuner cache restores it)" << std::endl;
+                }
                 return picked;
             }
         }
