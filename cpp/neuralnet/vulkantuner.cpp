@@ -225,20 +225,27 @@ namespace VulkanTuner {
       }
     }
 
+    // ONE derivation of "this process is in read-only mode".  Today `policy.off` and the write
+    // permission are the same fact, but they would otherwise be two SPELLINGS of it, and the
+    // moment "read-only" grows a second meaning (e.g. "do not touch an existing cache either")
+    // the two would drift apart.
+    bool readOnlyMode(const TunePolicy & policy) {
+      return policy.off;
+    }
+
     // THE single place that decides whether this process may write a cache file.
     //
-    // Not `!policy.off` spelled out at each call site: a guardrail can only check TEXT, so the
-    // thing it must recognise has to be ONE NAMED predicate (the same reason R1/R3 exist).  Two
-    // earlier versions of that guardrail were unsound for exactly this reason -- "is the string
-    // policy.off nearby?" is satisfied by an unrelated `if (policy.off) { }`, and it is violated
-    // by a helper gated by its caller (forcing a comment written only to satisfy the guardrail).
-    // So: write permission has ONE decision point, and R16 checks that the innermost condition
-    // at the write site names it.
+    // Why a named predicate rather than `!policy.off` at each site: a guardrail can only check
+    // TEXT, so what it must recognise has to be one NAME (the same reason R1/R3 exist).  Three
+    // earlier versions of that guardrail were unsound: "is the string policy.off nearby?" is
+    // satisfied by an unrelated `if (policy.off) { }`, and "the first `if (` within N lines" is
+    // satisfied by an unrelated `if (cacheWriteAllowed(policy)) { log(); }` while the real write
+    // sits outside it -- and it went RED for a write whose enclosing condition was simply more
+    // than N lines away, which pushes people to write comments that exist only for the guardrail.
     //
     // KATAGO_VK_TUNE=0 is deliberately not consulted here: it never reaches a decision at all.
-    // This answers only the user-facing read-only mode.
     bool cacheWriteAllowed(const TunePolicy & policy) {
-      return !policy.off;
+      return !readOnlyMode(policy);
     }
 
     // The policy fingerprint (t1-schema.md section 4): build revision + policy version + the
@@ -764,7 +771,7 @@ namespace VulkanTuner {
     // cfg vulkanTune=off: read-only.  Still LOUD about the requests that cannot be honoured
     // (RETUNE, PRIME): "I set RETUNE and nothing happened" is the same trap as under the master
     // switch, and this mode is the one a user is most likely to combine with a request.
-    reportIgnoredRequests(false, policy.off);
+    reportIgnoredRequests(false, readOnlyMode(policy));
 
     const auto t0 = chrono::steady_clock::now();
     shared_ptr<Decision> d = make_shared<Decision>();
