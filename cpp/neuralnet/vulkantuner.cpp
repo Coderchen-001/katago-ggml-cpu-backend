@@ -139,9 +139,15 @@ namespace VulkanTuner {
       return string(hash).substr(0, 16);
     }
 
-    // Make a *value* safe to place in a line-oriented text format: no newline (which would
-    // forge a field), no whitespace-only confusion, no control characters.  Values come from
-    // env vars and model names, i.e. from outside this program.
+    // Make a *value* safe to place in a line-oriented text format.  The REAL guarantee, stated
+    // exactly: every control character (including newline, 0x0A) becomes '_', so a value can
+    // never forge a field or start a new line, and POLICY is the LAST field on its line, so
+    // any spaces inside a value are harmless.  It is deliberately NOT "whitespace-safe" in
+    // general -- do not reuse it as a filename or CSV sanitiser.
+    //
+    // NOT used for hashing: hashing a sanitised value would make two different raw values
+    // collide (`a\x01b` and `a\x02b` both become `a_b`), which is the opposite of what a
+    // fingerprint is for.  See policyFingerprint().
     string sanitizeValue(const string& in, size_t maxLen) {
       string out;
       for (char c : in) {
@@ -166,6 +172,11 @@ namespace VulkanTuner {
         "KATAGO_VK_RMS_SUBGROUP", "KATAGO_VK_M4_FUSION", "KATAGO_VK_MMPREC_F32",
         "GGML_VK_DISABLE_COOPMAT", "GGML_VK_DISABLE_COOPMAT2", "KATAGO_VK_MM_TILE",
       };
+      // NOTE: the build revision is truncated to 16 characters and that is NOT the lossy kind
+      // of truncation the knob values below must avoid -- a SHA is a fixed-length prefix-free
+      // identifier, so no two revisions share their first 16 hex characters in practice, and
+      // keeping it readable in the log is worth more than the extra 48 characters.  Do not
+      // "fix" it with the hash rule below: the revision must stay greppable.
       string s = "b" + sanitizeValue(string(GIT_REVISION), 16)
                + "|p" + std::to_string(TUNER_POLICY_VERSION);
       for (const char* knob : KNOBS) {
@@ -177,15 +188,22 @@ namespace VulkanTuner {
           s += "-";
         }
         else {
-          // LONG VALUES ARE HASHED, NEVER TRUNCATED.  Truncation is lossy AND silent: two
-          // KATAGO_VK_MM_TILE=custom:... values that differ only past the cap would produce
-          // the same fingerprint and the cache would be reused across a policy change.  The
-          // marker also records the original length, so a reader can tell a hash from a value.
+          // SHORT VALUES AS-IS, LONG VALUES HASHED -- and the hash is taken over the RAW value.
+          // Two earlier mistakes are fixed here: truncating (lossy AND silent: two
+          // KATAGO_VK_MM_TILE=custom:... values differing past the cap produced the same
+          // fingerprint, so a policy change would have reused the cache), and hashing the
+          // SANITISED value (`a\x01b` and `a\x02b` both sanitise to `a_b`, i.e. two different
+          // policy values would collide).  The length recorded is the RAW length, for the same
+          // reason.  shortHash() output is hex, so it needs no sanitising to stay line-safe.
           const size_t MAX_VALUE = 24;
-          const string full = sanitizeValue(string(v), 4096);
-          s += (full.size() <= MAX_VALUE)
-             ? full
-             : ("#" + shortHash(full) + "/" + std::to_string(full.size()));
+          const string raw(v);
+          if (raw.size() <= MAX_VALUE) {
+            // Short enough to read: keep it, but make it line-safe.
+            s += sanitizeValue(raw, MAX_VALUE);
+          }
+          else {
+            s += "#" + shortHash(raw) + "/" + std::to_string(raw.size());
+          }
         }
       }
       return s;
@@ -295,6 +313,9 @@ namespace VulkanTuner {
       vector<string> absentKeys;
     };
 
+    // Read the whole file rather than using FileUtils::readFile: that helper throws on failure
+    // and this path must return an error string instead (every load failure here is fail-open +
+    // loud, never an exception out of the hook).  Do not "simplify" this back to readFile().
     bool readWholeFile(const string& path, string& out, string& err) {
       ifstream in;
       if (!FileUtils::tryOpen(in, path, ios_base::in | ios_base::binary)) {
@@ -654,17 +675,44 @@ namespace VulkanTuner {
     const bool enabled = tuneEnabled();
 
     if (!enabled) {
-      // Item 7: TUNE=0 is a complete no-op, EXCEPT that an import/export request must not
-      // be dropped in silence -- "I set the env var and nothing happened" is the trap this
-      // warning exists for (lesson #46).
-      if (importEnv != nullptr && importEnv[0] != '\0') {
-        logLine(string("WARNING: KATAGO_VK_TUNE_IMPORT=") + importEnv
-                + " was requested but KATAGO_VK_TUNE=0 disables the tuner; nothing was imported"
-                  " and no tuned row will be used (reference run stays clean)");
-      }
-      if (exportEnv != nullptr && exportEnv[0] != '\0') {
-        logLine(string("WARNING: KATAGO_VK_TUNE_EXPORT=") + exportEnv
-                + " was requested but KATAGO_VK_TUNE=0 disables the tuner; nothing was exported");
+      // REQUEST-TYPE SWITCHES, as a declared table (t3-shell-plan.md section 6, "P1").
+      //
+      // Every switch that ASKS the tuner to do something must be reported when the whole tuner
+      // is off, otherwise the operator gets "I set the env var and nothing happened" (lesson
+      // #46).  This was hand-written three times before -- first for IMPORT, then EXPORT, and
+      // RETUNE was silently dropped until a review noticed that the guardrail's own inventory
+      // count (2) was the proof.  So the list is DATA, and t3-guardrails.py R13 checks it: a
+      // new request switch that is not added here turns the guardrail red.
+      //
+      // `vacuousWhen` handles the one switch the TOOL sets rather than the operator:
+      // benchmark/genconfig call setPrimeEnvIfUnset() (command/benchmark.cpp), so KATAGO_VK_TUNE_PRIME
+      // is normally "auto" without anyone asking.  Under the strongest-off mode "no prime-time
+      // tuning" is not an ignored request, it is the point of the mode -- and warning about it
+      // on every reference-arm run would train people to ignore the warnings (the reference
+      // arm's own probe face is an acceptance criterion).  A NON-default PRIME value is a real
+      // request by someone, so that one does warn.
+      struct RequestSwitch {
+        const char* env;
+        const char* vacuousWhen;   // nullptr = any set value is an operator request
+        const char* consequence;
+      };
+      static const RequestSwitch REQUESTS[] = {
+        { "KATAGO_VK_TUNE_IMPORT", nullptr, "nothing was imported and no tuned row will be used" },
+        { "KATAGO_VK_TUNE_EXPORT", nullptr, "nothing was exported" },
+        { "KATAGO_VK_TUNE_RETUNE", nullptr, "nothing was re-tuned and the cache was not even read" },
+        { "KATAGO_VK_TUNE_PRIME",  "auto",  "no prime-time tuning happened (auto is the tool's own setting)" },
+      };
+      for (const RequestSwitch & r : REQUESTS) {
+        const char* v = getenv(r.env);
+        if (v == nullptr || v[0] == '\0') {
+          continue;
+        }
+        if (r.vacuousWhen != nullptr && string(v) == r.vacuousWhen) {
+          continue;
+        }
+        logLine(string("WARNING: ") + r.env + "=" + v
+                + " was requested but KATAGO_VK_TUNE=0 disables the tuner; "
+                + r.consequence + " (reference run stays clean)");
       }
       return nullptr;
     }
