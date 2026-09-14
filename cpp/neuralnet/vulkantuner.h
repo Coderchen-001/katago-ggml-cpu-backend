@@ -95,6 +95,14 @@ namespace VulkanTuner {
     // a different model, board size or max batch, and none of those may share a row set.
     std::string modelIdentity;    // header form (mv…-sha…-name…)
     bool negative = false;        // this key's row set is a "deterministically all-rejected" marker
+    // Why the reason is a CLOSED SET and not free text (t3-shell-plan.md section 6.4 item 2): a
+    // NEGATIVE entry is a claim that OUTLIVES the process -- it suppresses tuning until something
+    // invalidates it -- so it has to be mechanically comparable, and a file carrying a reason this
+    // tuner cannot interpret must not load (the same rule that refuses an unknown header key).
+    // The set is NEGATIVE_REASONS[] in vulkantuner.cpp; class (b) (every candidate rejected by the
+    // validation gate) and class (c) (timeout / IO failure / device lost / no winner) are
+    // deliberately absent from it, so they cannot be written at all.
+    std::string negativeReason;
     // The policy half of the header (t1-schema.md section 4): a row set measured under one
     // policy must not be reused under another.  `policyFingerprint` covers the build
     // revision, the tuner's policy version and the policy-relevant env knobs;
@@ -170,7 +178,10 @@ namespace VulkanTuner {
   //   ROW <path> <src0> <src1> <key_m> <key_k> <BM> <BN> <BK> <WM> <WN> <WMITER> <TM> <TN> <BS> <pad> <reshape> <smaller>
   //   NEGATIVE <reason>      this (device, model, S, mb) was DETERMINISTICALLY all-rejected;
   //                          no tuning is attempted.  Never written on a timeout, and never
-  //                          written for a partial result.
+  //                          written for a partial result.  `<reason>` is one of the CLOSED
+  //                          SET declared in vulkantuner.cpp -- a reason outside it refuses the
+  //                          file on BOTH channels, because the reason is the part of the claim
+  //                          that has to stay comparable across releases.
   //
   // WHICH HEADER KEYS ARE REQUIRED DEPENDS ON THE CHANNEL, and the split follows what each
   // key GUARANTEES (2026-09-13 review):

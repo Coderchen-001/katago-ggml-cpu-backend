@@ -248,6 +248,55 @@ namespace VulkanTuner {
       return !readOnlyMode(policy);
     }
 
+    // The CLOSED SET of NEGATIVE reasons (t3-shell-plan.md section 6.4 item 2).  A file-level
+    // reason is a claim about the DEVICE that outlives this process, so it must be comparable by
+    // machine and interpretable by the NEXT release that reads it -- which is exactly why the set
+    // is declared data rather than "whatever string the deciding code happens to produce".
+    //
+    // What may be in here: class (a) only, i.e. the device STRUCTURALLY cannot be tuned (there is
+    // no injectable slot, or the row lookup is unreachable by construction).  Class (a) does not
+    // depend on any gate / tau / soft-gate parameter, so a policy change can never invalidate it.
+    //
+    // What must NOT be in here: class (b) (every candidate rejected by the validation gate) and
+    // class (c) (timeout / IO failure / DEVICE_LOST / no winner).  (b) is only sound to write once
+    // the gate parameters are part of policyFingerprint -- otherwise changing a gate parameter
+    // would leave the key permanently skipped -- and (c) is not a property of the device at all
+    // (t1-schema.md section 1 discipline (b): "we ran out of time" must never be remembered as
+    // "this device cannot be tuned").  Adding a name here is therefore a deliberate act, and both
+    // the re-evaluation trigger (section 6.4 item 5) and R17 point at this array.
+    const char* NEGATIVE_REASONS[] = {
+      "no-injection-slot",
+      "no-entry",
+    };
+
+    // The closed set holds on BOTH sides: the parser (so an uninterpretable file is refused
+    // instead of loading as if it had said nothing) and the cache writer's "is there anything to
+    // write?" predicate below (so free text can never reach the disk).  A set only the reader
+    // checks is a set on paper.
+    bool negativeReasonKnown(const string & reason) {
+      for (const char* r : NEGATIVE_REASONS) {
+        if (reason == r) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // "Is there anything to write?" -- the SECOND half of the write permission.
+    // `cacheWriteAllowed(policy)` answers "may this process touch the cache at all" (the user's
+    // mode); this answers "does this decision say anything" (the decision's state), and they are
+    // separate because they fail for different reasons and are fixed by different people.  The
+    // state it rejects is real: a file carrying neither ROW nor NEGATIVE loads without complaint
+    // and reads as "this key is already decided" (see the writer comment in formatRowsFileImpl),
+    // so the CACHE path must refuse to create one while EXPORT may still write it (that is how
+    // the format is demonstrated in tests).
+    bool cacheEntryWritable(const Decision & d) {
+      if (!d.rows.empty()) {
+        return true;
+      }
+      return d.negative && negativeReasonKnown(d.negativeReason);
+    }
+
     // The policy fingerprint (t1-schema.md section 4): build revision + policy version + the
     // policy-relevant env knobs.  Deliberately assembled HERE rather than asked of the
     // backend, because the interface is capped at four functions (R1) and none of these facts
@@ -613,8 +662,18 @@ namespace VulkanTuner {
           }
         }
         else if (line.compare(0, 9, "NEGATIVE ") == 0) {
+          // Same rule as an unknown key (see the final else): a claim this tuner cannot interpret
+          // must not be read as if it had said nothing.  The reason decides how long the claim
+          // lasts and what invalidates it, so "unrecognised" is not a cosmetic problem -- it is
+          // the difference between "this device can never be tuned" and a free-text guess.
+          const string reason = line.substr(9);
+          if (!negativeReasonKnown(reason)) {
+            err = "NEGATIVE line " + to_string(lineNo) + ": unknown reason '" + reason
+                + "' (the reason is a closed set; see NEGATIVE_REASONS)";
+            return false;
+          }
           out.negative = true;
-          out.negativeReason = line.substr(9);
+          out.negativeReason = reason;
         }
         else if (line.compare(0, 4, "ROW ") == 0) {
           if (out.rows.size() >= MAX_ROWS_PER_FILE) {
@@ -677,9 +736,8 @@ namespace VulkanTuner {
       // mutually exclusive statements.  The writer refuses to emit both; the reader still
       // copes with a hand-edited file containing both (rows win, loudly).  The remaining
       // case -- neither -- is only reachable through EXPORT of an empty row set, which is
-      // how the format is demonstrated in tests; the CACHE write path (step 3) must never
-      // write it, because loading a file that says nothing would still look like "this key
-      // is already decided".
+      // how the format is demonstrated in tests; the CACHE write path cannot create one
+      // because cacheEntryWritable() refuses it before this function is called.
       if (!d.rows.empty() && d.negative) {
         throw StringError("VulkanTuner: refusing to write a file with both ROW and NEGATIVE"
                           " (one file = one key: the two are exclusive statements)");
@@ -699,6 +757,24 @@ namespace VulkanTuner {
            << " " << r.geom.WM << " " << r.geom.WN << " " << r.geom.WMITER
            << " " << r.geom.TM << " " << r.geom.TN << " " << r.geom.BS
            << " " << r.geom.pad << " " << r.geom.reshape << " " << r.geom.smaller << "\n";
+      }
+      if (d.negative) {
+        // The NEGATIVE segment.  Without this the negative channel had no WRITER at all: a
+        // decision that was (or had loaded) a negative entry exported as `ROWS 0` and nothing
+        // else -- i.e. the marker was silently dropped and the round trip was broken, which is
+        // the same "it looked fine" failure the read side already refuses to make.
+        //
+        // The reason is taken from the Decision (never a literal here, so R17 can require that)
+        // and re-checked against the closed set: the parser refuses an unknown reason, so a file
+        // this writer produces is always re-readable.  `d.rows` is empty whenever `d.negative` is
+        // set (the guard above throws otherwise), which is also why the ROWSET_HASH written above
+        // is the hash of the EMPTY row set -- a deterministic value, not a placeholder.
+        if (!negativeReasonKnown(d.negativeReason)) {
+          throw StringError("VulkanTuner: refusing to write a NEGATIVE entry with reason '"
+                            + d.negativeReason + "' (it is not in the closed set, and a file this "
+                            "tuner cannot re-read must not be written)");
+        }
+        os << "NEGATIVE " << d.negativeReason << "\n";
       }
       return os.str();
     }
@@ -740,6 +816,43 @@ namespace VulkanTuner {
       err = string(errBuf.data());
     }
     return ok;
+  }
+
+  // THE single cache write path (t3-shell-plan.md section 9.1 R16, step "3-3").
+  //
+  // Why a named function rather than an `if` at the call site: the write permission has to be one
+  // recognisable NAME for the guardrail to check, and the check is STRUCTURAL -- this body is the
+  // only place a cache writeFileAtomic call may sit, and both permission predicates have to be
+  // named in it BEFORE the write.  It is deliberately NOT declared in vulkantuner.h: the header
+  // says what the caller (vulkanbackend.cpp) needs, and this is an internal step of the shell.
+  //
+  // NO CALLER YET, and that is the documented state of step 3-3 rather than an oversight.  The
+  // first class-(a) verdict ("this device structurally cannot be tuned") can only come from the
+  // enumerator, which is step 5, so at this cut every runnable path ends with "nothing to say" and
+  // MUST NOT write.  The consequence is recorded instead of hidden (t1-schema.md section 1): step
+  // 3 lands the function and the rules, step 4 lands the end-to-end, and the POSITIVE leg for this
+  // write path (a synthetic class-(a) all-reject producing a cache file whose header matches the
+  // schema) is step 4's acceptance item.  What this cut CAN check is the negative side: R16's
+  // structure, plus the behaviour legs that plant a cache and require it byte-identical and that
+  // run with no cache file at all and require none to appear.
+  //
+  // The CALLER logs; this function only reports.  One writer per line (section 9.3-9), and the
+  // message is born with the path that can actually produce it (step 4).
+  bool writeCacheIfAllowed(const Decision& d, const TunePolicy& policy, string& err) {
+    if (!cacheWriteAllowed(policy)) {
+      // Read-only (cfg vulkanTune=off, or any future second meaning of "read-only"): the cache may
+      // be READ but never written.  Reaching here is a bug in the caller, so it is refused loudly
+      // rather than silently skipped.
+      err = "the cache is read-only in this mode";
+      return false;
+    }
+    if (!cacheEntryWritable(d)) {
+      err = "nothing to write: no rows and no negative entry (a file that says neither would "
+            "load as 'this key is already decided')";
+      return false;
+    }
+    // WRITE-PATH: cache
+    return writeFileAtomic(d.cachePath, formatRowsFile(d), err);
   }
 
   shared_ptr<Decision> makeDecision(
@@ -993,6 +1106,13 @@ namespace VulkanTuner {
             d->rowSource = fromImport ? "import" : "cache";
             d->cacheState = file.negative ? "negative" : "loaded";
             d->negative = file.negative && file.rows.empty();
+            if (d->negative) {
+              // Carried onto the Decision, not just into the note: EXPORT has to re-emit the
+              // marker (it writes what a cache file would contain), and the cache writer has to
+              // check the reason against the closed set.  In the "both ROW and NEGATIVE" case
+              // below the reason is deliberately dropped with the stale entry.
+              d->negativeReason = file.negativeReason;
+            }
             if (file.negative && !file.rows.empty()) {
               // Reachable only from a hand-edited or merged file: the writer refuses to emit
               // both (one file = one key makes them exclusive statements about that key).
