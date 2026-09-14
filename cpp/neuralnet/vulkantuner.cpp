@@ -160,6 +160,71 @@ namespace VulkanTuner {
       return out;
     }
 
+    // The request-type switch table (t3-shell-plan.md section 6, "P1").  Every switch that ASKS
+    // the tuner to do something must be reported when the tuner is not allowed to act,
+    // otherwise the operator gets "I set the env var and nothing happened" (lesson #46).  This
+    // was hand-written three times before -- IMPORT, then EXPORT, and RETUNE was silently
+    // dropped until a review noticed that the guardrail's own inventory count (2) was the
+    // proof.  So the list is DATA and t3-guardrails.py R13 pins ALL FOUR FIELDS: a switch
+    // added without thought, or a `vacuousWhen` quietly changed, turns the guardrail red.
+    //
+    //   env               the switch
+    //   vacuousWhen       value that means "the TOOL set it, so under a not-allowed tuner
+    //                     nothing was really requested" (nullptr = any set value is a request).
+    //                     KATAGO_VK_TUNE_PRIME is set by benchmark/genconfig themselves, so
+    //                     warning about "auto" on every reference-arm run would train people to
+    //                     ignore warnings -- while the reference arm's probe face is itself an
+    //                     acceptance criterion.  A non-default PRIME really was asked for.
+    //   ignoredUnderOff   is it ALSO ignored when cfg vulkanTune=off?  IMPORT is a read, so it
+    //                     is honoured; EXPORT writes a file the operator named (not the cache),
+    //                     so it is honoured too; RETUNE and PRIME ask for TUNING, which off
+    //                     forbids.
+    //   consequence       what the operator needs to hear.
+    struct RequestSwitch {
+      const char* env;
+      const char* vacuousWhen;
+      bool ignoredUnderOff;
+      const char* consequence;
+    };
+    static const RequestSwitch REQUESTS[] = {
+      { "KATAGO_VK_TUNE_IMPORT", nullptr, false, "nothing was imported and no tuned row will be used" },
+      { "KATAGO_VK_TUNE_EXPORT", nullptr, false, "nothing was exported" },
+      { "KATAGO_VK_TUNE_RETUNE", nullptr, true,  "nothing was re-tuned and the cache was not even read" },
+      { "KATAGO_VK_TUNE_PRIME",  "auto",  true,  "no prime-time tuning happened (auto is the tool's own setting)" },
+    };
+
+    // Report the request switches that cannot be honoured, under whichever reason applies.
+    // ONCE PER PROCESS: this is a property of the configuration, not of one context, and a
+    // benchmark thread-count sweep creates one context per bucket -- N identical warnings is
+    // how a warning becomes wallpaper.
+    void reportIgnoredRequests(bool tunerOff, bool readOnly) {
+      if (!tunerOff && !readOnly) {
+        return;
+      }
+      static std::atomic<bool> alreadyReported {false};
+      bool expected = false;
+      if (!alreadyReported.compare_exchange_strong(expected, true)) {
+        return;
+      }
+      const char* why = tunerOff ? "KATAGO_VK_TUNE=0 disables the tuner"
+                                 : "vulkanTune=off makes the tuner read-only";
+      for (const RequestSwitch & r : REQUESTS) {
+        if (readOnly && !tunerOff && !r.ignoredUnderOff) {
+          continue;
+        }
+        const char* v = getenv(r.env);
+        if (v == nullptr || v[0] == '\0') {
+          continue;
+        }
+        if (r.vacuousWhen != nullptr && string(v) == r.vacuousWhen) {
+          continue;
+        }
+        logLine(string("WARNING: ") + r.env + "=" + v + " was requested but " + why
+                + "; " + r.consequence
+                + (tunerOff ? " (reference run stays clean)" : ""));
+      }
+    }
+
     // The policy fingerprint (t1-schema.md section 4): build revision + policy version + the
     // policy-relevant env knobs.  Deliberately assembled HERE rather than asked of the
     // backend, because the interface is capped at four functions (R1) and none of these facts
@@ -627,6 +692,7 @@ namespace VulkanTuner {
          << " baseline=" << d.baselineVersion
          << " rows=" << d.rowCount
          << " source=" << d.rowSource
+         << " tuneMode=" << d.tuneModeText
          << " cache_state=" << d.cacheState
          << " tune_ms=" << d.tuneMs
          << " cache=" << d.cachePath
@@ -660,7 +726,8 @@ namespace VulkanTuner {
     int nnXLen,
     int nnYLen,
     int maxBatchSize,
-    const ModelIdentity& model
+    const ModelIdentity& model,
+    const TunePolicy& policy
   ) {
     const char* importEnv = getenv("KATAGO_VK_TUNE_IMPORT");
     const char* exportEnv = getenv("KATAGO_VK_TUNE_EXPORT");
@@ -675,47 +742,13 @@ namespace VulkanTuner {
     const bool enabled = tuneEnabled();
 
     if (!enabled) {
-      // REQUEST-TYPE SWITCHES, as a declared table (t3-shell-plan.md section 6, "P1").
-      //
-      // Every switch that ASKS the tuner to do something must be reported when the whole tuner
-      // is off, otherwise the operator gets "I set the env var and nothing happened" (lesson
-      // #46).  This was hand-written three times before -- first for IMPORT, then EXPORT, and
-      // RETUNE was silently dropped until a review noticed that the guardrail's own inventory
-      // count (2) was the proof.  So the list is DATA, and t3-guardrails.py R13 checks it: a
-      // new request switch that is not added here turns the guardrail red.
-      //
-      // `vacuousWhen` handles the one switch the TOOL sets rather than the operator:
-      // benchmark/genconfig call setPrimeEnvIfUnset() (command/benchmark.cpp), so KATAGO_VK_TUNE_PRIME
-      // is normally "auto" without anyone asking.  Under the strongest-off mode "no prime-time
-      // tuning" is not an ignored request, it is the point of the mode -- and warning about it
-      // on every reference-arm run would train people to ignore the warnings (the reference
-      // arm's own probe face is an acceptance criterion).  A NON-default PRIME value is a real
-      // request by someone, so that one does warn.
-      struct RequestSwitch {
-        const char* env;
-        const char* vacuousWhen;   // nullptr = any set value is an operator request
-        const char* consequence;
-      };
-      static const RequestSwitch REQUESTS[] = {
-        { "KATAGO_VK_TUNE_IMPORT", nullptr, "nothing was imported and no tuned row will be used" },
-        { "KATAGO_VK_TUNE_EXPORT", nullptr, "nothing was exported" },
-        { "KATAGO_VK_TUNE_RETUNE", nullptr, "nothing was re-tuned and the cache was not even read" },
-        { "KATAGO_VK_TUNE_PRIME",  "auto",  "no prime-time tuning happened (auto is the tool's own setting)" },
-      };
-      for (const RequestSwitch & r : REQUESTS) {
-        const char* v = getenv(r.env);
-        if (v == nullptr || v[0] == '\0') {
-          continue;
-        }
-        if (r.vacuousWhen != nullptr && string(v) == r.vacuousWhen) {
-          continue;
-        }
-        logLine(string("WARNING: ") + r.env + "=" + v
-                + " was requested but KATAGO_VK_TUNE=0 disables the tuner; "
-                + r.consequence + " (reference run stays clean)");
-      }
+      reportIgnoredRequests(true, false);
       return nullptr;
     }
+    // cfg vulkanTune=off: read-only.  Still LOUD about the requests that cannot be honoured
+    // (RETUNE, PRIME): "I set RETUNE and nothing happened" is the same trap as under the master
+    // switch, and this mode is the one a user is most likely to combine with a request.
+    reportIgnoredRequests(false, policy.off);
 
     const auto t0 = chrono::steady_clock::now();
     shared_ptr<Decision> d = make_shared<Decision>();
@@ -727,6 +760,7 @@ namespace VulkanTuner {
     d->policyFingerprint = policyFingerprint();
     d->baselineVersion = std::to_string(TUNER_POLICY_VERSION);
     d->rowSource = "none";   // stays "none" unless a load actually produced rows
+    d->tuneModeText = policy.modeText;
 
     try {
       char fp[512];

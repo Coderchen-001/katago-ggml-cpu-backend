@@ -2408,6 +2408,12 @@ struct ComputeContext {
   // createComputeContext -- it used to be discarded here.
   std::string homeDataDirOverride;
 
+  // T3 user-facing tuner mode (cfg `vulkanTune`, t3-shell-plan.md section 2.2).  Read HERE
+  // because createComputeContext owns the ConfigParser; the shell must not read one.  A bad
+  // value is a hard error: it is the operator's own config, and silently falling back to auto
+  // would hide a typo behind "it tuned anyway".
+  VulkanTuner::TunePolicy tunePolicy;
+
   // ONE tune decision per (evaluator, device), taken by whichever NN server thread
   // creates its handle first; the others reuse it and only perform their own per-context
   // install (section 2).  Without the single flight, N threads would race for the same
@@ -2436,7 +2442,15 @@ ComputeContext* NeuralNet::createComputeContext(
   ConfigParser& cfg
 ) {
   (void)gpuIdxs;
-  (void)cfg;
+
+  // T3 user-facing mode (t3-shell-plan.md section 2.2): cfg `vulkanTune` = auto (default) or
+  // off (read-only).  The dev master switch `KATAGO_VK_TUNE=0` is resolved inside the shell and
+  // is stronger; the env-overrides-cfg rule therefore lives there, not here.
+  string vulkanTune = "auto";
+  if(cfg.contains("vulkanTune"))
+    vulkanTune = cfg.getString("vulkanTune");
+  if(vulkanTune != "auto" && vulkanTune != "off")
+    throw StringError("Vulkan backend: vulkanTune must be \"auto\" or \"off\", got \"" + vulkanTune + "\"");
 
   // scale8 (1/8 activation rescaling) is applied here, before the graph is
   // built, exactly like the ONNX/TensorRT backends do. Transformer models are
@@ -2448,10 +2462,13 @@ ComputeContext* NeuralNet::createComputeContext(
   // itself does not gate on it -- ggml picks the fp16 path by device
   // capability -- but the request must be observable for tooling/tests).
   ComputeContext* ctx = new ComputeContext(nnXLen, nnYLen, useFP16Mode, homeDataDirOverride);
+  ctx->tunePolicy.off = (vulkanTune == "off");
+  ctx->tunePolicy.modeText = ctx->tunePolicy.off ? "off(cfg)" : "auto(cfg)";
   if(logger != NULL)
     logger->write("VULKAN backend: creating compute context for " +
                   Global::intToString(nnXLen) + "x" + Global::intToString(nnYLen) +
-                  (homeDataDirOverride.empty() ? string() : (" (homeDataDir=" + homeDataDirOverride + ")")));
+                  (homeDataDirOverride.empty() ? string() : (" (homeDataDir=" + homeDataDirOverride + ")")) +
+                  " (vulkanTune=" + vulkanTune + ")");
   return ctx;
 }
 
@@ -2577,7 +2594,7 @@ struct ComputeHandle {
             effectiveDeviceIdx,
             VulkanTuner::makeDecision(
               backend, effectiveDeviceIdx, ctx->homeDataDirOverride,
-              ctx->nnXLen, ctx->nnYLen, maxBatchSize, modelKey)
+              ctx->nnXLen, ctx->nnYLen, maxBatchSize, modelKey, ctx->tunePolicy)
           ).first;
         }
         tuneDecision = it->second;

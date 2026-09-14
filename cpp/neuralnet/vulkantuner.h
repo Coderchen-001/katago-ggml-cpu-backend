@@ -63,6 +63,24 @@ namespace VulkanTuner {
     }
   };
 
+  // The USER-facing mode (cfg `vulkanTune`), resolved by the caller because it owns the
+  // ConfigParser (the shell must not read one).  The dev master switch (env KATAGO_VK_TUNE=0)
+  // is STRONGER and is resolved inside the shell before this is consulted.
+  //
+  //   Auto -- read the cache; on a miss, tune and save (today: nothing to tune yet).
+  //   Off  -- READ-ONLY: read the cache, use a hit, fall back to stock on a miss, never tune,
+  //           never write the cache and never write a negative entry.  IMPORT is still
+  //           honoured, because it is a read.
+  //
+  // ⚠️ Off is NOT a reference arm: it may install tuned rows, so "bit-identical to stock"
+  // acceptance may only ever use KATAGO_VK_TUNE=0.
+  struct TunePolicy {
+    bool off = false;
+    // What the decision line prints: "auto(cfg)" / "off(cfg)".  The env case is silent by
+    // design (the reference arm produces no decision line at all), which the caller documents.
+    std::string modeText = "auto(cfg)";
+  };
+
   // One tune decision, taken at most once per (evaluator, device) and reused by every
   // context on that device (t3-shell-plan.md section 2).  Immutable once built.
   struct Decision {
@@ -94,6 +112,10 @@ namespace VulkanTuner {
     // never silently dropped.
     std::vector<vk_tune_row_spec> rows;
     std::string rowSource;        // "none" / "cache" / "import"
+    // What the decision line prints for "which mode is running" (auto(cfg) / off(cfg)): without
+    // it the log cannot prove which mode was in effect, and "auto" vs "off" is exactly the
+    // difference between "we tried to tune" and "we deliberately did not".
+    std::string tuneModeText = "auto(cfg)";
     // "absent" / "loaded" / "negative" / "rejected"
     std::string cacheState = "absent";
     // Cache-growth accounting (t1-schema.md section 1, "pipeline cache growth"): the
@@ -121,7 +143,8 @@ namespace VulkanTuner {
     int nnXLen,
     int nnYLen,
     int maxBatchSize,
-    const ModelIdentity& model
+    const ModelIdentity& model,
+    const TunePolicy& policy
   );
 
   // Per-context install.  Called once per ComputeHandle, after the backend exists and
