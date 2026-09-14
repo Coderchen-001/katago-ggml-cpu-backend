@@ -283,13 +283,14 @@ struct vk_matmul_pipeline_struct {
     // overwritten by the last device's init on multi-GPU hosts and dispatches
     // with a foreign-device pipeline => garbage output; lesson #42).
     vk_pipeline custom_l, custom_a_l;
-    // Tuned rows for this exact (family, accumulator variant) object.  Empty until
-    // T3 loads them, so today selection behaviour is unchanged.
-    std::vector<vk_tuned_row> tuned_rows;
+    // Tuned rows are NOT stored here (t3-shell-plan.md K3): this object is a device
+    // member, so every context on the device (second model, other board size) would
+    // share one table, while a row carries no outer key.  They live on the backend
+    // context instead -- see ggml_backend_vk_context::tuned_rows.
     // Returns true when all unaligned pipelines are null.
     // We only check for unaligned variants since one of the unaligned pipelines must exist
     // while aligned pipelines are optional
-    // NOTE (T2 close-out, invariant I1): this deliberately ignores tuned_rows, so a
+    // NOTE (T2 close-out, invariant I1): this deliberately ignores tuned rows, so a
     // tuned row must never be installed on an object whose stock buckets are absent
     // -- see ggml_vk_tuned_row_check().  The mmq/q8_1 paths and the mul_mat_id acc
     // selector use is_empty() to decide whether a (family, acc) exists at all (the
@@ -2488,6 +2489,16 @@ struct ggml_backend_vk_context {
     // T2/T3 probe statistics, per context (see vk_t2_stats above for why these are
     // not file statics).
     vk_t2_stats t2;
+
+    // Tuned rows, per context (t3-shell-plan.md K3).  Keyed by the (family, acc)
+    // object the row was validated against, because the selector only receives that
+    // already-acc-specialised object and cannot tell f16acc from f32acc.  Keeping the
+    // table here rather than on the object means one context can never see another
+    // context's rows -- which is what makes the (device, model, S, mb) outer key of
+    // t1-schema.md section 4 hold by construction (one evaluator creates one context,
+    // and every thread-count / board-size / model change rebuilds it).
+    // Installed by ggml_backend_vk_tune_install_rows(); empty in production today.
+    std::map<const vk_matmul_pipeline_struct *, std::vector<vk_tuned_row>> tuned_rows;
 
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
@@ -9463,46 +9474,66 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     return split_k;
 }
 
-// The row that applies to this shape, or nullptr when the object carries none.
-// v1 loads at most one row per (family, acc) and key_m == 0 means "whole slot";
-// the multi-row version matches on the exact (m, k) key.
-static const vk_tuned_row * ggml_vk_tuned_row_for(const vk_matmul_pipeline & mmp, uint32_t m, uint32_t k) {
-    for (const vk_tuned_row & row : mmp->tuned_rows) {
-        if (row.key_m == 0 || (row.key_m == m && row.key_k == k)) {
+// The pure matching rule, shared by the lookup and the self-test so the sentinel
+// semantics cannot drift from what is tested:
+//   key_m == 0        -> whole-slot row, applies to every shape of this (family, acc)
+//   k == 0            -> the caller does not know k, so NO keyed row may match
+//                        (falling back to stock beats matching with a wrong key)
+//   otherwise         -> exact (m, k) match
+static bool ggml_vk_tuned_row_matches(const vk_tuned_row & row, uint32_t m, uint32_t k) {
+    if (row.key_m == 0) {
+        return true;
+    }
+    if (k == 0) {
+        return false;
+    }
+    return row.key_m == m && row.key_k == k;
+}
+
+// The row that applies to this shape in this context, or nullptr when there is none.
+// v1 installs at most one row per (family, acc) with key_m == 0 ("whole slot"); the
+// multi-row version matches on the exact (m, k) key.
+static const vk_tuned_row * ggml_vk_tuned_row_for(ggml_backend_vk_context * ctx, const vk_matmul_pipeline & mmp, uint32_t m, uint32_t k) {
+    auto it = ctx->tuned_rows.find(mmp.get());
+    if (it == ctx->tuned_rows.end()) {
+        return nullptr;
+    }
+    for (const vk_tuned_row & row : it->second) {
+        if (ggml_vk_tuned_row_matches(row, m, k)) {
             return &row;
         }
     }
     return nullptr;
 }
 
-// T3 skeleton note: report when a tuned row applies to this (family, acc) object.
-// Until T3 loads rows this never fires, so selection behaviour is unchanged; it
-// exists so the T4 injection chain can be observed on a device.
-static void ggml_vk_t2_log_tuned_row(ggml_backend_vk_context * ctx, const vk_matmul_pipeline & mmp, uint32_t m, uint32_t n, const char * chain) {
-    const vk_tuned_row * row = vk_t2_on(8u) ? ggml_vk_tuned_row_for(mmp, m, n) : nullptr;
+// Report when a tuned row applies to this (family, acc) for this shape.  Diagnostics
+// only (bit 8); the row itself is applied by ggml_vk_guess_matmul_pipeline.
+static void ggml_vk_t2_log_tuned_row(ggml_backend_vk_context * ctx, const vk_matmul_pipeline & mmp, uint32_t m, uint32_t n, uint32_t k, const char * chain) {
+    const vk_tuned_row * row = vk_t2_on(8u) ? ggml_vk_tuned_row_for(ctx, mmp, m, k) : nullptr;
     if (row == nullptr || row->unaligned == nullptr) {
         return;
     }
-    // One-shot per distinct (chain, pipeline, m, n).  This runs on every matmul
+    // One-shot per distinct (chain, pipeline, m, n, k).  This runs on every matmul
     // dispatch, and an unconditional print measured +1.7 ms/batch (+24%) on the
     // 5080 b10c384 smoke run -- that would poison the very timings T2 collects,
     // so the log must stay off the per-dispatch path.  The cap only guards
     // against a pathological shape space flooding stderr.
     const std::string key = std::string(chain) + "|" + row->unaligned->name
-                          + "|m=" + std::to_string(m) + "|n=" + std::to_string(n);
+                          + "|m=" + std::to_string(m) + "|n=" + std::to_string(n)
+                          + "|k=" + std::to_string(k);
     if (ctx->t2.tuned_logged.find(key) != ctx->t2.tuned_logged.end()) {
         return;
     }
     if (ctx->t2.tuned_logged.size() >= 64) {
         if (!ctx->t2.tuned_log_capped) {
             ctx->t2.tuned_log_capped = true;
-            std::cerr << "ggml_vulkan: [T2] tuned row hit: further distinct (name,m,n) suppressed (cap 64)" << std::endl;
+            std::cerr << "ggml_vulkan: [T2] tuned row hit: further distinct (name,m,n,k) suppressed (cap 64)" << std::endl;
         }
         return;
     }
     ctx->t2.tuned_logged[key] = true;
     std::cerr << "ggml_vulkan: [T2] tuned row hit (" << chain << "): name=" << row->unaligned->name
-              << " m=" << m << " n=" << n << " (NOT applied yet)" << std::endl;
+              << " m=" << m << " n=" << n << " k=" << k << " (applied)" << std::endl;
 }
 
 // Invariants a tuned row must satisfy before it is installed (T2 close-out item 1,
@@ -9553,12 +9584,28 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
         family_name = "bf16";
     }
 
+    // Row matching rule (t3-shell-plan.md K1, sentinel semantics).  Pure function on
+    // local rows: no ctx state is touched, so this cannot influence selection.
+    vk_tuned_row whole_slot;                    // key_m == 0: applies to every shape
+    vk_tuned_row keyed;                         // exact (m, k) == (192, 384)
+    keyed.key_m = 192;
+    keyed.key_k = 384;
+    const bool match_whole_any   = ggml_vk_tuned_row_matches(whole_slot, 512, 192);
+    const bool match_keyed_exact = ggml_vk_tuned_row_matches(keyed, 192, 384);
+    const bool match_keyed_m     = ggml_vk_tuned_row_matches(keyed, 512, 384);
+    const bool match_keyed_k0    = ggml_vk_tuned_row_matches(keyed, 192, 0);   // must be false
+    const bool sentinel_ok = match_whole_any && match_keyed_exact && !match_keyed_m && !match_keyed_k0;
+
     std::cerr << "ggml_vulkan: [T2] tuned-row validator self-test: I1(no stock)="
               << (reason_empty != nullptr ? "rejected" : "ACCEPTED (BUG)")
               << " [" << (reason_empty ? reason_empty : "-") << "]"
               << ", I2(wrong family " << family_name << ")="
               << (reason_mismatch != nullptr ? "rejected" : "not exercised")
-              << " [" << (reason_mismatch ? reason_mismatch : "-") << "]" << std::endl;
+              << " [" << (reason_mismatch ? reason_mismatch : "-") << "]"
+              << ", K1 sentinel(whole-slot hit, exact hit, m-mismatch miss, k==0 miss)="
+              << (sentinel_ok ? "ok" : "FAILED")
+              << " [" << (int) match_whole_any << (int) match_keyed_exact
+              << (int) match_keyed_m << (int) match_keyed_k0 << "]" << std::endl;
 }
 
 // T3 step 0 (2026-09-13): the KATAGO_VK_T2_TUNED_FAKE hook was deleted here.
@@ -9567,8 +9614,30 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
 // from a test env var -- i.e. a fabricated-evidence source.  A fake tuned row is
 // never legitimate now: rows come from the tuner (or nothing at all).
 
-static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
-    VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
+static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, uint32_t k, bool aligned, ggml_type src0_type, ggml_type src1_type) {
+    VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << k << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
+
+    // T4 row routing (t3-shell-plan.md K1): a tuned row replaces the l/m/s heuristic
+    // for this (family, acc).  It is resolved HERE, before the cm2 / scalar split, so
+    // the align probe (which calls back with aligned=true) and the real call resolve
+    // through the same code with the same (m, n, k).  That is what keeps kpad/aligned
+    // and the dispatched pipeline consistent: if the row lookup applied on only one of
+    // the two calls, the padding would be computed from stock while the dispatch used
+    // the tuned pipeline -- a correctness bug, not a performance one.
+    // k == 0 means "caller does not know k" and matches only whole-slot rows (see
+    // ggml_vk_tuned_row_matches), so an un-keyed call can never pick a keyed row.
+    {
+        const vk_tuned_row * row = ggml_vk_tuned_row_for(ctx, mmp, m, k);
+        if (row != nullptr && (row->unaligned != nullptr || row->aligned != nullptr)) {
+            ggml_vk_t2_log_tuned_row(ctx, mmp, m, n, k, "row");
+            const vk_pipeline picked = aligned ? (row->aligned != nullptr ? row->aligned : row->unaligned)
+                                               : (row->unaligned != nullptr ? row->unaligned : row->aligned);
+            if (picked != nullptr) {
+                return picked;
+            }
+        }
+    }
+
     // The q8_1 (integer dot) mmq path uses a different shader with its own
     // shared-memory layout, so use the int-specific availability flags.
     const bool is_q8_1 = (src1_type == GGML_TYPE_Q8_1);
@@ -9577,7 +9646,6 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     const bool mm_s = is_q8_1 ? ctx->device->mul_mat_s_int[src0_type] : ctx->device->mul_mat_s[src0_type];
 
     if (ctx->device->coopmat2) {
-        ggml_vk_t2_log_tuned_row(ctx, mmp, m, n, "cm2");
         const uint32_t shader_core_count = ctx->device->shader_core_count;
         const uint32_t tiles_l = CEIL_DIV(m, mmp->a_l->wg_denoms[0]) * CEIL_DIV(n, mmp->a_l->wg_denoms[1]);
         const uint32_t tiles_m = CEIL_DIV(m, mmp->a_m->wg_denoms[0]) * CEIL_DIV(n, mmp->a_m->wg_denoms[1]);
@@ -9620,7 +9688,6 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     // unset) preserves the default heuristic exactly (bit-identical). Placed
     // inside this function so ggml_vk_guess_matmul_pipeline_align (which calls
     // back with aligned=true) computes kpad from the same forced tile.
-    ggml_vk_t2_log_tuned_row(ctx, mmp, m, n, "scalar");
     const char * mm_tile_env = getenv("KATAGO_VK_MM_TILE");
     if (mm_tile_env != nullptr) {
         if (strcmp(mm_tile_env, "l") == 0 && mm_l) {
@@ -9665,9 +9732,9 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     return aligned ? mmp->a_l : mmp->l;
 }
 
-static uint32_t ggml_vk_guess_matmul_pipeline_align(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, int m, int n, ggml_type src0_type, ggml_type src1_type) {
+static uint32_t ggml_vk_guess_matmul_pipeline_align(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, int m, int n, int k, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline_align(" << m << ", " << n << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
-    return ggml_vk_guess_matmul_pipeline(ctx, mmp, m, n, true, src0_type, src1_type)->align;
+    return ggml_vk_guess_matmul_pipeline(ctx, mmp, (uint32_t)m, (uint32_t)n, (uint32_t)k, true, src0_type, src1_type)->align;
 }
 
 // T2 bit 4: dump the matmul pipeline histogram.  Only prints when something new
@@ -10128,10 +10195,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, ne10, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, ne10, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
