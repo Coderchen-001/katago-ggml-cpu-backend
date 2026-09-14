@@ -339,6 +339,62 @@ namespace VulkanTuner {
       return d.negative && negativeReasonKnown(d.negativeReason);
     }
 
+    // The CLOSED SET of decision outcomes and whether each one may be REMEMBERED (step "3-4").
+    //
+    // Why a table and not a bool: the rule is "a measurement-level failure is never written", and
+    // the failure modes are not interchangeable -- a timeout, an IO error, a lost device and a run
+    // with no winner all mean "this attempt did not produce an answer", while a structural
+    // all-reject means "there is no answer to produce" and a completed measurement means "here is
+    // the answer".  Only those last two may be written, and they are different KINDS of writable
+    // (a row set vs a NEGATIVE entry), which is why the class is declared as well -- the class is
+    // what section 6.4's rule table names, and what step 4/5 will branch on.
+    //
+    // Class (b) (every candidate rejected by the validation gate) is declared NOT writable and
+    // stays that way until the gate / tau / soft-gate parameters enter policyFingerprint, or
+    // changing a gate parameter would leave the key permanently skipped (section 6.4 items 1/5 --
+    // the same argument R17 makes for the file's reason).
+    //
+    // The lookup is FAIL-CLOSED (see outcomeWritable): an outcome this build does not know is not
+    // writable, so a caller that invents a state cannot write by accident.
+    struct DecisionOutcomeSpec {
+      const char* outcome;
+      const char* klass;       // "structural" / "completed" / "gate" / "measurement"
+      bool writable;
+    };
+    const DecisionOutcomeSpec DECISION_OUTCOMES[] = {
+      { "structural-all-reject", "structural",  true  },
+      { "measured",              "completed",   true  },
+      { "gate-reject",           "gate",        false },
+      { "running",               "measurement", false },
+      { "timeout",               "measurement", false },
+      { "io-error",              "measurement", false },
+      { "device-lost",           "measurement", false },
+      { "no-winner",             "measurement", false },
+    };
+
+    bool outcomeWritable(const Decision & d) {
+      for (const DecisionOutcomeSpec & o : DECISION_OUTCOMES) {
+        if (d.outcome == o.outcome) {
+          return o.writable;
+        }
+      }
+      return false;
+    }
+
+    // The probe face belongs to the backend (KATAGO_VK_T2_PROBE, bit 8 = the tuned-row surface,
+    // which includes its validator self-test).  The shell reads the SAME variable with the SAME
+    // grammar -- `all` or a base-10 bitmask, see vk_t2_probe's comment -- so one env asks both
+    // sides for their self-checks.  Never reached under KATAGO_VK_TUNE=0: makeDecision returns
+    // before this (and the backend suppresses its probes there for the same reason).
+    bool t2ProbeBit8() {
+      const char* v = getenv("KATAGO_VK_T2_PROBE");
+      if (v == nullptr || v[0] == '\0') {
+        return false;
+      }
+      const unsigned long bits = (strcmp(v, "all") == 0) ? 0xFul : strtoul(v, nullptr, 10);
+      return (bits & 8ul) != 0;
+    }
+
     // The policy fingerprint (t1-schema.md section 4): build revision + policy version + the
     // policy-relevant env knobs.  Deliberately assembled HERE rather than asked of the
     // backend, because the interface is capped at four functions (R1) and none of these facts
@@ -899,6 +955,16 @@ namespace VulkanTuner {
       err = "the cache is read-only in this mode";
       return false;
     }
+    if (!outcomeWritable(d)) {
+      // THE state gate (step 3-4).  "We ran out of time" must never be remembered as "this device
+      // cannot be tuned", and neither must a lost device, an IO failure or a run with no winner:
+      // those describe THIS attempt, and a cache file describes the DEVICE.  Only a completed
+      // measurement or a structural all-reject gets past here (see DECISION_OUTCOMES), and an
+      // outcome nobody declared is refused too (fail-closed).
+      err = "the decision is not in a writable state ('" + d.outcome + "'): only a completed "
+            "measurement or a structural all-reject may be remembered";
+      return false;
+    }
     if (!cacheEntryWritable(d)) {
       err = "nothing to write: no rows and no negative entry (a file that says neither would "
             "load as 'this key is already decided')";
@@ -912,6 +978,114 @@ namespace VulkanTuner {
       err = string("the cache entry was refused: ") + e.what();
       return false;
     }
+  }
+
+  // Exercise the outcome table and the write gates THROUGH the real function, once per process,
+  // under probe bit 8.
+  //
+  // Why this exists (2026-09-13 review of step 3-4): "a measurement-level failure is never
+  // written" has no non-vacuous executor at this step -- the cache write path has no caller and
+  // there is no measurement loop yet, so an end-to-end leg asserting "no file was created" would
+  // pass because nothing ever ATTEMPTS a write, not because the rule works (the vacuous judgement
+  // section 9.2 keeps catching).  This calls the real writer with a real Decision for every
+  // declared outcome and requires exactly the declared verdict:
+  //   * an unwritable outcome must be refused by the write path itself, with a write-allowed
+  //     policy (so the refusal comes from the state gate, not from the mode);
+  //   * a writable outcome must pass the STATE gate and be stopped only by the read-only policy --
+  //     the positive direction is therefore checked without ever writing a file that no real
+  //     verdict produced (the real positive leg belongs to step 4).
+  // Then it requires that nothing appeared at the probe path.  The four E2E legs that cannot be
+  // written yet (timeout / io-error / device-lost / no-winner) are registered for step 5 WITH a
+  // mandatory precondition: prove the failure happened first, then assert the file was not created.
+  void cacheWriteSelfTest(const TunePolicy & policy, const string & cacheDir) {
+    TunePolicy readOnly = policy;
+    readOnly.off = true;
+    const string probePath = cacheDir + "/self-test-must-not-exist.txt";
+    int declared = 0, refused = 0, allowed = 0;
+    bool ok = true;
+    string firstBad;
+    for (const DecisionOutcomeSpec & o : DECISION_OUTCOMES) {
+      Decision d;
+      d.outcome = o.outcome;
+      d.cachePath = probePath;
+      d.nnXLen = 19;
+      d.nnYLen = 19;
+      d.maxBatchSize = 8;
+      d.fingerprint = "self-test";
+      d.policyFingerprint = "self-test";
+      d.baselineVersion = "1";
+      d.modelIdentity = "self-test";
+      if (o.writable && string(o.klass) == "structural") {
+        // The one writable shape that says something without rows.
+        d.negative = true;
+        d.negativeReason = "no-injection-slot";
+      }
+      else if (o.writable && string(o.klass) == "completed") {
+        // The rows-file shape: one legal row, so the CONTENT gate passes and only the state gate
+        // is left to check.  The geometry is the one the smoke's A3 leg proves legal, and the
+        // verdict below re-checks it against the rule table -- a self-test whose own fixture went
+        // illegal would otherwise test nothing while looking green.
+        vk_tune_row_spec r {};
+        r.path = VK_TILE_PATH_SCALAR;
+        r.src0_type = 1;
+        r.src1_type = 0;
+        r.key_m = 0;
+        r.key_k = 0;
+        r.geom.BM = 64;
+        r.geom.BN = 64;
+        r.geom.BK = 0;
+        r.geom.WM = 32;
+        r.geom.WN = 32;
+        r.geom.WMITER = 1;
+        r.geom.TM = 4;
+        r.geom.TN = 4;
+        r.geom.BS = 128;
+        r.geom.pad = -1;
+        r.geom.reshape = -1;
+        r.geom.smaller = -1;
+        d.rows.push_back(r);
+      }
+      string err;
+      bool verdict = false;
+      const bool stateOk = (outcomeWritable(d) == o.writable);   // the table agrees with itself
+      const bool fixtureOk = d.rows.empty()
+                          || vk_tile_candidate_reason(d.rows[0].path, d.rows[0].geom) == nullptr;
+      if (!o.writable) {
+        // The STATE gate itself must refuse, and the error string must name it -- with a
+        // write-ALLOWED policy, so the mode cannot be the thing that refused, and with the string
+        // checked so the CONTENT gate (which would also refuse `gate-reject`) cannot be mistaken
+        // for the state gate.
+        const bool wrote = writeCacheIfAllowed(d, policy, err);
+        verdict = !wrote && err.find("not in a writable state") != string::npos;
+        refused++;
+      }
+      else {
+        // A writable outcome must get PAST the state gate: with a read-only policy the refusal has
+        // to come from the permission gate, which its message names.  Written this way the
+        // positive direction is checked without ever writing a file that no real verdict produced
+        // (the first version of this test called the writer with a write-allowed policy here and
+        // dutifully created the probe file -- found by the test itself, which is the point).
+        string err2;
+        const bool wroteReadOnly = writeCacheIfAllowed(d, readOnly, err2);
+        verdict = !wroteReadOnly && err2.find("read-only") != string::npos
+               && cacheEntryWritable(d);
+        allowed++;
+      }
+      declared++;
+      if (!verdict || !stateOk || !fixtureOk) {
+        ok = false;
+        if (firstBad.empty()) {
+          firstBad = string(o.outcome)
+                   + (!fixtureOk ? " has an ILLEGAL self-test fixture" : " was not refused as declared");
+        }
+      }
+    }
+    const bool absent = !FileUtils::exists(probePath);
+    logLine("cache write self-test: " + to_string(declared) + " outcome(s) declared, "
+            + to_string(refused) + " refused by the state gate, " + to_string(allowed)
+            + " state-writable; probe file " + (absent ? "absent" : "PRESENT") + " ["
+            + ((ok && absent) ? "ok" : "FAIL") + "]"
+            + (ok ? "" : " first problem: " + firstBad));
   }
 
   shared_ptr<Decision> makeDecision(
@@ -992,6 +1166,18 @@ namespace VulkanTuner {
       d->cachePath = d->cacheDir + "/" + d->deviceFile;
       d->cacheFileExists = FileUtils::exists(d->cachePath);
       d->hasPipelineCacheBytes = pipelineCacheBytesBefore(d->pipelineCacheBytesBefore);
+
+      // Step 3-4's self-check, once per process, under the backend's probe bit 8.  It runs HERE
+      // because it needs a real cache directory (to prove nothing was written into it) and the
+      // resolved policy; it is deliberately before the load decides anything, so its line always
+      // precedes the decision line in the log (order is what makes a two-line story readable).
+      if (t2ProbeBit8()) {
+        static std::atomic<bool> selfTested {false};
+        bool expected = false;
+        if (selfTested.compare_exchange_strong(expected, true)) {
+          cacheWriteSelfTest(policy, d->cacheDir);
+        }
+      }
 
       // One loader for both channels: an import is just a cache file that lives somewhere
       // else and is keyed by the operator instead of by the device.  Sharing it is what

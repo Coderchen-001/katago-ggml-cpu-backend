@@ -95,6 +95,13 @@ namespace VulkanTuner {
     // a different model, board size or max batch, and none of those may share a row set.
     std::string modelIdentity;    // header form (mv…-sha…-name…)
     bool negative = false;        // this key's row set is a "deterministically all-rejected" marker
+    // HOW THIS DECISION WAS REACHED, as one string from the closed set in vulkantuner.cpp
+    // (step "3-4").  The default is NOT writable, deliberately: a decision nobody gave an outcome
+    // to has by definition not finished, and the failure this field exists to prevent is
+    // remembering a timeout / an IO error / a lost device / a run with no winner as if it were a
+    // property of the device ("we ran out of time" must never become "this device cannot be
+    // tuned").  Only a COMPLETED measurement or a STRUCTURAL all-reject may be written.
+    std::string outcome = "running";
     // Why the reason is a CLOSED SET and not free text (t3-shell-plan.md section 6.4 item 2): a
     // NEGATIVE entry is a claim that OUTLIVES the process -- it suppresses tuning until something
     // invalidates it -- so it has to be mechanically comparable, and a file carrying a reason this
