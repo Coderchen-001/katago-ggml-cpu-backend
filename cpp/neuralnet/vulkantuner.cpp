@@ -8,6 +8,7 @@
 #include "../dataio/homedata.h"
 
 #include <chrono>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -20,6 +21,7 @@
 // windows.h and its macro hazards) on Windows, fsync elsewhere.
 #if defined(_WIN32)
 #include <io.h>
+#include <process.h>
 #include <stdio.h>
 #else
 #include <stdio.h>
@@ -57,6 +59,13 @@ namespace VulkanTuner {
     // today's meaning (t1-schema.md section 1, "VERSION").
     const int SCHEMA_VERSION = 1;
     const int TUNER_VERSION = 1;
+
+    // Row-count cap.  ONE constant used by BOTH the writer and the parser (a cap that only
+    // one side enforces is a cap that produces files the other side rejects): a file with
+    // more rows than this is refused on read and never produced on write.  v1 is one row
+    // per (family, acc), so 64 is room for the multi-row version many times over -- the
+    // point of the number is to bound what a corrupt or hostile file can make us allocate.
+    const size_t MAX_ROWS_PER_FILE = 64;
 
     // KATAGO_VK_TUNE: unset or anything other than "0" = enabled.  "0" is the reference
     // configuration and must stay bit-identical to stock, which is why every entry point
@@ -150,7 +159,20 @@ namespace VulkanTuner {
     // acceptable here because the file is a CACHE -- losing it costs one re-tune, which is
     // the same fail-open path as a missing file.
     bool writeFileAtomic(const string& path, const string& content, string& err) {
-      const string tmp = path + ".tmp";
+      // The tmp name carries the pid and a per-process sequence.  Without them two
+      // processes writing the same target would share one tmp name, and A's rename could
+      // publish B's bytes as A's result (the in-file outer key would then refuse it, but a
+      // refusal caused by a race is a bug that should not exist).  The shell deliberately
+      // does NOT use the backend's ctx ordinal here: that identity is backend-owned (R7)
+      // and the shell must not invent a second numbering.
+      static std::atomic<uint32_t> tmp_seq {0};
+#if defined(_WIN32)
+      const long pid = (long) _getpid();
+#else
+      const long pid = (long) getpid();
+#endif
+      const string tmp = path + ".tmp." + std::to_string(pid) + "."
+                       + std::to_string(tmp_seq.fetch_add(1u));
       FILE* f = nullptr;
 #if defined(_WIN32)
       fopen_s(&f, tmp.c_str(), "wb");
@@ -306,6 +328,11 @@ namespace VulkanTuner {
           out.negativeReason = line.substr(9);
         }
         else if (line.compare(0, 4, "ROW ") == 0) {
+          if (out.rows.size() >= MAX_ROWS_PER_FILE) {
+            err = "line " + to_string(lineNo) + ": more than " + to_string(MAX_ROWS_PER_FILE)
+                  + " ROW lines (the cap the writer also enforces)";
+            return false;
+          }
           vk_tune_row_spec row;
           if (!parseRowLine(line.substr(4), lineNo, row, err)) {
             return false;
@@ -342,6 +369,13 @@ namespace VulkanTuner {
       os << "MODEL " << d.modelIdentity << "\n";
       os << "BOARD " << d.nnXLen << "x" << d.nnYLen << "\n";
       os << "MAXBATCH " << d.maxBatchSize << "\n";
+      // The writer enforces the SAME cap the parser does (MAX_ROWS_PER_FILE).  Refusing to
+      // write an over-cap set is the only honest option: writing it would produce a file
+      // that the reader then rejects, i.e. a cache that silently never loads.
+      if (d.rows.size() > MAX_ROWS_PER_FILE) {
+        throw StringError("VulkanTuner: refusing to write more than "
+                          + std::to_string(MAX_ROWS_PER_FILE) + " rows");
+      }
       os << "ROWS " << d.rows.size() << "\n";
       for (const vk_tune_row_spec& r : d.rows) {
         os << "ROW " << r.path << " " << r.src0_type << " " << r.src1_type
