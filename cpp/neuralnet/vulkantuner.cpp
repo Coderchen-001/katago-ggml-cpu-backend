@@ -23,6 +23,14 @@ namespace VulkanTuner {
 
     const char* const LOG_PREFIX = "KataGoVulkanTuner: [T3] ";
 
+    // ONE write per line, like the backend's ggml_vk_t3_line(): NN server threads share
+    // stderr, and a line assembled from several << calls can be split by another thread in
+    // the middle of its own prefix -- the line is then in the log but no grep finds it.
+    // `LOG_PREFIX` is used HERE and nowhere else, which is what makes that checkable.
+    void logLine(const string& msg) {
+      cerr << (string(LOG_PREFIX) + msg) << endl;
+    }
+
     // Schema version of anything this file reads or writes.  Bump it when the MEANING of
     // a field changes: a cache written by an older tuner must not be read as if it had
     // today's meaning (t1-schema.md section 1, "VERSION").
@@ -108,7 +116,7 @@ namespace VulkanTuner {
 
     string formatDecisionLine(const Decision& d, int nnXLen, int nnYLen, int maxBatchSize) {
       ostringstream os;
-      os << LOG_PREFIX << "decision"
+      os << "decision"
          << " device=" << d.deviceName
          << " deviceIdx=" << d.deviceIdx
          << " S=" << nnXLen << "x" << nnYLen
@@ -156,9 +164,9 @@ namespace VulkanTuner {
       // dropped in silence -- "I set the env var and nothing happened" is the trap this
       // warning exists for (lesson #46).
       if (importEnv != nullptr && importEnv[0] != '\0') {
-        cerr << LOG_PREFIX << "WARNING: KATAGO_VK_TUNE_IMPORT=" << importEnv
-             << " was requested but KATAGO_VK_TUNE=0 disables the tuner; nothing was imported"
-             << " and no tuned row will be used (reference run stays clean)" << endl;
+        logLine(string("WARNING: KATAGO_VK_TUNE_IMPORT=") + importEnv
+                + " was requested but KATAGO_VK_TUNE=0 disables the tuner; nothing was imported"
+                  " and no tuned row will be used (reference run stays clean)");
       }
       return nullptr;
     }
@@ -171,8 +179,8 @@ namespace VulkanTuner {
       char fp[512];
       const size_t fpLen = backendFingerprint(backend, fp, sizeof(fp));
       if (fpLen == 0) {
-        cerr << LOG_PREFIX << "WARNING: the backend could not describe the device; the tuner is"
-             << " disabled for device " << deviceIdx << " (fail-open: no tuned rows)" << endl;
+        logLine("WARNING: the backend could not describe the device; the tuner is disabled for device "
+                + to_string(deviceIdx) + " (fail-open: no tuned rows)");
         return nullptr;
       }
       d->fingerprint = string(fp, fpLen);
@@ -198,29 +206,27 @@ namespace VulkanTuner {
         ImportHeader hdr;
         string err;
         if (!readImportHeader(importEnv, hdr, err)) {
-          cerr << LOG_PREFIX << "WARNING: KATAGO_VK_TUNE_IMPORT refused: " << err
-               << " (fail-open: no tuned rows)" << endl;
+          logLine("WARNING: KATAGO_VK_TUNE_IMPORT refused: " + err + " (fail-open: no tuned rows)");
           return nullptr;
         }
         if (!hdr.foundFingerprint) {
-          cerr << LOG_PREFIX << "WARNING: KATAGO_VK_TUNE_IMPORT refused: " << importEnv
-               << " has no FINGERPRINT header (fail-open: no tuned rows)" << endl;
+          logLine(string("WARNING: KATAGO_VK_TUNE_IMPORT refused: ") + importEnv
+                  + " has no FINGERPRINT header (fail-open: no tuned rows)");
           return nullptr;
         }
         if (hdr.fingerprint != d->fingerprint) {
           // Section 2.1: an import is accepted only for the SAME fingerprint.  Merging
           // across devices is how a tuned row for a 5080 ends up on a 1660.
-          cerr << LOG_PREFIX << "WARNING: KATAGO_VK_TUNE_IMPORT refused: fingerprint mismatch"
-               << " (file=" << hdr.fingerprint << " current=" << d->fingerprint
-               << "; fail-open: no tuned rows)" << endl;
+          logLine("WARNING: KATAGO_VK_TUNE_IMPORT refused: fingerprint mismatch (file="
+                  + hdr.fingerprint + " current=" + d->fingerprint + "; fail-open: no tuned rows)");
           return nullptr;
         }
         if (hdr.foundVersion && hdr.version != TUNER_VERSION) {
           // The fingerprint matching is not enough: the same device read by a different
           // tuner may mean something different by the same bytes.
-          cerr << LOG_PREFIX << "WARNING: KATAGO_VK_TUNE_IMPORT refused: file VERSION=" << hdr.version
-               << " but this tuner speaks VERSION=" << TUNER_VERSION
-               << " (fail-open: no tuned rows)" << endl;
+          logLine("WARNING: KATAGO_VK_TUNE_IMPORT refused: file VERSION=" + to_string(hdr.version)
+                  + " but this tuner speaks VERSION=" + to_string(TUNER_VERSION)
+                  + " (fail-open: no tuned rows)");
           return nullptr;
         }
         d->imported = true;
@@ -238,14 +244,14 @@ namespace VulkanTuner {
       // in step 2 and must produce rows through the same legality table (section 1.7).
       d->rowCount = 0;
       d->tuneMs = chrono::duration<double, milli>(chrono::steady_clock::now() - t0).count();
-      cerr << formatDecisionLine(*d, nnXLen, nnYLen, maxBatchSize) << endl;
+      logLine(formatDecisionLine(*d, nnXLen, nnYLen, maxBatchSize));
       return d;
     }
     catch (const std::exception& e) {
       // Section 3: fail open and loud.  A tuner that can take down a search is worse than
       // no tuner at all.
-      cerr << LOG_PREFIX << "WARNING: the tuner failed for device " << deviceIdx << ": " << e.what()
-           << " (fail-open: no tuned rows)" << endl;
+      logLine("WARNING: the tuner failed for device " + to_string(deviceIdx) + ": " + e.what()
+              + " (fail-open: no tuned rows)");
       return nullptr;
     }
   }
@@ -259,8 +265,8 @@ namespace VulkanTuner {
     const vk_tune_row_spec* rows = nullptr;
     string err;
     if (!backendInstallRows(backend, rows, decision->rowCount, err)) {
-      cerr << LOG_PREFIX << "WARNING: install failed for " << decision->deviceName << ": " << err
-           << " (fail-open: this context uses the stock heuristic)" << endl;
+      logLine("WARNING: install failed for " + decision->deviceName + ": " + err
+              + " (fail-open: this context uses the stock heuristic)");
     }
   }
 

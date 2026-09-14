@@ -2703,6 +2703,29 @@ static std::string ggml_vk_tune_ctx_tag(const ggml_backend_vk_context * ctx) {
     return "ctx=" + std::to_string(ctx->tune_ctx_ordinal) + " device=" + ctx->device->name;
 }
 
+// ONE write per evidence line, on ONE stream (std::cerr).  Two measured reasons:
+//   (a) GGML_LOG_* goes through ggml's log callback, which an embedder may replace or
+//       level-filter -- an evidence line that can be routed away from stderr is one the
+//       harness will eventually fail to see;
+//   (b) two NN server threads share stderr, and a line assembled from several << calls
+//       can be split by the other thread IN THE MIDDLE OF ITS OWN PREFIX.  Measured in
+//       this cut: both install lines were written, but "ggml_vulkan: [T3] install (ctx=1"
+//       never appears contiguously in the file (the 2-thread run counted 2 for a pattern
+//       that matched by luck and 1 for the prefix-anchored one).  The line is in the log
+//       and no grep can find it -- worse than a missing line, because it looks like the
+//       code did not run.
+// Building the whole line first and writing it with a single << fixes (b) for practical
+// purposes; the guardrail (R10) forbids "[T3]" appearing anywhere else in this file.
+static void ggml_vk_t3_line(const std::string & msg) {
+    std::cerr << ("ggml_vulkan: [T3] " + msg) << std::endl;
+}
+
+// The two [T2] lifecycle markers the 1b acceptance reads POSITIONALLY (section 6.1 items
+// 10/13).  Same single-write rule, for the same reason: these are evidence.
+static void ggml_vk_t2_marker(const std::string & msg) {
+    std::cerr << ("ggml_vulkan: [T2] " + msg) << std::endl;
+}
+
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
 
 static uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
@@ -9874,8 +9897,8 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         // of an inference.  Printed from the production path only (the self-test uses a
         // local table), and only when the table is still open.
         if (vk_t2_on(8u) && !ctx->tuned.frozen) {
-            std::cerr << "ggml_vulkan: [T2] tuned rows frozen by first lookup (" << ggml_vk_tune_ctx_tag(ctx)
-                      << ", target families=" << ctx->tuned.rows.size() << ")" << std::endl;
+            ggml_vk_t2_marker("tuned rows frozen by first lookup (" + ggml_vk_tune_ctx_tag(ctx)
+                              + ", target families=" + std::to_string(ctx->tuned.rows.size()) + ")");
         }
         const vk_tuned_row * row = ggml_vk_tuned_row_for(ctx, mmp, m, k);
         if (row != nullptr) {
@@ -10008,8 +10031,8 @@ static void ggml_vk_t2_dump_slot_histogram(ggml_backend_vk_context * ctx) {
         return;
     }
     ctx->t2.slot_dumped = ctx->t2.slot_total;
-    std::cerr << "ggml_vulkan: [T2] matmul pipeline histogram (" << ggml_vk_tune_ctx_tag(ctx)
-              << ", cumulative, dispatches=" << ctx->t2.slot_total << "):" << std::endl;
+    ggml_vk_t2_marker("matmul pipeline histogram (" + ggml_vk_tune_ctx_tag(ctx)
+                      + ", cumulative, dispatches=" + std::to_string(ctx->t2.slot_total) + "):");
     for (const auto & kv : ctx->t2.slot_histogram) {
         std::cerr << "ggml_vulkan: [T2]   " << kv.first << " x " << kv.second << std::endl;
     }
@@ -19072,9 +19095,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // bit-8 gated, like the other surface diagnostics.
             if (vk_t2_on(8u) && !ctx->t2.pr_recording_logged) {
                 ctx->t2.pr_recording_logged = true;
-                std::cerr << "ggml_vulkan: [T2] pr_recording first set (" << ggml_vk_tune_ctx_tag(ctx)
-                          << ", eval=" << ctx->pr_evals << ", tuned_rows_frozen="
-                          << (ctx->tuned.frozen ? 1 : 0) << ")" << std::endl;
+                ggml_vk_t2_marker("pr_recording first set (" + ggml_vk_tune_ctx_tag(ctx)
+                                  + ", eval=" + std::to_string(ctx->pr_evals) + ", tuned_rows_frozen="
+                                  + (ctx->tuned.frozen ? "1" : "0") + ")");
             }
         }
     }
@@ -20088,17 +20111,11 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
         }
     };
     const auto refuse = [&](const std::string & msg) {
-        // std::cerr, not GGML_LOG_ERROR: EVERY [T3] line is on stderr so the whole
-        // install/refuse series is one stream.  GGML_LOG_* goes through ggml's log
-        // callback, which an embedder may replace or level-filter -- an evidence line
-        // that can be routed away from stderr is an evidence line the harness will
-        // eventually fail to see (that mistake was already made once while building
-        // this cut's smoke script).  The T2 probe series made the same choice.
-        std::cerr << "ggml_vulkan: [T3] install refused ("
-                  << (backend != nullptr && ggml_backend_is_vk(backend)
-                        ? ggml_vk_tune_ctx_tag((ggml_backend_vk_context *)backend->context)
-                        : std::string("no vulkan context"))
-                  << "): " << msg << std::endl;
+        ggml_vk_t3_line("install refused ("
+                        + (backend != nullptr && ggml_backend_is_vk(backend)
+                             ? ggml_vk_tune_ctx_tag((ggml_backend_vk_context *)backend->context)
+                             : std::string("no vulkan context"))
+                        + "): " + msg);
         set_err(msg);
         return false;
     };
@@ -20132,8 +20149,8 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
 
     // Empty set: nothing to write, and deliberately no write -- the freeze still happens
     // on the first lookup, which is what keeps the install/freeze ordering evidence real.
-    std::cerr << "ggml_vulkan: [T3] install (" << ggml_vk_tune_ctx_tag(ctx)
-              << "): 0 rows (empty set is the 1b-2b production form)" << std::endl;
+    ggml_vk_t3_line("install (" + ggml_vk_tune_ctx_tag(ctx)
+                    + "): 0 rows (empty set is the 1b-2b production form)");
     return true;
 }
 
