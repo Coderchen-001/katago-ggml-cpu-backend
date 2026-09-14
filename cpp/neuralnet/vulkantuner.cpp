@@ -359,6 +359,18 @@ namespace VulkanTuner {
               + to_string(out.rows.size()) + " ROW lines (truncated or hand-edited file?)";
         return false;
       }
+      // The header keys fall into two buckets, and which bucket a key is in is a DESIGN
+      // decision, not an implementation detail:
+      //   REQUIRED (absent => the caller refuses the file): FINGERPRINT, VERSION,
+      //     TUNER_VERSION -- and, from step 3, POLICY and BASELINE, which must arrive in the
+      //     same batch as VERSION 3;
+      //   ADVISORY (absent => accepted with a "[not key-checked: ...]" note): MODEL, BOARD,
+      //     MAXBATCH, purely so a hand-written fixture does not have to spell out every key.
+      // Why it matters: because a missing advisory key is ACCEPTED, putting a key that
+      // GUARANTEES something into this bucket makes the guarantee vanish silently -- a
+      // missing POLICY would load fine, so "the policy changed, the negative entry is void"
+      // would never fire and would never complain.  Guardrail R12 freezes this bucket at
+      // exactly these three names, so a fourth is a deliberate act.
       if (!out.foundModel) out.absentKeys.push_back("MODEL");
       if (!out.foundBoard) out.absentKeys.push_back("BOARD");
       if (!out.foundMaxBatch) out.absentKeys.push_back("MAXBATCH");
