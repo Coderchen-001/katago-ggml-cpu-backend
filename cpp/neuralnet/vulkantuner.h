@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "ggml-backend.h"
 #include "vulkan-tile-validity.h"
@@ -52,17 +53,31 @@ namespace VulkanTuner {
     std::string cacheDir;         // <homeDataDir>/vulkan-tune
     std::string cachePath;        // cacheDir + "/" + deviceFile (may not exist yet)
     bool cacheFileExists = false;
+    // The rest of the cache's outer key (t1-schema.md section 4): the same device can hold
+    // a different model, board size or max batch, and none of those may share a row set.
+    // `modelIdentity` is derived from the loaded model's description by the caller -- the
+    // shell must not learn what a LoadedModel is.
+    std::string modelIdentity;
+    int nnXLen = 0;
+    int nnYLen = 0;
+    int maxBatchSize = 0;
     bool imported = false;        // row set came from KATAGO_VK_TUNE_IMPORT
     std::string importedFrom;     // path the import came from
+    // The rows to hand to the backend, in the wire form both sides share.  Parsed from the
+    // cache or the import file; still refused by the backend's T4 gate today (loudly), and
+    // never silently dropped.
+    std::vector<vk_tune_row_spec> rows;
+    std::string rowSource;        // "none" / "cache" / "import"
+    // "absent" / "loaded" / "negative" / "rejected"
+    std::string cacheState = "absent";
     // Cache-growth accounting (t1-schema.md section 1, "pipeline cache growth"): the
     // bytes this process loaded from the persistent pipeline cache.  The "after" reading
     // only exists at the NEXT startup, so a single run can report the "before" half.
     bool hasPipelineCacheBytes = false;
     size_t pipelineCacheBytesBefore = 0;
-    // How many rows were handed to the backend (1b-2b: always 0).  A COUNT, not the rows
-    // themselves: the rows are the backend's business and only cross the interface once,
-    // inside installForHandle.  The decision log prints it as the `rows=` field -- renaming
-    // the member to rowCount is what keeps "rows" from reading like a row container.
+    // How many rows were handed to the backend.  A COUNT, not the rows themselves: the
+    // decision log prints it as the `rows=` field -- naming the member rowCount is what
+    // keeps "rows" from reading like a row container.
     size_t rowCount = 0;
     double tuneMs = 0.0;          // wall time of this decision, never mixed into visits/s
     std::string note;             // one short human-readable clause for the log line
@@ -79,12 +94,31 @@ namespace VulkanTuner {
     const std::string& homeDataDirOverride,
     int nnXLen,
     int nnYLen,
-    int maxBatchSize
+    int maxBatchSize,
+    const std::string& modelIdentity
   );
 
   // Per-context install.  Called once per ComputeHandle, after the backend exists and
   // before the first graph build; idempotent by construction (the context is fresh).
   void installForHandle(const std::shared_ptr<Decision>& decision, ggml_backend_t backend);
+
+  // The ONE row-set file format (t1-schema.md section 1): the cache file, KATAGO_VK_TUNE_IMPORT
+  // and KATAGO_VK_TUNE_EXPORT all use it, so a file written by one run can be read by the
+  // next, by another machine, and by a hand-written fixture in a test.
+  //
+  //   VERSION <n>            schema version (refused on mismatch)
+  //   TUNER_VERSION <n>      enumerator version (refused on mismatch)
+  //   FINGERPRINT <string>   the full device/driver fingerprint (refused on mismatch)
+  //   MODEL <string>         outer key part 2 (absent = not key-checked)
+  //   BOARD <X>x<Y>          outer key part 3
+  //   MAXBATCH <n>           outer key part 4
+  //   ROWS <n>               DECLARED row count: a file that lost rows in transit is
+  //                          refused instead of being read as a shorter row set
+  //   ROW <path> <src0> <src1> <key_m> <key_k> <BM> <BN> <BK> <WM> <WN> <WMITER> <TM> <TN> <BS> <pad> <reshape> <smaller>
+  //   NEGATIVE <reason>      optional: this (device, model, S, mb) was DETERMINISTICALLY
+  //                          all-rejected; no tuning is attempted.  Never written on a
+  //                          timeout, and never written for a partial result.
+  std::string formatRowsFile(const Decision& decision);
 
 }  // namespace VulkanTuner
 
