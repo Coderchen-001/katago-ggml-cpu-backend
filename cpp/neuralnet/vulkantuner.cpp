@@ -581,6 +581,29 @@ namespace VulkanTuner {
                               + "/TUNER_VERSION=" + to_string(TUNER_VERSION));
           d->note = string(loadKind) + " was written by another schema version";
         }
+        else if (!fromImport && !file.absentKeys.empty()) {
+          // Channel-dependent required keys (2026-09-13 review).  Both channels share this
+          // loader, but they differ in what they may tolerate:
+          //   cache  -- written by us, so there is NO legitimate reason for a header key to
+          //             be missing.  "The name routes, the header verifies" only holds if the
+          //             header actually carries the key: without MODEL, a cache copied from
+          //             another model and renamed to this key's name would pass every check
+          //             left.  That is the one path where the model dimension would silently
+          //             stop being verified, so the cache channel requires it.
+          //   IMPORT -- the operator names the file explicitly, and hand-written fixtures must
+          //             stay possible; absence is tolerated and loudly REPORTED ("[not
+          //             key-checked: ...]") rather than only noted internally, so a human can
+          //             see that the model dimension was not verified on this channel.
+          string missing;
+          for (size_t i = 0; i < file.absentKeys.size(); i++) {
+            missing += (i ? "," : "") + file.absentKeys[i];
+          }
+          d->cacheState = "rejected";
+          refuseLoad(loadKind, "missing header key(s) " + missing
+                              + " (a machine-written cache always carries them;"
+                                " KATAGO_VK_TUNE_IMPORT tolerates their absence for hand-written files)");
+          d->note = string(loadKind) + " is missing " + missing + ", so the model dimension would not be verified";
+        }
         else {
           // Outer key, one item at a time so a refusal names WHICH item did not match.
           string keyMismatch;
