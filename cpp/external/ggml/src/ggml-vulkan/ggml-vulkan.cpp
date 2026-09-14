@@ -2703,27 +2703,30 @@ static std::string ggml_vk_tune_ctx_tag(const ggml_backend_vk_context * ctx) {
     return "ctx=" + std::to_string(ctx->tune_ctx_ordinal) + " device=" + ctx->device->name;
 }
 
-// ONE write per evidence line, on ONE stream (std::cerr).  Two measured reasons:
+// ONE insertion per evidence line, TERMINATOR INCLUDED, on ONE stream (std::cerr).
+// Three measured reasons, all from this cut:
 //   (a) GGML_LOG_* goes through ggml's log callback, which an embedder may replace or
 //       level-filter -- an evidence line that can be routed away from stderr is one the
 //       harness will eventually fail to see;
-//   (b) two NN server threads share stderr, and a line assembled from several << calls
-//       can be split by the other thread IN THE MIDDLE OF ITS OWN PREFIX.  Measured in
-//       this cut: both install lines were written, but "ggml_vulkan: [T3] install (ctx=1"
-//       never appears contiguously in the file (the 2-thread run counted 2 for a pattern
-//       that matched by luck and 1 for the prefix-anchored one).  The line is in the log
-//       and no grep can find it -- worse than a missing line, because it looks like the
-//       code did not run.
-// Building the whole line first and writing it with a single << fixes (b) for practical
-// purposes; the guardrail (R10) forbids "[T3]" appearing anywhere else in this file.
-static void ggml_vk_t3_line(const std::string & msg) {
-    std::cerr << ("ggml_vulkan: [T3] " + msg) << std::endl;
+//   (b) `std::cerr << a << b` is SEVERAL writes, and two NN server threads share stderr:
+//       the other thread's line can land inside this one, even inside its own prefix.
+//       Measured: "ggml_vulkan: [T3] install (ctx=1" never appeared contiguously in the
+//       byte stream, so the 2-thread leg counted one install instead of two -- the line
+//       was there and no grep could find it;
+//   (c) `<< std::endl` is ANOTHER insertion on top of (b): A's text, B's text, A's newline
+//       yields "lineAlineB\n", two messages on one physical line.  That is the phenomenon
+//       first hit when a probe face was counted by LINES instead of by occurrences.
+// So: build the complete line INCLUDING its "\n", then write it with exactly ONE <<.
+// ggml_vk_evidence_line() takes a whole line; the two prefixed wrappers exist so that the
+// "[T2] " and "[T3] " literals each appear exactly once in this file (guardrail R10).
+static void ggml_vk_evidence_line(const std::string & line) {
+    std::cerr << (line + "\n");
 }
-
-// The two [T2] lifecycle markers the 1b acceptance reads POSITIONALLY (section 6.1 items
-// 10/13).  Same single-write rule, for the same reason: these are evidence.
-static void ggml_vk_t2_marker(const std::string & msg) {
-    std::cerr << ("ggml_vulkan: [T2] " + msg) << std::endl;
+static void ggml_vk_t3_line(const std::string & msg) {
+    ggml_vk_evidence_line("ggml_vulkan: [T3] " + msg);
+}
+static void ggml_vk_t2_line(const std::string & msg) {
+    ggml_vk_evidence_line("ggml_vulkan: [T2] " + msg);
 }
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -3365,7 +3368,9 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     }
     if (vk_t2_on(2u)) {
         const double t2_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2_compile_t0).count();
-        std::cerr << "ggml_vulkan: [T2] compile name=" << pipeline->name << " ms=" << t2_ms << std::endl;
+        std::ostringstream t2_ms_os;
+        t2_ms_os << t2_ms;
+        ggml_vk_t2_line("compile name=" + pipeline->name + " ms=" + t2_ms_os.str());
     }
 
     if (vk_instance.debug_utils_support) {
@@ -3385,27 +3390,30 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         bool print_stats = !vk_pipeline_stats_filter.empty() &&
                            pipeline->name.find(vk_pipeline_stats_filter) != std::string::npos;
         if (print_stats) {
-            std::cerr << "ggml_vulkan: pipeline stats for " << pipeline->name << ":" << std::endl;
+            ggml_vk_evidence_line("ggml_vulkan: pipeline stats for " + pipeline->name + ":");
         }
 
         for (auto & s : statistics) {
             if (print_stats) {
-                std::cerr << "ggml_vulkan:   " << s.name.data() << ": ";
+                std::string value;
                 switch (s.format) {
                     case vk::PipelineExecutableStatisticFormatKHR::eBool32:
-                        std::cerr << (s.value.b32 ? "true" : "false");
+                        value = s.value.b32 ? "true" : "false";
                         break;
                     case vk::PipelineExecutableStatisticFormatKHR::eInt64:
-                        std::cerr << s.value.i64;
+                        value = std::to_string(s.value.i64);
                         break;
                     case vk::PipelineExecutableStatisticFormatKHR::eUint64:
-                        std::cerr << s.value.u64;
+                        value = std::to_string(s.value.u64);
                         break;
-                    case vk::PipelineExecutableStatisticFormatKHR::eFloat64:
-                        std::cerr << s.value.f64;
+                    case vk::PipelineExecutableStatisticFormatKHR::eFloat64: {
+                        std::ostringstream value_os;
+                        value_os << s.value.f64;
+                        value = value_os.str();
                         break;
+                    }
                 }
-                std::cerr << std::endl;
+                ggml_vk_evidence_line("ggml_vulkan:   " + std::string(s.name.data()) + ": " + value);
             }
             // "Register Count" is reported by NVIDIA drivers.
             if (strcmp(s.name, "Register Count") == 0) {
@@ -4173,19 +4181,22 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
             if (ggml_vk_flash_attn_scalar_shmem_support(device, probe, hsk, hsv, f32acc, k_type, v_type)) {
                 result = probe;
                 fa_tile_applied = true;
-                std::cerr << "ggml_vulkan: KATAGO_VK_FA_TILE=" << fa_tile_env << " applied (Br=" << result.block_rows
-                          << " Bc=" << result.block_cols << " Dsplit=" << result.d_split
-                          << " row_split=" << result.row_split << " staging=" << result.shmem_staging
-                          << " WG=" << result.workgroup_size << ")\n";
+                ggml_vk_evidence_line("ggml_vulkan: KATAGO_VK_FA_TILE=" + std::string(fa_tile_env)
+                                      + " applied (Br=" + std::to_string(result.block_rows)
+                                      + " Bc=" + std::to_string(result.block_cols)
+                                      + " Dsplit=" + std::to_string(result.d_split)
+                                      + " row_split=" + std::to_string(result.row_split)
+                                      + " staging=" + std::to_string(result.shmem_staging)
+                                      + " WG=" + std::to_string(result.workgroup_size) + ")");
             } else {
-                std::cerr << "ggml_vulkan: KATAGO_VK_FA_TILE=" << fa_tile_env
-                          << " rejected (tile exceeds scalar FA shared memory); using heuristic\n";
+                ggml_vk_evidence_line("ggml_vulkan: KATAGO_VK_FA_TILE=" + std::string(fa_tile_env)
+                                      + " rejected (tile exceeds scalar FA shared memory); using heuristic");
             }
         } else {
-            std::cerr << "ggml_vulkan: KATAGO_VK_FA_TILE=" << fa_tile_env
-                      << " rejected (need >=3 fields, staging<=1, Dsplit|HSK,HSV,WG; row_split|(WG/Dsplit);"
-                         " row_split|Br; (WG/Dsplit/row_split)|Bc; row_split in {1, WG/subgroup_size});"
-                         " using heuristic\n";
+            ggml_vk_evidence_line("ggml_vulkan: KATAGO_VK_FA_TILE=" + std::string(fa_tile_env)
+                                  + " rejected (need >=3 fields, staging<=1, Dsplit|HSK,HSV,WG; row_split|(WG/Dsplit);"
+                                    " row_split|Br; (WG/Dsplit/row_split)|Bc; row_split in {1, WG/subgroup_size});"
+                                    " using heuristic");
         }
     }
     // -------------------------------------------------------------------------
@@ -5152,7 +5163,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     const uint32_t v = (uint32_t) atoi(cm2_bk_env);
                     if (v > 0) {
                         if (!cm2_bk_logged) {
-                            std::cerr << "ggml_vulkan: KATAGO_VK_CM2_BK=" << v << " (default spec BK was " << spec[3] << ")\n";
+                            ggml_vk_evidence_line("ggml_vulkan: KATAGO_VK_CM2_BK=" + std::to_string(v)
+                                          + " (default spec BK was " + std::to_string(spec[3]) + ")");
                             cm2_bk_logged = true;
                         }
                         spec[3] = v;
@@ -5162,7 +5174,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     const uint32_t v = (uint32_t) atoi(cm2_bm_env);
                     if (v > 0) {
                         if (!cm2_bm_logged) {
-                            std::cerr << "ggml_vulkan: KATAGO_VK_CM2_BM=" << v << " (default spec BM was " << spec[1] << ")\n";
+                            ggml_vk_evidence_line("ggml_vulkan: KATAGO_VK_CM2_BM=" + std::to_string(v)
+                                                  + " (default spec BM was " + std::to_string(spec[1]) + ")");
                             cm2_bm_logged = true;
                         }
                         spec[1] = v;
@@ -6155,8 +6168,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     const bool katago_rms_sg128 =
         device->vendor_id == VK_VENDOR_ID_NVIDIA && device->subgroup_size == 32 &&
         !(katago_rms_sg_env != nullptr && katago_rms_sg_env[0] == '0');
-    std::cerr << "ggml_vulkan: RMS shader variant: " << (katago_rms_sg128 ? "sg128 (N51)" : "legacy 512-tree")
-              << (katago_rms_sg_env != nullptr ? " [KATAGO_VK_RMS_SUBGROUP set]" : "") << "\n";
+    ggml_vk_evidence_line("ggml_vulkan: RMS shader variant: "
+                          + std::string(katago_rms_sg128 ? "sg128 (N51)" : "legacy 512-tree")
+                          + (katago_rms_sg_env != nullptr ? " [KATAGO_VK_RMS_SUBGROUP set]" : ""));
     if (sizeof(vk_op_rms_norm_mul_mul_push_constants) <= device->properties.limits.maxPushConstantsSize) {
         if (katago_rms_sg128) {
             ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_mul_f32, "rms_norm_mul_mul_f32", rms_norm_dual_mul_sg128_f32_len, rms_norm_dual_mul_sg128_f32_data, "main", 4, sizeof(vk_op_rms_norm_mul_mul_push_constants), {1, 1, 1}, {}, 1, true);
@@ -8154,12 +8168,14 @@ static void ggml_vk_instance_init() {
                 // one-shot), so refuse to run them rather than silently
                 // distorting a reference run.
                 vk_t2_probe = 0;
-                std::cerr << "ggml_vulkan: WARNING: KATAGO_VK_T2_PROBE was requested but KATAGO_VK_TUNE=0"
-                          << " disables the tuner, so all T2 probes are suppressed (reference run stays clean)" << std::endl;
+                ggml_vk_evidence_line("ggml_vulkan: WARNING: KATAGO_VK_T2_PROBE was requested but KATAGO_VK_TUNE=0"
+                                      " disables the tuner, so all T2 probes are suppressed (reference run stays clean)");
             } else {
-                std::cerr << "ggml_vulkan: KATAGO_VK_T2_PROBE=" << vk_t2_probe << " (T2 instrumentation active)"
-                          << " KATAGO_VK_TUNE=" << (t2_tune_env ? t2_tune_env : "(unset)")
-                          << " KATAGO_VK_TUNE_PRIME=" << (getenv("KATAGO_VK_TUNE_PRIME") ? getenv("KATAGO_VK_TUNE_PRIME") : "(unset)") << std::endl;
+                ggml_vk_evidence_line("ggml_vulkan: KATAGO_VK_T2_PROBE=" + std::to_string(vk_t2_probe)
+                                      + " (T2 instrumentation active) KATAGO_VK_TUNE="
+                                      + (t2_tune_env ? t2_tune_env : "(unset)")
+                                      + " KATAGO_VK_TUNE_PRIME="
+                                      + (getenv("KATAGO_VK_TUNE_PRIME") ? getenv("KATAGO_VK_TUNE_PRIME") : "(unset)"));
             }
         }
     }
@@ -8516,14 +8532,14 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
             else if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) fam = "matmul_f32";
             else if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F16) fam = "matmul_f32_f16";
             else if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_BF16) fam = "matmul_bf16";
-            std::cerr << "ggml_vulkan: [T2] matmul family: src0=" << ggml_type_name(src0_type)
-                      << " src1=" << ggml_type_name(src1_type)
-                      << " prec=" << (int) prec
-                      << " device.fp16=" << (int) ctx->device->fp16
-                      << " coopmat=" << (int) ctx->device->coopmat_support
-                      << " coopmat2=" << (int) ctx->device->coopmat2
-                      << " => family=" << fam
-                      << " acc=" << (acc_f16 ? "f16acc" : "f32acc") << std::endl;
+            ggml_vk_t2_line("matmul family: src0=" + std::string(ggml_type_name(src0_type))
+                            + " src1=" + ggml_type_name(src1_type)
+                            + " prec=" + std::to_string((int) prec)
+                            + " device.fp16=" + std::to_string((int) ctx->device->fp16)
+                            + " coopmat=" + std::to_string((int) ctx->device->coopmat_support)
+                            + " coopmat2=" + std::to_string((int) ctx->device->coopmat2)
+                            + " => family=" + fam
+                            + " acc=" + (acc_f16 ? "f16acc" : "f32acc"));
         }
     }
     if (ggml_vk_prefers_f16acc(ctx->device, prec)) {
@@ -9633,13 +9649,14 @@ static void ggml_vk_t2_log_tuned_row(ggml_backend_vk_context * ctx, const vk_mat
     if (ctx->t2.tuned_logged.size() >= 64) {
         if (!ctx->t2.tuned_log_capped) {
             ctx->t2.tuned_log_capped = true;
-            std::cerr << "ggml_vulkan: [T2] tuned row hit: further distinct (name,m,n,k) suppressed (cap 64)" << std::endl;
+            ggml_vk_t2_line("tuned row hit: further distinct (name,m,n,k) suppressed (cap 64)");
         }
         return;
     }
     ctx->t2.tuned_logged[key] = true;
-    std::cerr << "ggml_vulkan: [T2] tuned row hit (" << chain << "): name=" << row->unaligned->name
-              << " m=" << m << " n=" << n << " k=" << k << " (applied)" << std::endl;
+    ggml_vk_t2_line("tuned row hit (" + std::string(chain) + "): name=" + row->unaligned->name
+                    + " m=" + std::to_string(m) + " n=" + std::to_string(n)
+                    + " k=" + std::to_string(k) + " (applied)");
 }
 
 // The invariants a candidate row must satisfy before it is installed.  Returns nullptr
@@ -9843,29 +9860,29 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
     const bool install2 = tab.install(&fake_target, std::vector<vk_tuned_row>{}, &late_reason);
     const bool table_ok = install1 && lookup_before_freeze && !install2 && !late_reason.empty();
 
-    std::cerr << "ggml_vulkan: [T2] tuned-row validator self-test: I1(no stock)="
-              << (reason_empty != nullptr ? "rejected" : "ACCEPTED (BUG)")
-              << " [" << (reason_empty ? reason_empty : "-") << "]"
-              << ", I2(wrong family " << family_name << ")="
-              << (reason_mismatch != nullptr ? "rejected" : "not exercised")
-              << " [" << (reason_mismatch ? reason_mismatch : "-") << "]"
-              << ", K1 sentinel(whole-slot hit, exact hit, m-mismatch miss, k==0 miss)="
-              << (sentinel_ok ? "ok" : "FAILED")
-              << " [" << (int) match_whole_any << (int) match_keyed_exact
-              << (int) match_keyed_m << (int) match_keyed_k0 << "]"
-              << ", G13 pick(aligned-only: aligned ok / unaligned null, unaligned-only: both ok)="
-              << (g13_ok ? "ok" : "FAILED")
-              << " [" << (int) pick_aligned_from_aligned_only << (int) pick_unaligned_is_null
-              << (int) pick_unaligned_ok << (int) pick_aligned_falls_back << "]"
-              << ", table(install ok, lookup ok, late install refused)="
-              << (table_ok ? "ok" : "FAILED")
-              << " [" << (int) install1 << (int) lookup_before_freeze << (int) !install2 << "]"
-              << ", I3(no unaligned)=" << (reason_no_unaligned != nullptr ? "rejected" : "ACCEPTED (BUG)")
-              << ", I4(oversize ALIGNED align, stock=" << stock_align_dbg << ")="
-              << (i4_aligned_ok ? "accepted+advised" : "WRONG")
-              << ", I5(q8_1 target)=" << (reason_q8_1 != nullptr ? "rejected" : "ACCEPTED (BUG)")
-              << ", axis classes=" << (axes_ok ? "ok" : "FAILED")
-              << std::endl;
+    ggml_vk_t2_line("tuned-row validator self-test: I1(no stock)="
+                    + std::string(reason_empty != nullptr ? "rejected" : "ACCEPTED (BUG)")
+                    + " [" + (reason_empty ? reason_empty : "-") + "]"
+                    + ", I2(wrong family " + family_name + ")="
+                    + (reason_mismatch != nullptr ? "rejected" : "not exercised")
+                    + " [" + (reason_mismatch ? reason_mismatch : "-") + "]"
+                    + ", K1 sentinel(whole-slot hit, exact hit, m-mismatch miss, k==0 miss)="
+                    + (sentinel_ok ? "ok" : "FAILED")
+                    + " [" + std::to_string((int) match_whole_any) + std::to_string((int) match_keyed_exact)
+                    + std::to_string((int) match_keyed_m) + std::to_string((int) match_keyed_k0) + "]"
+                    + ", G13 pick(aligned-only: aligned ok / unaligned null, unaligned-only: both ok)="
+                    + (g13_ok ? "ok" : "FAILED")
+                    + " [" + std::to_string((int) pick_aligned_from_aligned_only) + std::to_string((int) pick_unaligned_is_null)
+                    + std::to_string((int) pick_unaligned_ok) + std::to_string((int) pick_aligned_falls_back) + "]"
+                    + ", table(install ok, lookup ok, late install refused)="
+                    + (table_ok ? "ok" : "FAILED")
+                    + " [" + std::to_string((int) install1) + std::to_string((int) lookup_before_freeze)
+                    + std::to_string((int) !install2) + "]"
+                    + ", I3(no unaligned)=" + (reason_no_unaligned != nullptr ? "rejected" : "ACCEPTED (BUG)")
+                    + ", I4(oversize ALIGNED align, stock=" + std::to_string(stock_align_dbg) + ")="
+                    + (i4_aligned_ok ? "accepted+advised" : "WRONG")
+                    + ", I5(q8_1 target)=" + (reason_q8_1 != nullptr ? "rejected" : "ACCEPTED (BUG)")
+                    + ", axis classes=" + (axes_ok ? "ok" : "FAILED"));
 }
 
 // T3 step 0 (2026-09-13): the KATAGO_VK_T2_TUNED_FAKE hook was deleted here.
@@ -9897,8 +9914,8 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         // of an inference.  Printed from the production path only (the self-test uses a
         // local table), and only when the table is still open.
         if (vk_t2_on(8u) && !ctx->tuned.frozen) {
-            ggml_vk_t2_marker("tuned rows frozen by first lookup (" + ggml_vk_tune_ctx_tag(ctx)
-                              + ", target families=" + std::to_string(ctx->tuned.rows.size()) + ")");
+            ggml_vk_t2_line("tuned rows frozen by first lookup (" + ggml_vk_tune_ctx_tag(ctx)
+                            + ", target families=" + std::to_string(ctx->tuned.rows.size()) + ")");
         }
         const vk_tuned_row * row = ggml_vk_tuned_row_for(ctx, mmp, m, k);
         if (row != nullptr) {
@@ -9911,9 +9928,9 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
                 // so say it once per context.
                 if (!ctx->t2.mm_tile_ignored_logged && getenv("KATAGO_VK_MM_TILE") != nullptr) {
                     ctx->t2.mm_tile_ignored_logged = true;
-                    std::cerr << "ggml_vulkan: WARNING: KATAGO_VK_MM_TILE is set but a tuned row intercepts this"
-                              << " (family, acc); the env tile is IGNORED for those shapes"
-                              << " (KATAGO_VK_TUNE=0 or deleting the tuner cache restores it)" << std::endl;
+                    ggml_vk_evidence_line("ggml_vulkan: WARNING: KATAGO_VK_MM_TILE is set but a tuned row intercepts this"
+                                          " (family, acc); the env tile is IGNORED for those shapes"
+                                          " (KATAGO_VK_TUNE=0 or deleting the tuner cache restores it)");
                 }
                 return picked;
             }
@@ -10031,10 +10048,10 @@ static void ggml_vk_t2_dump_slot_histogram(ggml_backend_vk_context * ctx) {
         return;
     }
     ctx->t2.slot_dumped = ctx->t2.slot_total;
-    ggml_vk_t2_marker("matmul pipeline histogram (" + ggml_vk_tune_ctx_tag(ctx)
-                      + ", cumulative, dispatches=" + std::to_string(ctx->t2.slot_total) + "):");
+    ggml_vk_t2_line("matmul pipeline histogram (" + ggml_vk_tune_ctx_tag(ctx)
+                    + ", cumulative, dispatches=" + std::to_string(ctx->t2.slot_total) + "):");
     for (const auto & kv : ctx->t2.slot_histogram) {
-        std::cerr << "ggml_vulkan: [T2]   " << kv.first << " x " << kv.second << std::endl;
+        ggml_vk_t2_line("  " + kv.first + " x " + std::to_string(kv.second));
     }
 }
 
@@ -10494,10 +10511,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         if (ctx->t2.dispatch_geom_logged.find(geom_key) == ctx->t2.dispatch_geom_logged.end() &&
             ctx->t2.dispatch_geom_logged.size() < 32) {
             ctx->t2.dispatch_geom_logged[geom_key] = true;
-            std::cerr << "ggml_vulkan: [T2] dispatch geometry: pipeline=" << pipeline->name
-                      << " m=" << ne01 << " n=" << ne11
-                      << " k_arg=" << ne10 << " kpad=" << kpad
-                      << " aligned=" << (int) aligned << " align=" << pipeline->align << std::endl;
+            ggml_vk_t2_line("dispatch geometry: pipeline=" + pipeline->name
+                            + " m=" + std::to_string(ne01) + " n=" + std::to_string(ne11)
+                            + " k_arg=" + std::to_string(ne10) + " kpad=" + std::to_string(kpad)
+                            + " aligned=" + std::to_string((int) aligned)
+                            + " align=" + std::to_string(pipeline->align));
         }
     }
 
@@ -19095,9 +19113,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // bit-8 gated, like the other surface diagnostics.
             if (vk_t2_on(8u) && !ctx->t2.pr_recording_logged) {
                 ctx->t2.pr_recording_logged = true;
-                ggml_vk_t2_marker("pr_recording first set (" + ggml_vk_tune_ctx_tag(ctx)
-                                  + ", eval=" + std::to_string(ctx->pr_evals) + ", tuned_rows_frozen="
-                                  + (ctx->tuned.frozen ? "1" : "0") + ")");
+                ggml_vk_t2_line("pr_recording first set (" + ggml_vk_tune_ctx_tag(ctx)
+                                + ", eval=" + std::to_string(ctx->pr_evals) + ", tuned_rows_frozen="
+                                + (ctx->tuned.frozen ? "1" : "0") + ")");
             }
         }
     }

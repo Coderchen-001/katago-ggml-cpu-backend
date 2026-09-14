@@ -23,12 +23,14 @@ namespace VulkanTuner {
 
     const char* const LOG_PREFIX = "KataGoVulkanTuner: [T3] ";
 
-    // ONE write per line, like the backend's ggml_vk_t3_line(): NN server threads share
-    // stderr, and a line assembled from several << calls can be split by another thread in
-    // the middle of its own prefix -- the line is then in the log but no grep finds it.
-    // `LOG_PREFIX` is used HERE and nowhere else, which is what makes that checkable.
+    // ONE insertion per line, TERMINATOR INCLUDED, like the backend's ggml_vk_t3_line().
+    // Two things go wrong otherwise, both measured: `<< a << b` lets another NN server
+    // thread land inside this line (even inside its own prefix, which makes the line
+    // unfindable), and `<< std::endl` is a SECOND insertion, so two messages can end up on
+    // one physical line ("lineAlineB\n").  `LOG_PREFIX` is used HERE and nowhere else,
+    // which is what makes that checkable (guardrail R10).
     void logLine(const string& msg) {
-      cerr << (string(LOG_PREFIX) + msg) << endl;
+      cerr << (string(LOG_PREFIX) + msg + "\n");
     }
 
     // Schema version of anything this file reads or writes.  Bump it when the MEANING of
@@ -234,10 +236,10 @@ namespace VulkanTuner {
         d->note = "import fingerprint matches, row parsing arrives in T4";
       }
       else if (d->cacheFileExists) {
-        d->note = "cache file present, loading arrives in T2 step 2";
+        d->note = "cache file present, loading arrives in T3 step 2";
       }
       else {
-        d->note = "no cache file, tuning arrives in T2 step 2";
+        d->note = "no cache file, tuning arrives in T3 step 2";
       }
 
       // 1b-2b: the row set is empty by construction.  Tuning/cache loading replaces this
