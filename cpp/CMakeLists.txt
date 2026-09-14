@@ -853,6 +853,7 @@ elseif(USE_BACKEND STREQUAL "VULKAN")
   message(STATUS "-DUSE_BACKEND=VULKAN, using the ggml Vulkan backend.")
   set(NEURALNET_BACKEND_SOURCES
     neuralnet/vulkanbackend.cpp
+    neuralnet/vulkantuner.cpp
     )
 # --------------------------- ROCM backend (AMD GPU / HIP + MIOpen) ---------------------------
 elseif(USE_BACKEND STREQUAL "ROCM")
@@ -1704,6 +1705,13 @@ elseif(USE_BACKEND STREQUAL "VULKAN")
   add_subdirectory(external/ggml)
 
   target_link_libraries(katago ggml ggml-base ggml-vulkan ggml-cpu Vulkan::Vulkan)
+
+  # The tuner shell shares the tile-validity rules with the backend (t3-shell-plan.md
+  # section 1.7: ONE header, included by both sides, so the enumerator and the loader
+  # cannot reject different geometries).  That header sits next to the vendored backend
+  # source rather than in ggml's public include dir, so this is a KataGo-side include
+  # path, not a change to ggml's public API or CMake surface (section 7.1-7).
+  target_include_directories(katago PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/external/ggml/src/ggml-vulkan")
 elseif(USE_BACKEND STREQUAL "ONNX")
   target_compile_definitions(katago PRIVATE USE_ONNX_BACKEND)
 

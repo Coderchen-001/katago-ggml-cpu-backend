@@ -24,6 +24,7 @@
 #include "../neuralnet/nninputs.h"
 #include "../neuralnet/modelversion.h"
 #include "../neuralnet/onnxmodelbuilder.h"
+#include "../neuralnet/vulkantuner.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -39,6 +40,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -2401,8 +2403,21 @@ struct ComputeContext {
   int nnYLen;
   enabled_t useFP16Mode;
 
-  ComputeContext(int xLen, int yLen, enabled_t fp16Mode)
-    : nnXLen(xLen), nnYLen(yLen), useFP16Mode(fp16Mode)
+  // T3 (t3-shell-plan.md section 6, step 1): the tuner cache lives under homeDataDir
+  // (mirroring OpenCL's <homeDataDir>/opencltuning/), so the override has to survive
+  // createComputeContext -- it used to be discarded here.
+  std::string homeDataDirOverride;
+
+  // ONE tune decision per (evaluator, device), taken by whichever NN server thread
+  // creates its handle first; the others reuse it and only perform their own per-context
+  // install (section 2).  Without the single flight, N threads would race for the same
+  // cache file; without the per-context install, only one context would get the rows and
+  // the rest would silently fall back to stock -- i.e. fabricated evidence.
+  std::mutex tuneMutex;
+  std::map<int, std::shared_ptr<VulkanTuner::Decision>> tuneDecisions;
+
+  ComputeContext(int xLen, int yLen, enabled_t fp16Mode, const std::string& homeDataDir)
+    : nnXLen(xLen), nnYLen(yLen), useFP16Mode(fp16Mode), homeDataDirOverride(homeDataDir)
   {}
 
   ComputeContext() = delete;
@@ -2421,7 +2436,6 @@ ComputeContext* NeuralNet::createComputeContext(
   ConfigParser& cfg
 ) {
   (void)gpuIdxs;
-  (void)homeDataDirOverride;
   (void)cfg;
 
   // scale8 (1/8 activation rescaling) is applied here, before the graph is
@@ -2433,10 +2447,11 @@ ComputeContext* NeuralNet::createComputeContext(
   // report it truthfully instead of hard-coding false (the Vulkan backend
   // itself does not gate on it -- ggml picks the fp16 path by device
   // capability -- but the request must be observable for tooling/tests).
-  ComputeContext* ctx = new ComputeContext(nnXLen, nnYLen, useFP16Mode);
+  ComputeContext* ctx = new ComputeContext(nnXLen, nnYLen, useFP16Mode, homeDataDirOverride);
   if(logger != NULL)
     logger->write("VULKAN backend: creating compute context for " +
-                  Global::intToString(nnXLen) + "x" + Global::intToString(nnYLen));
+                  Global::intToString(nnXLen) + "x" + Global::intToString(nnYLen) +
+                  (homeDataDirOverride.empty() ? string() : (" (homeDataDir=" + homeDataDirOverride + ")")));
   return ctx;
 }
 
@@ -2504,7 +2519,9 @@ struct ComputeHandle {
 
     // Debug cross-check: KATAGO_VULKAN_CPU=1 runs the same graph on the ggml
     // CPU backend instead of Vulkan (validates the interpreter in isolation).
-    if(getenv("KATAGO_VULKAN_CPU") != nullptr && getenv("KATAGO_VULKAN_CPU")[0] == '1') {
+    const bool cpucrossCheck =
+      getenv("KATAGO_VULKAN_CPU") != nullptr && getenv("KATAGO_VULKAN_CPU")[0] == '1';
+    if(cpucrossCheck) {
       backend = ggml_backend_cpu_init();
       if(backend == NULL)
         throw StringError("VULKAN backend: could not initialize the ggml CPU backend");
@@ -2521,6 +2538,41 @@ struct ComputeHandle {
       backend = ggml_backend_vk_init(deviceIdx >= 0 ? (size_t)deviceIdx : 0);
       if(backend == NULL)
         throw StringError("VULKAN backend: could not initialize Vulkan backend for device " + Global::intToString(deviceIdx));
+    }
+
+    // --- T3 tuner hook (t3-shell-plan.md section 6, step 1) --------------------------
+    // Placement is a hard requirement, not a convenience. It must be
+    //   * after the backend exists -- the fingerprint and the install both need it, and
+    //     the fingerprint is what names the cache file;
+    //   * before anything can select a pipeline, i.e. before the ONNX/graph build below,
+    //     because the pre-record path stops SELECTING once it replays (section 5) and a
+    //     row installed after that would never be read.
+    // The single flight (per evaluator+device) and the per-context install are what make
+    // "1 decision, N installs" true instead of hoped for.  Nothing between here and the
+    // install may query the selector, so the install cannot race the freeze.
+    // Skipped on the KATAGO_VULKAN_CPU cross-check path: there is no Vulkan device to
+    // describe and no Vulkan pipeline to tune.
+    if(!cpucrossCheck) {
+      const int effectiveDeviceIdx = deviceIdx >= 0 ? deviceIdx : 0;
+      std::shared_ptr<VulkanTuner::Decision> tuneDecision;
+      {
+        // The decision map is per ComputeContext and NN server threads are created
+        // concurrently, so the single flight needs this lock.
+        std::lock_guard<std::mutex> tuneLock(ctx->tuneMutex);
+        std::map<int, std::shared_ptr<VulkanTuner::Decision>>::iterator it =
+          ctx->tuneDecisions.find(effectiveDeviceIdx);
+        if(it == ctx->tuneDecisions.end()) {
+          it = ctx->tuneDecisions.emplace(
+            effectiveDeviceIdx,
+            VulkanTuner::makeDecision(
+              backend, effectiveDeviceIdx, ctx->homeDataDirOverride,
+              ctx->nnXLen, ctx->nnYLen, maxBatchSize)
+          ).first;
+        }
+        tuneDecision = it->second;
+      }
+      if(tuneDecision != nullptr)
+        VulkanTuner::installForHandle(tuneDecision, backend);
     }
 
     // --- Get the ONNX bytes (external .onnx shared, .bin.gz built here) ---

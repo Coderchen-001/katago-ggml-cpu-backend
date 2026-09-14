@@ -11,10 +11,12 @@
 //   * the backend: the KATAGO_VK_MM_TILE=custom: parser
 //   * the shell (KataGO side): the candidate enumerator and the IMPORT parser
 //
-// Deliberately small API:
+// Deliberately small API (authority order: class, then reason, then canonical key):
 //   1. vk_tile_candidate_reason() -- is this concrete geometry legal, and if not, why
 //   2. vk_tile_canonical_key()    -- dedup identity (dedup is NOT validity)
-//   3. vk_tile_axis_is_live()     -- per-path live-axis table (the enumeration space)
+//   3. vk_tile_axis_class()       -- per-path axis classification (the AUTHORITY);
+
+//      vk_tile_axis_is_live() is a thin wrapper answering only "may it be swept?"
 //
 // No vk::, no ggml, no std::string: plain ints in, plain const char* out.  That is what
 // lets both sides share it without either one reaching into the other.
@@ -76,6 +78,26 @@ struct vk_tile_geometry {
     int pad;      // -1 = unspecified (shader default applies)
     int reshape;  // -1 = unspecified
     int smaller;  // -1 = unspecified (cm2 only)
+};
+
+// The wire form of ONE tuned row: identity + geometry, and nothing else.  No handles and
+// no pointers (t3-shell-plan.md section 7.1-3): the backend resolves the geometry into
+// pipelines when the row is installed, so a row is something the cache can store verbatim
+// and the shell can hand across the interface without either side knowing the other's
+// types.  It lives in this header so both sides share ONE definition of a row -- two
+// definitions of a wire format is exactly the drift this header exists to prevent.
+//
+// `src0_type`/`src1_type` are ggml_type values carried as int on purpose: this header
+// knows nothing about ggml, and the backend is the only side that has to interpret them.
+// `key_m`/`key_k` are 0 for "whole slot" (matches any shape), which is the v1 form; see
+// ggml_vk_tuned_row_matches for the matching rule.
+struct vk_tune_row_spec {
+    int src0_type;
+    int src1_type;
+    uint32_t key_m;
+    uint32_t key_k;
+    int path;                  // vk_tile_path
+    struct vk_tile_geometry geom;
 };
 
 // Returns nullptr when the geometry is legal, otherwise a static reason string naming
@@ -174,7 +196,10 @@ static inline int vk_tile_axis_class(int path, int axis) {
                 return VK_TILE_AXIS_ENUMERABLE;
             case VK_TILE_AXIS_TK:
             case VK_TILE_AXIS_WARP:
-                return VK_TILE_AXIS_INERT;   // cm2 has no TK/WARP warptile semantics
+                // NOT_APPLICABLE, not INERT: these are not axes of the cm2 path at all
+                // (there is no warptile semantics there), so the enumerator should not
+                // even consider them.  INERT would mean "exists but sweeping does nothing".
+                return VK_TILE_AXIS_NOT_APPLICABLE;
             default:
                 return VK_TILE_AXIS_NOT_APPLICABLE;
         }

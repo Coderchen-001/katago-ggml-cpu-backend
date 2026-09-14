@@ -2339,6 +2339,7 @@ struct vk_t2_stats {
     bool selftest_done = false;
     bool mm_tile_ignored_logged = false;   // S2': "env override ignored" warning, once per context
     std::map<std::string, bool> dispatch_geom_logged;   // item 12: one-shot k_arg/kpad proof
+    bool pr_recording_logged = false;   // item 10: first pr_recording transition, once per context
 };
 static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
@@ -2584,6 +2585,15 @@ struct ggml_backend_vk_context {
     // Installed by ggml_backend_vk_tune_install_rows(); empty in production today.
     vk_tuned_row_table tuned;
 
+    // T3 per-context ordinal, assigned once at construction (t3-shell-plan.md section
+    // 9.1 R7).  Two contexts on the SAME device both report ctx->name == "Vulkan0", so
+    // the install/query/frozen log lines would be indistinguishable -- and the T2
+    // dual-thread runs are exactly that case.  The ordinal is assigned here, by the
+    // backend, because the shell cannot see contexts it did not create; every log line
+    // that needs a context identity renders it through ggml_vk_tune_ctx_tag() below, so
+    // there is one source for it and the lines cannot drift apart.
+    uint32_t tune_ctx_ordinal {0};
+
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
@@ -2683,6 +2693,15 @@ struct ggml_backend_vk_context {
     int32_t num_queries {};
     int32_t query_idx {};
 };
+
+// T3 (t3-shell-plan.md section 9.1 R7): one process-monotonic counter stamps every
+// context at creation, and ONE formatter renders it for log lines.  The install path and
+// the query path both call the formatter, which is what makes "install x2 then frozen"
+// readable as a sequence per context instead of two lines that happen to look alike.
+static std::atomic<uint32_t> vk_tune_ctx_counter {0};
+static std::string ggml_vk_tune_ctx_tag(const ggml_backend_vk_context * ctx) {
+    return "ctx=" + std::to_string(ctx->tune_ctx_ordinal) + " device=" + ctx->device->name;
+}
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
 
@@ -9600,8 +9619,6 @@ static void ggml_vk_t2_log_tuned_row(ggml_backend_vk_context * ctx, const vk_mat
               << " m=" << m << " n=" << n << " k=" << k << " (applied)" << std::endl;
 }
 
-// Invariants a tuned row must satisfy before it is installed (T2 close-out item 1,
-// invariants I1/I2).  Returns nullptr when the row may be installed, otherwise a
 // The invariants a candidate row must satisfy before it is installed.  Returns nullptr
 // when the row may be installed, otherwise a reason string the loader must print loudly
 // before refusing -- never install a row that fails this, and never fail silently.
@@ -9614,10 +9631,12 @@ static void ggml_vk_t2_log_tuned_row(ggml_backend_vk_context * ctx, const vk_mat
 //      which is exactly why the custom: probe is inert)
 //   I3 the row has an unaligned pipeline -- the aligned variant alone is unusable
 //      whenever aligned == false (t3-shell-plan.md section 1.4)
-//   I4 the row's align does not exceed the stock buckets' align (insurance: a row's
-//      align only selects between its own two variants today -- the dispatched k and
-//      stride_a come from ne10, not kpad -- but a bound keeps that true if rows ever
-//      reach another path)
+//   I4 the row's UNALIGNED pipeline align does not exceed the stock buckets' align.
+//      Insurance only: a row's align selects between its own two variants, because the
+//      dispatched k and stride_a come from ne10 and kpad only feeds the aligned flag
+//      (t3-shell-plan.md section 6.1 item 12 measured this).  The measured unaligned
+//      align is 1, so this bound is not expected to trigger; an oversized ALIGNED
+//      variant is deliberately NOT a rejection -- see ggml_vk_tuned_row_align_advice.
 //   I5 the row does not target the mmq/q8_1 path, whose shader has its own layout and
 //      where padded_n would start depending on the row's wg_denoms
 static const char * ggml_vk_tuned_row_check(ggml_backend_vk_context * ctx, const vk_matmul_pipeline & target,
@@ -9641,7 +9660,14 @@ static const char * ggml_vk_tuned_row_check(ggml_backend_vk_context * ctx, const
         if (row->unaligned == nullptr) {
             return "I3: row has no unaligned pipeline (the aligned variant alone is unsafe)";
         }
-        // I4: bound the row's align by the stock buckets' align.
+        // I4 (2026-09-13 review: downgraded to the unaligned pipeline only).  An
+        // oversized align on the ALIGNED variant is the case a candidate-0-style
+        // geometry produces, and item 12 measured that it is harmless on every reachable
+        // path (the shader receives ne10 for both k and stride_a, kpad only feeds the
+        // aligned flag, padded_n follows wg_denoms and q8_1 is refused by I5).  Rejecting
+        // it would make the row path stricter than KATAGO_VK_MM_TILE=custom: for the same
+        // geometry -- an accept-set inconsistency -- so that case only warns
+        // (ggml_vk_tuned_row_align_advice) and the bound lives in the candidate table.
         uint32_t stock_align = 0;
         const vk_pipeline stock[6] = { target->l, target->m, target->s, target->a_l, target->a_m, target->a_s };
         for (const vk_pipeline & p : stock) {
@@ -9649,14 +9675,35 @@ static const char * ggml_vk_tuned_row_check(ggml_backend_vk_context * ctx, const
                 stock_align = p->align;
             }
         }
-        if (row->unaligned->align > stock_align || (row->aligned != nullptr && row->aligned->align > stock_align)) {
-            return "I4: row align exceeds the stock buckets' align";
+        if (row->unaligned->align > stock_align) {
+            return "I4: row's unaligned pipeline align exceeds the stock buckets' align";
         }
     }
     // I5: the mmq/q8_1 path is not routable (the selector skips it, and padded_n would
     // become a function of the row's wg_denoms there).
     if (src1_type == GGML_TYPE_Q8_1) {
         return "I5: rows must not target the mmq/q8_1 path";
+    }
+    return nullptr;
+}
+
+// Non-fatal advice for an oversized ALIGNED variant (t3-shell-plan.md section 6.1 item
+// 14b): the row may be installed, but the caller should warn and count it as
+// "conservative, not correctness" (predicate_rejects).  Returns nullptr when there is
+// nothing to say.
+static const char * ggml_vk_tuned_row_align_advice(const vk_matmul_pipeline & target, const vk_tuned_row * row) {
+    if (row == nullptr || row->aligned == nullptr) {
+        return nullptr;
+    }
+    uint32_t stock_align = 0;
+    const vk_pipeline stock[6] = { target->l, target->m, target->s, target->a_l, target->a_m, target->a_s };
+    for (const vk_pipeline & p : stock) {
+        if (p != nullptr && p->align > stock_align) {
+            stock_align = p->align;
+        }
+    }
+    if (row->aligned->align > stock_align) {
+        return "aligned variant align exceeds the stock buckets' align (conservative, not correctness)";
     }
     return nullptr;
 }
@@ -9691,6 +9738,7 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
     const char * reason_no_unaligned = nullptr;
     const char * reason_align = nullptr;
     uint32_t stock_align_dbg = 0;
+    bool i4_aligned_ok = false;
     if (f16_obj != nullptr && f16_obj->l != nullptr) {
         vk_tuned_row only_aligned_row;
         only_aligned_row.aligned = f16_obj->l;         // no unaligned -> I3
@@ -9705,9 +9753,19 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
         }
         vk_pipeline oversize = std::make_shared<vk_pipeline_struct>();
         oversize->align = stock_align_dbg * 2 + 1;
-        vk_tuned_row oversize_row;
-        oversize_row.unaligned = oversize;
-        reason_align = ggml_vk_tuned_row_check(ctx, f16_obj, GGML_TYPE_F16, GGML_TYPE_F16, &oversize_row);
+        vk_tuned_row oversize_unaligned_row;
+        oversize_unaligned_row.unaligned = oversize;
+        reason_align = ggml_vk_tuned_row_check(ctx, f16_obj, GGML_TYPE_F16, GGML_TYPE_F16, &oversize_unaligned_row);
+
+        // ... whereas an oversized ALIGNED variant is accepted and only advises
+        // (item 14b): a candidate-0-style geometry must not be stricter as a row than it
+        // is through KATAGO_VK_MM_TILE=custom:.
+        vk_tuned_row oversize_aligned_row;
+        oversize_aligned_row.unaligned = f16_obj->l;
+        oversize_aligned_row.aligned = oversize;
+        const char * check_aligned = ggml_vk_tuned_row_check(ctx, f16_obj, GGML_TYPE_F16, GGML_TYPE_F16, &oversize_aligned_row);
+        const char * advice_aligned = ggml_vk_tuned_row_align_advice(f16_obj, &oversize_aligned_row);
+        i4_aligned_ok = (check_aligned == nullptr && advice_aligned != nullptr);
     }
     const char * reason_q8_1 = ggml_vk_tuned_row_check(ctx, ctx->device->pipeline_matmul_f16.f16acc,
                                                        GGML_TYPE_F16, GGML_TYPE_Q8_1);
@@ -9779,7 +9837,8 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
               << (table_ok ? "ok" : "FAILED")
               << " [" << (int) install1 << (int) lookup_before_freeze << (int) !install2 << "]"
               << ", I3(no unaligned)=" << (reason_no_unaligned != nullptr ? "rejected" : "ACCEPTED (BUG)")
-              << ", I4(oversize align, stock=" << stock_align_dbg << ")=" << (reason_align != nullptr ? "rejected" : "ACCEPTED (BUG)")
+              << ", I4(oversize ALIGNED align, stock=" << stock_align_dbg << ")="
+              << (i4_aligned_ok ? "accepted+advised" : "WRONG")
               << ", I5(q8_1 target)=" << (reason_q8_1 != nullptr ? "rejected" : "ACCEPTED (BUG)")
               << ", axis classes=" << (axes_ok ? "ok" : "FAILED")
               << std::endl;
@@ -9814,8 +9873,8 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         // of an inference.  Printed from the production path only (the self-test uses a
         // local table), and only when the table is still open.
         if (vk_t2_on(8u) && !ctx->tuned.frozen) {
-            std::cerr << "ggml_vulkan: [T2] tuned rows frozen by first lookup (target families="
-                      << ctx->tuned.rows.size() << ")" << std::endl;
+            std::cerr << "ggml_vulkan: [T2] tuned rows frozen by first lookup (" << ggml_vk_tune_ctx_tag(ctx)
+                      << ", target families=" << ctx->tuned.rows.size() << ")" << std::endl;
         }
         const vk_tuned_row * row = ggml_vk_tuned_row_for(ctx, mmp, m, k);
         if (row != nullptr) {
@@ -9948,7 +10007,7 @@ static void ggml_vk_t2_dump_slot_histogram(ggml_backend_vk_context * ctx) {
         return;
     }
     ctx->t2.slot_dumped = ctx->t2.slot_total;
-    std::cerr << "ggml_vulkan: [T2] matmul pipeline histogram (device=" << ctx->device->name
+    std::cerr << "ggml_vulkan: [T2] matmul pipeline histogram (" << ggml_vk_tune_ctx_tag(ctx)
               << ", cumulative, dispatches=" << ctx->t2.slot_total << "):" << std::endl;
     for (const auto & kv : ctx->t2.slot_histogram) {
         std::cerr << "ggml_vulkan: [T2]   " << kv.first << " x " << kv.second << std::endl;
@@ -19006,6 +19065,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ctx->pr_recording = true;
             ctx->pr_ar_zeroed = false;   // lazy accumulator zeroing (see build_graph)
             ctx->pr_bad = false;
+            // T3 section 6.1 item 10: the third line of the "install -> frozen -> record"
+            // sequence.  Once pr replays, ggml_vk_matmul is not called at all (section 5),
+            // so this transition is the boundary the install had to precede.  One-shot and
+            // bit-8 gated, like the other surface diagnostics.
+            if (vk_t2_on(8u) && !ctx->t2.pr_recording_logged) {
+                ctx->t2.pr_recording_logged = true;
+                std::cerr << "ggml_vulkan: [T2] pr_recording first set (" << ggml_vk_tune_ctx_tag(ctx)
+                          << ", eval=" << ctx->pr_evals << ", tuned_rows_frozen="
+                          << (ctx->tuned.frozen ? 1 : 0) << ")" << std::endl;
+            }
         }
     }
 
@@ -19920,6 +19989,7 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
     VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
 
     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
+    ctx->tune_ctx_ordinal = vk_tune_ctx_counter.fetch_add(1u);   // T3 identity, see the field
     ggml_vk_init(ctx, dev_num);
 
     ggml_backend_t vk_backend = new ggml_backend {
@@ -19938,6 +20008,126 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
 
 bool ggml_backend_is_vk(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_vk_guid());
+}
+
+// ---------------------------------------------------------------------------
+// T3/T4 tuner interface (t3-shell-plan.md section 9.1 R1: four functions, no more).
+//
+// Deliberately NOT declared in ggml-vulkan.h: that header and the ggml CMake surface are
+// vendored public API and stay untouched (section 7.1-7).  The only consumer is the
+// KataGo-side shell, which declares these itself in neuralnet/vulkantuner.h.
+//
+// What must NOT appear here: candidate enumeration, predicates, gates, ranking, cache
+// paths.  All of that is the control plane and lives in the shell (R1/R5).  This side
+// knows how to resolve a row into pipelines and how to describe a device -- nothing else.
+//
+// Bump when the fingerprint's field list changes: an old cache must not be reused under a
+// new meaning (t1-schema.md section 1, "VERSION").
+#define VK_TUNE_FINGERPRINT_VERSION 1
+
+// Device/driver identity for the cache file name and header (t1-schema.md section 1).
+// Returns the number of bytes written excluding the terminator, or 0 when the caller's
+// buffer is too small or the backend is not a Vulkan one -- a truncated fingerprint would
+// silently alias two devices, so refusing is the only safe failure.
+size_t ggml_backend_vk_tune_fingerprint(ggml_backend_t backend, char * out, size_t out_size) {
+    if (out == nullptr || out_size == 0 || !ggml_backend_is_vk(backend)) {
+        return 0;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    const vk_device & device = ctx->device;
+
+    // Field list: the required header fields of t1-schema.md section 1 (vendorID,
+    // deviceID, driverVersion, sg, coopmat2/cm1, shaderCoreCount) plus the flags that
+    // also decide which (family, acc) objects exist at all.  Leaving fp16/bf16 out would
+    // let a cache written on one capability set be reused on another -- the capability
+    // half of the "capability != request" rule (G14).  `useFP16Mode` is NOT here and must
+    // never be: it is a request, and the same file has to serve both requests.
+    std::ostringstream ss;
+    ss << "vv" << VK_TUNE_FINGERPRINT_VERSION
+       << "|name=" << device->name
+       << "|vendorID=" << device->vendor_id
+       << "|deviceID=" << device->properties.deviceID
+       << "|driverVersion=" << device->properties.driverVersion
+       << "|apiVersion=" << device->properties.apiVersion
+       << "|sg=" << device->subgroup_size
+       << "|cm1=" << (device->coopmat_support ? 1 : 0)
+       << "|cm1acc16=" << (device->coopmat_acc_f16_support ? 1 : 0)
+       << "|cm2=" << (device->coopmat2 ? 1 : 0)
+       << "|cm2dv=" << (device->coopmat2_decode_vector ? 1 : 0)
+       << "|sms=" << device->shader_core_count
+       << "|fp16=" << (device->fp16 ? 1 : 0)
+       << "|bf16=" << (device->bf16 ? 1 : 0)
+       << "|uma=" << (device->uma ? 1 : 0);
+    const std::string s = ss.str();
+    if (s.size() + 1 > out_size) {
+        return 0;
+    }
+    std::memcpy(out, s.c_str(), s.size() + 1);
+    return s.size();
+}
+
+// Install a row set into ONE backend context.  Called by the shell once per context,
+// after ggml_backend_vk_init() and before the first graph build (section 6, step 1).
+//
+// 1b-2b scope: the production call is the EMPTY set -- the shell's decision, fingerprint
+// and cache plumbing are in place, while row -> pipeline resolution is T4.  The empty set
+// is a real, successful install (there is simply nothing to write), which is what makes
+// "one decision, one install per context" observable.
+//
+// A non-empty set is validated against the SAME rule table the enumerator uses (section
+// 1.7) and then refused LOUDLY: accepting rows and quietly not applying them is the
+// "set it and nothing happened" trap (lesson #46).  The validation is not decoration --
+// it is what makes the enumerator and this loader produce the same reason string for the
+// same bad geometry (section 6.1 item 11).
+bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row_spec * rows, size_t n_rows,
+                                       char * err, size_t err_size) {
+    const auto set_err = [&](const std::string & msg) {
+        if (err != nullptr && err_size > 0) {
+            snprintf(err, err_size, "%s", msg.c_str());
+        }
+    };
+    const auto refuse = [&](const std::string & msg) {
+        GGML_LOG_ERROR("ggml_vulkan: [T3] install refused (%s): %s\n",
+                       backend != nullptr && ggml_backend_is_vk(backend)
+                         ? ggml_vk_tune_ctx_tag((ggml_backend_vk_context *)backend->context).c_str()
+                         : "no vulkan context",
+                       msg.c_str());
+        set_err(msg);
+        return false;
+    };
+
+    if (!ggml_backend_is_vk(backend)) {
+        return refuse("not a Vulkan backend");
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    // One install per context, before the first shape lookup.  A later install would be
+    // applied to a table the first query already froze (R3) -- and once pre-record starts
+    // replaying, no lookup happens at all (section 5), so the rows would never be read.
+    if (ctx->tuned.frozen) {
+        return refuse("the row set is frozen: a shape lookup already happened, and a tuned row "
+                      "must be installed before the first graph build");
+    }
+
+    if (n_rows > 0) {
+        if (rows == nullptr) {
+            return refuse("n_rows > 0 but the row pointer is null");
+        }
+        for (size_t i = 0; i < n_rows; i++) {
+            const char * reason = vk_tile_candidate_reason(rows[i].path, rows[i].geom);
+            if (reason != nullptr) {
+                return refuse("row " + std::to_string(i) + " is not a legal geometry: " + reason);
+            }
+        }
+        return refuse(std::to_string(n_rows) + " row(s) are legal geometries, but row resolution "
+                      "(geometry -> pipeline) arrives in T4; nothing was installed");
+    }
+
+    // Empty set: nothing to write, and deliberately no write -- the freeze still happens
+    // on the first lookup, which is what keeps the install/freeze ordering evidence real.
+    std::cerr << "ggml_vulkan: [T3] install (" << ggml_vk_tune_ctx_tag(ctx)
+              << "): 0 rows (empty set is the 1b-2b production form)" << std::endl;
+    return true;
 }
 
 int ggml_backend_vk_get_device_count() {
