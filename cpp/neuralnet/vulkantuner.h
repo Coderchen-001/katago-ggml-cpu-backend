@@ -77,6 +77,13 @@ namespace VulkanTuner {
     // a different model, board size or max batch, and none of those may share a row set.
     std::string modelIdentity;    // header form (mv…-sha…-name…)
     bool negative = false;        // this key's row set is a "deterministically all-rejected" marker
+    // The policy half of the header (t1-schema.md section 4): a row set measured under one
+    // policy must not be reused under another.  `policyFingerprint` covers the build
+    // revision, the tuner's policy version and the policy-relevant env knobs;
+    // `baselineVersion` is the bump-this-when-the-fork's-default-policy-changes constant.
+    std::string policyFingerprint;
+    std::string baselineVersion;
+    std::string rowSetHash;       // computed from the rows, never carried in from a file
     int nnXLen = 0;
     int nnYLen = 0;
     int maxBatchSize = 0;
@@ -128,15 +135,32 @@ namespace VulkanTuner {
   //   VERSION <n>            schema version (refused on mismatch)
   //   TUNER_VERSION <n>      enumerator version (refused on mismatch)
   //   FINGERPRINT <string>   the full device/driver fingerprint (refused on mismatch)
+  //   POLICY <string>        policy fingerprint: build revision + policy version + knobs
+  //   BASELINE <string>      policy baseline version (bump when a default changes)
   //   MODEL <string>         outer key part 2 (absent = not key-checked)
   //   BOARD <X>x<Y>          outer key part 3
   //   MAXBATCH <n>           outer key part 4
+  //   ROWSET_HASH <hex>      hash of the row set, computed from the rows at write time
+  //   CREATED <iso8601>      when this file was written (informational)
   //   ROWS <n>               DECLARED row count: a file that lost rows in transit is
   //                          refused instead of being read as a shorter row set
   //   ROW <path> <src0> <src1> <key_m> <key_k> <BM> <BN> <BK> <WM> <WN> <WMITER> <TM> <TN> <BS> <pad> <reshape> <smaller>
   //   NEGATIVE <reason>      this (device, model, S, mb) was DETERMINISTICALLY all-rejected;
   //                          no tuning is attempted.  Never written on a timeout, and never
   //                          written for a partial result.
+  //
+  // WHICH HEADER KEYS ARE REQUIRED DEPENDS ON THE CHANNEL, and the split follows what each
+  // key GUARANTEES (2026-09-13 review):
+  //   required on BOTH channels -- POLICY, BASELINE: they carry "the policy changed, so this
+  //     row set is void".  A missing one would make that guarantee vanish silently, because
+  //     the parser accepts a file that is missing a merely-advisory key.
+  //   required on the CACHE channel only -- MODEL, BOARD, MAXBATCH, ROWSET_HASH, CREATED:
+  //     a cache is written by us, so there is no legitimate reason for a field to be absent,
+  //     and the filename routing alone would otherwise be the only check left.  IMPORT
+  //     tolerates their absence (hand-written fixtures must stay possible) and prints
+  //     "[not key-checked: ...]" so a human can see what was not verified.
+  //   ROWSET_HASH additionally never *refuses* on IMPORT: the parsed rows are hashed live and
+  //     the declared value is only a hint there, since a hand-written fixture cannot compute it.
   //
   // ONE FILE = ONE KEY (2026-09-13 decision): the file NAME carries the whole outer key --
   //   <sha256(fingerprint)[0:16]>-<model mvV-shaS>-<X>x<Y>-mb<N>.txt

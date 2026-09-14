@@ -11,10 +11,18 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <vector>
+
+// The build revision, obtained exactly the way main.cpp obtains it: a macro generated into the
+// build directory.  The plan's invalidation table requires "a code change invalidates the
+// row set" (t1-schema.md section 4, the buildHash row), and this is the sanction source for it;
+// asking the backend instead would need a fifth interface function (R1 forbids that).
+#include <program/gitinfo.h>
 
 // For the durable flush in writeFileAtomic(): _commit (the MSVC spelling of fsync, which
 // needs only <io.h> -- deliberately NOT the Win32 FlushFileBuffers, whose headers drag in
@@ -63,8 +71,35 @@ namespace VulkanTuner {
     // migration and none is needed: no production cache file existed before this (EXPORT was
     // the only writer and only tests asked for it).  A VERSION 1 file is refused loudly,
     // which is right for a file whose rows were not keyed to the name they live under.
-    const int SCHEMA_VERSION = 2;
+    const int SCHEMA_VERSION = 3;
+    // TUNER_VERSION = the ENUMERATOR's version: it changes when the way candidates are
+    // enumerated/measured changes.  This cut adds header fields, not enumeration, so it stays
+    // while SCHEMA_VERSION moves.
     const int TUNER_VERSION = 2;
+
+    // The policy baseline (t1-schema.md section 4, "baselineVersion"): a row set measured
+    // under one policy must not be reused under another.  Bump this whenever the fork's
+    // DEFAULT policy changes (e.g. a new default FA tile or RMS variant) without any env
+    // change -- that is exactly the case neither the build revision nor the env knobs catch
+    // if a default is edited in place and the revision happens to match.
+    const int TUNER_POLICY_VERSION = 1;
+
+    // Which header keys are required depends on the CHANNEL, and the split follows what each
+    // key GUARANTEES.  These two arrays are the single source of truth: the parser builds its
+    // "absent" list from REQUIRED_FOR_CACHE, and R12 in t3-guardrails.py verifies both sets,
+    // so moving a key between buckets is a deliberate act that has to go through the guardrail.
+    //
+    //   REQUIRED_ANY_CHANNEL -- the key carries a guarantee ("the policy changed, so this row
+    //     set is void").  Because the parser ACCEPTS a file that is missing a merely-advisory
+    //     key, putting such a key in the other bucket would make the guarantee vanish
+    //     silently: the file loads, the policy changes, nothing invalidates anything.
+    //   REQUIRED_FOR_CACHE -- a cache is written by us, so absence has no legitimate
+    //     explanation; tolerated on IMPORT (hand-written fixtures) with a "[not key-checked]"
+    //     note.  For ROWSET_HASH the tolerance goes further on IMPORT: the parsed rows are
+    //     hashed live and the declared value is only a hint, since a human cannot compute it.
+    const char* const REQUIRED_ANY_CHANNEL[] = { "POLICY", "BASELINE" };
+    const char* const REQUIRED_FOR_CACHE[] = { "MODEL", "BOARD", "MAXBATCH", "ROWSET_HASH", "CREATED" };
+
 
     // Row-count cap.  ONE constant used by BOTH the writer and the parser (a cap that only
     // one side enforces is a cap that produces files the other side rejects): a file with
@@ -85,6 +120,91 @@ namespace VulkanTuner {
       char hash[65];
       SHA2::get256(reinterpret_cast<const uint8_t*>(s.data()), s.size(), hash);
       return string(hash).substr(0, 16);
+    }
+
+    // Make a *value* safe to place in a line-oriented text format: no newline (which would
+    // forge a field), no whitespace-only confusion, no control characters.  Values come from
+    // env vars and model names, i.e. from outside this program.
+    string sanitizeValue(const string& in, size_t maxLen) {
+      string out;
+      for (char c : in) {
+        if (out.size() >= maxLen) {
+          break;
+        }
+        const unsigned char u = (unsigned char) c;
+        out += (u < 0x20 || u == 0x7f) ? '_' : c;
+      }
+      return out;
+    }
+
+    // The policy fingerprint (t1-schema.md section 4): build revision + policy version + the
+    // policy-relevant env knobs.  Deliberately assembled HERE rather than asked of the
+    // backend, because the interface is capped at four functions (R1) and none of these facts
+    // needs a Vulkan device to read.  The env values are the *requests*; the resolved variant
+    // also depends on the device, which is already in the fingerprint/name, so the pair
+    // (device, policy) is fully covered.
+    string policyFingerprint() {
+      static const char* const KNOBS[] = {
+        "KATAGO_VK_FA", "KATAGO_VK_FA_TILE", "KATAGO_VK_FA_PRECISE", "KATAGO_VK_FA_NULL",
+        "KATAGO_VK_RMS_SUBGROUP", "KATAGO_VK_M4_FUSION", "KATAGO_VK_MMPREC_F32",
+        "GGML_VK_DISABLE_COOPMAT", "GGML_VK_DISABLE_COOPMAT2", "KATAGO_VK_MM_TILE",
+      };
+      string s = "b" + sanitizeValue(string(GIT_REVISION), 16)
+               + "|p" + std::to_string(TUNER_POLICY_VERSION);
+      for (const char* knob : KNOBS) {
+        const char* v = getenv(knob);
+        s += "|";
+        s += knob;
+        s += "=";
+        s += (v == nullptr) ? string("-") : sanitizeValue(string(v), 24);
+      }
+      return s;
+    }
+
+    // FNV-1a over the rows' identity+geometry, spelled out field by field (never over the
+    // struct's bytes: padding would make the hash depend on the compiler).  This is what
+    // ROWSET_HASH declares, and on the cache channel a mismatch means the file does not
+    // describe the rows it contains.
+    string rowSetHash(const vector<vk_tune_row_spec>& rows) {
+      uint64_t h = 1469598103934665603ull;
+      auto feed = [&h](uint32_t v) {
+        for (int i = 0; i < 4; i++) {
+          h ^= (v >> (8 * i)) & 0xffu;
+          h *= 1099511628211ull;
+        }
+      };
+      feed((uint32_t) rows.size());
+      for (const vk_tune_row_spec& r : rows) {
+        feed((uint32_t) r.path);
+        feed((uint32_t) r.src0_type);
+        feed((uint32_t) r.src1_type);
+        feed(r.key_m);
+        feed(r.key_k);
+        feed(r.geom.BM); feed(r.geom.BN); feed(r.geom.BK);
+        feed(r.geom.WM); feed(r.geom.WN); feed(r.geom.WMITER);
+        feed(r.geom.TM); feed(r.geom.TN); feed(r.geom.BS);
+        feed((uint32_t) r.geom.pad);
+        feed((uint32_t) r.geom.reshape);
+        feed((uint32_t) r.geom.smaller);
+      }
+      ostringstream os;
+      os << hex << h;
+      return os.str();
+    }
+
+    // ISO-8601 UTC, e.g. 2026-09-13T21:04:05Z.  Informational only: nothing is invalidated by
+    // it (POLICY/BASELINE do that), but a human reading the cache wants to know its age.
+    string createdAtNow() {
+      const std::time_t now = std::time(nullptr);
+      std::tm tmUtc {};
+#if defined(_WIN32)
+      gmtime_s(&tmUtc, &now);
+#else
+      gmtime_r(&now, &tmUtc);
+#endif
+      char buf[32];
+      std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmUtc);
+      return string(buf);
     }
 
     // Size of the persistent pipeline cache this process LOADED (t1-schema.md section 1,
@@ -121,12 +241,20 @@ namespace VulkanTuner {
       int tunerVersion = 0;
       bool foundFingerprint = false;
       string fingerprint;
+      bool foundPolicy = false;
+      string policy;
+      bool foundBaseline = false;
+      string baseline;
       bool foundModel = false;
       string model;
       bool foundBoard = false;
       int boardX = 0, boardY = 0;
       bool foundMaxBatch = false;
       int maxBatch = 0;
+      bool foundRowSetHash = false;
+      string declaredRowSetHash;
+      bool foundCreated = false;
+      string created;
       bool foundDeclaredRows = false;
       long declaredRows = -1;
       vector<vk_tune_row_spec> rows;
@@ -302,6 +430,22 @@ namespace VulkanTuner {
           out.foundFingerprint = true;
           out.fingerprint = line.substr(12);
         }
+        else if (line.compare(0, 7, "POLICY ") == 0) {
+          out.foundPolicy = true;
+          out.policy = line.substr(7);
+        }
+        else if (line.compare(0, 9, "BASELINE ") == 0) {
+          out.foundBaseline = true;
+          out.baseline = line.substr(9);
+        }
+        else if (line.compare(0, 12, "ROWSET_HASH ") == 0) {
+          out.foundRowSetHash = true;
+          out.declaredRowSetHash = line.substr(12);
+        }
+        else if (line.compare(0, 8, "CREATED ") == 0) {
+          out.foundCreated = true;
+          out.created = line.substr(8);
+        }
         else if (line.compare(0, 6, "MODEL ") == 0) {
           out.foundModel = true;
           out.model = line.substr(6);
@@ -359,21 +503,20 @@ namespace VulkanTuner {
               + to_string(out.rows.size()) + " ROW lines (truncated or hand-edited file?)";
         return false;
       }
-      // The header keys fall into two buckets, and which bucket a key is in is a DESIGN
-      // decision, not an implementation detail:
-      //   REQUIRED (absent => the caller refuses the file): FINGERPRINT, VERSION,
-      //     TUNER_VERSION -- and, from step 3, POLICY and BASELINE, which must arrive in the
-      //     same batch as VERSION 3;
-      //   ADVISORY (absent => accepted with a "[not key-checked: ...]" note): MODEL, BOARD,
-      //     MAXBATCH, purely so a hand-written fixture does not have to spell out every key.
-      // Why it matters: because a missing advisory key is ACCEPTED, putting a key that
-      // GUARANTEES something into this bucket makes the guarantee vanish silently -- a
-      // missing POLICY would load fine, so "the policy changed, the negative entry is void"
-      // would never fire and would never complain.  Guardrail R12 freezes this bucket at
-      // exactly these three names, so a fourth is a deliberate act.
-      if (!out.foundModel) out.absentKeys.push_back("MODEL");
-      if (!out.foundBoard) out.absentKeys.push_back("BOARD");
-      if (!out.foundMaxBatch) out.absentKeys.push_back("MAXBATCH");
+      // The ADVISORY set is built from the declared array, not from a hand-written list: the
+      // parser cannot drift from REQUIRED_FOR_CACHE, and R12 checks the array's contents.
+      for (const char* key : REQUIRED_FOR_CACHE) {
+        const string k(key);
+        bool found = false;
+        if (k == "MODEL") found = out.foundModel;
+        else if (k == "BOARD") found = out.foundBoard;
+        else if (k == "MAXBATCH") found = out.foundMaxBatch;
+        else if (k == "ROWSET_HASH") found = out.foundRowSetHash;
+        else if (k == "CREATED") found = out.foundCreated;
+        if (!found) {
+          out.absentKeys.push_back(k);
+        }
+      }
       return true;
     }
 
@@ -384,9 +527,13 @@ namespace VulkanTuner {
       os << "VERSION " << SCHEMA_VERSION << "\n";
       os << "TUNER_VERSION " << TUNER_VERSION << "\n";
       os << "FINGERPRINT " << d.fingerprint << "\n";
+      os << "POLICY " << d.policyFingerprint << "\n";
+      os << "BASELINE " << d.baselineVersion << "\n";
       os << "MODEL " << d.modelIdentity << "\n";
       os << "BOARD " << d.nnXLen << "x" << d.nnYLen << "\n";
       os << "MAXBATCH " << d.maxBatchSize << "\n";
+      os << "ROWSET_HASH " << rowSetHash(d.rows) << "\n";
+      os << "CREATED " << createdAtNow() << "\n";
       // One file = one key, so "this key has rows" and "this key was all-rejected" are
       // mutually exclusive statements.  The writer refuses to emit both; the reader still
       // copes with a hand-edited file containing both (rows win, loudly).  The remaining
@@ -425,6 +572,8 @@ namespace VulkanTuner {
          << " S=" << nnXLen << "x" << nnYLen
          << " mb=" << maxBatchSize
          << " model=" << d.modelIdentity
+         << " policy=" << d.policyFingerprint
+         << " baseline=" << d.baselineVersion
          << " rows=" << d.rowCount
          << " source=" << d.rowSource
          << " cache_state=" << d.cacheState
@@ -489,6 +638,8 @@ namespace VulkanTuner {
     d->nnYLen = nnYLen;
     d->maxBatchSize = maxBatchSize;
     d->modelIdentity = model.headerValue();
+    d->policyFingerprint = policyFingerprint();
+    d->baselineVersion = std::to_string(TUNER_POLICY_VERSION);
     d->rowSource = "none";   // stays "none" unless a load actually produced rows
 
     try {
@@ -581,6 +732,32 @@ namespace VulkanTuner {
                               + "/TUNER_VERSION=" + to_string(TUNER_VERSION));
           d->note = string(loadKind) + " was written by another schema version";
         }
+        else if (!file.foundPolicy || !file.foundBaseline) {
+          // REQUIRED_ANY_CHANNEL: these carry "the policy changed, so this row set is void".
+          // Accepting a file without them would make that guarantee vanish silently -- the file
+          // would load, the policy would change, and nothing would invalidate anything -- which
+          // is why they are refused on BOTH channels rather than tolerated like MODEL/BOARD.
+          d->cacheState = "rejected";
+          refuseLoad(loadKind, string("missing header key(s) ")
+                              + (file.foundPolicy ? "" : "POLICY")
+                              + (file.foundPolicy || file.foundBaseline ? "" : ",")
+                              + (file.foundBaseline ? "" : "BASELINE")
+                              + " (a missing policy key would let a policy change go unnoticed)");
+          d->note = string(loadKind) + " does not say which policy its rows were measured under";
+        }
+        else if (file.policy != d->policyFingerprint) {
+          // The row set belongs to a different policy: void, not "possibly still fine".
+          d->cacheState = "rejected";
+          refuseLoad(loadKind, "policy fingerprint mismatch (file=" + file.policy
+                              + " current=" + d->policyFingerprint + ")");
+          d->note = string(loadKind) + " was measured under another policy";
+        }
+        else if (file.baseline != d->baselineVersion) {
+          d->cacheState = "rejected";
+          refuseLoad(loadKind, "baseline version mismatch (file=" + file.baseline
+                              + " current=" + d->baselineVersion + ")");
+          d->note = string(loadKind) + " was measured against another policy baseline";
+        }
         else if (!fromImport && !file.absentKeys.empty()) {
           // Channel-dependent required keys (2026-09-13 review).  Both channels share this
           // loader, but they differ in what they may tolerate:
@@ -623,6 +800,16 @@ namespace VulkanTuner {
             refuseLoad(loadKind, "outer key mismatch on " + keyMismatch);
             d->note = string(loadKind) + " is for a different model/board/batch";
           }
+          else if (!fromImport && file.foundRowSetHash
+                   && file.declaredRowSetHash != rowSetHash(file.rows)) {
+            // The cache channel: the file must describe the rows it contains.  A mismatch means
+            // it was edited or truncated after it was written.
+            d->cacheState = "rejected";
+            refuseLoad(loadKind, "ROWSET_HASH mismatch (file=" + file.declaredRowSetHash
+                                + " computed=" + rowSetHash(file.rows)
+                                + "): the file does not describe the rows it contains");
+            d->note = string(loadKind) + " was edited after it was written";
+          }
           else {
             string keyNote;
             if (!file.absentKeys.empty()) {
@@ -631,6 +818,14 @@ namespace VulkanTuner {
                 keyNote += (i ? "," : " ") + file.absentKeys[i];
               }
               keyNote += "]";
+            }
+            if (fromImport && file.foundRowSetHash
+                && file.declaredRowSetHash != rowSetHash(file.rows)) {
+              // IMPORT: the declared hash is a HINT, never a refusal reason -- a hand-written
+              // fixture cannot compute it, and the rows that were actually parsed are what get
+              // used.  (The cache channel refuses the same mismatch: see above.)
+              keyNote += " [declared ROWSET_HASH differs from the parsed rows;"
+                         " the parsed rows are used]";
             }
             d->imported = fromImport;
             if (fromImport) {
