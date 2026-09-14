@@ -3362,8 +3362,12 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     try {
         pipeline->pipeline = device->device.createComputePipeline(device->pipeline_cache, compute_pipeline_create_info).value;
     } catch (const vk::SystemError& e) {
-        std::cerr << "ggml_vulkan: Compute pipeline creation failed for " << pipeline->name << std::endl;
-        std::cerr << "ggml_vulkan: " << e.what() << std::endl;
+        // Error paths go through the writer too: an error is the line most likely to be
+        // read by a harness, and it is the one least likely to be excused for being
+        // unparsable.  Not in the counted inventory (it is not a per-shape evidence line),
+        // but the same single-insertion rule applies -- see guardrail R10e's whitelist.
+        ggml_vk_evidence_line("ggml_vulkan: Compute pipeline creation failed for " + pipeline->name);
+        ggml_vk_evidence_line("ggml_vulkan: " + std::string(e.what()));
         throw e;
     }
     if (vk_t2_on(2u)) {
