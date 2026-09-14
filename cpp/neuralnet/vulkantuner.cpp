@@ -57,8 +57,14 @@ namespace VulkanTuner {
     // Schema version of anything this file reads or writes.  Bump it when the MEANING of
     // a field changes: a cache written by an older tuner must not be read as if it had
     // today's meaning (t1-schema.md section 1, "VERSION").
-    const int SCHEMA_VERSION = 1;
-    const int TUNER_VERSION = 1;
+    //
+    // VERSION 2 (2026-09-13): the outer key moved into the FILE NAME (one file = one key) and
+    // ROWS/NEGATIVE became mutually exclusive statements about that key.  There is NO
+    // migration and none is needed: no production cache file existed before this (EXPORT was
+    // the only writer and only tests asked for it).  A VERSION 1 file is refused loudly,
+    // which is right for a file whose rows were not keyed to the name they live under.
+    const int SCHEMA_VERSION = 2;
+    const int TUNER_VERSION = 2;
 
     // Row-count cap.  ONE constant used by BOTH the writer and the parser (a cap that only
     // one side enforces is a cap that produces files the other side rejects): a file with
@@ -369,6 +375,17 @@ namespace VulkanTuner {
       os << "MODEL " << d.modelIdentity << "\n";
       os << "BOARD " << d.nnXLen << "x" << d.nnYLen << "\n";
       os << "MAXBATCH " << d.maxBatchSize << "\n";
+      // One file = one key, so "this key has rows" and "this key was all-rejected" are
+      // mutually exclusive statements.  The writer refuses to emit both; the reader still
+      // copes with a hand-edited file containing both (rows win, loudly).  The remaining
+      // case -- neither -- is only reachable through EXPORT of an empty row set, which is
+      // how the format is demonstrated in tests; the CACHE write path (step 3) must never
+      // write it, because loading a file that says nothing would still look like "this key
+      // is already decided".
+      if (!d.rows.empty() && d.negative) {
+        throw StringError("VulkanTuner: refusing to write a file with both ROW and NEGATIVE"
+                          " (one file = one key: the two are exclusive statements)");
+      }
       // The writer enforces the SAME cap the parser does (MAX_ROWS_PER_FILE).  Refusing to
       // write an over-cap set is the only honest option: writing it would produce a file
       // that the reader then rejects, i.e. a cache that silently never loads.
@@ -431,7 +448,7 @@ namespace VulkanTuner {
     int nnXLen,
     int nnYLen,
     int maxBatchSize,
-    const string& modelIdentity
+    const ModelIdentity& model
   ) {
     const char* importEnv = getenv("KATAGO_VK_TUNE_IMPORT");
     const char* exportEnv = getenv("KATAGO_VK_TUNE_EXPORT");
@@ -459,7 +476,7 @@ namespace VulkanTuner {
     d->nnXLen = nnXLen;
     d->nnYLen = nnYLen;
     d->maxBatchSize = maxBatchSize;
-    d->modelIdentity = modelIdentity;
+    d->modelIdentity = model.headerValue();
     d->rowSource = "none";   // stays "none" unless a load actually produced rows
 
     try {
@@ -482,7 +499,16 @@ namespace VulkanTuner {
           : d->fingerprint.substr(at + 6, (end == string::npos ? d->fingerprint.size() : end) - (at + 6));
       }
 
-      d->deviceFile = shortHash(d->fingerprint) + ".txt";
+      // ONE FILE = ONE KEY: the file name carries the whole outer key, so "re-tune" is a
+      // whole-file overwrite rather than a read-modify-write, and a `benchmark -threads
+      // 1,2,4` sweep keeps every bucket's rows instead of only the last one's.  The header
+      // still holds the same key as the AUTHORITY (a hand-renamed or cross-machine-copied
+      // file is caught there); the two cannot drift because both come from this Decision.
+      // The model NAME is deliberately absent from the name -- it can contain characters a
+      // filesystem dislikes, and it is redundant with the sha for routing.
+      d->deviceFile = shortHash(d->fingerprint) + "-" + model.fileTag() + "-"
+                    + std::to_string(nnXLen) + "x" + std::to_string(nnYLen)
+                    + "-mb" + std::to_string(maxBatchSize) + ".txt";
       d->cacheDir = HomeData::getHomeDataDir(true, homeDataDirOverride) + "/vulkan-tune";
       MakeDir::make(d->cacheDir);
       d->cachePath = d->cacheDir + "/" + d->deviceFile;
@@ -579,7 +605,18 @@ namespace VulkanTuner {
             d->rowCount = d->rows.size();
             d->rowSource = fromImport ? "import" : "cache";
             d->cacheState = file.negative ? "negative" : "loaded";
-            if (file.negative) {
+            d->negative = file.negative && file.rows.empty();
+            if (file.negative && !file.rows.empty()) {
+              // Reachable only from a hand-edited or merged file: the writer refuses to emit
+              // both (one file = one key makes them exclusive statements about that key).
+              // The rows are the useful thing, so they win -- but saying nothing would turn
+              // "we wrote NEGATIVE and it still installed rows" into a mystery (lesson #46).
+              d->cacheState = "loaded";
+              logLine("WARNING: " + string(loadKind) + " has both ROW and NEGATIVE for this key"
+                      " (the writer never emits that); using the " + to_string(d->rowCount)
+                      + " row(s) and treating the negative entry as stale");
+            }
+            if (d->negative) {
               // A negative entry means "this (device, model, S, mb) was DETERMINISTICALLY
               // all-rejected": there is nothing to install and nothing to try.  It is never
               // written on a timeout (t1-schema.md section 1), because "we ran out of time"

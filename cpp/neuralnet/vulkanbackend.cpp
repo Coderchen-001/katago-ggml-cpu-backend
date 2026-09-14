@@ -2557,15 +2557,14 @@ struct ComputeHandle {
       // The model half of the cache's outer key (t1-schema.md section 4): two models can
       // share the device, board size and batch size and still need different tiles, because
       // the model decides the (m,k) shapes.  Uses the model's OWN sha256 (already computed
-      // when the model was loaded -- no extra 64-355 MB hash on every startup), with the
-      // version and name as the readable part.  A model whose sha is unavailable still gets
-      // a stable identity, and the cache header records exactly what was used.
+      // when the model was loaded -- no extra 64-355 MB hash on every startup).  The sha goes
+      // into the file NAME truncated to 16 hex characters (an identity, not a checksum:
+      // mv+name are the backstop), the name only into the header.
       const ModelDesc& md = loadedModel->modelDesc;
-      string modelIdentity = Global::strprintf(
-        "mv%d-sha%s-name%s",
-        md.modelVersion,
-        md.sha256.empty() ? "none" : md.sha256.substr(0, 16).c_str(),
-        md.name.empty() ? "none" : md.name.c_str());
+      VulkanTuner::ModelIdentity modelKey;
+      modelKey.version = md.modelVersion;
+      modelKey.sha16 = md.sha256.empty() ? "none" : md.sha256.substr(0, 16);
+      modelKey.name = md.name;
       std::shared_ptr<VulkanTuner::Decision> tuneDecision;
       {
         // The decision map is per ComputeContext and NN server threads are created
@@ -2578,7 +2577,7 @@ struct ComputeHandle {
             effectiveDeviceIdx,
             VulkanTuner::makeDecision(
               backend, effectiveDeviceIdx, ctx->homeDataDirOverride,
-              ctx->nnXLen, ctx->nnYLen, maxBatchSize, modelIdentity)
+              ctx->nnXLen, ctx->nnYLen, maxBatchSize, modelKey)
           ).first;
         }
         tuneDecision = it->second;

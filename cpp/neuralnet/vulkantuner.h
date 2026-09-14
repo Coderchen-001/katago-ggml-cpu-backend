@@ -43,6 +43,26 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
 
 namespace VulkanTuner {
 
+  // The model half of the cache's outer key, built by the caller from the loaded model's
+  // description (the shell must not learn what a LoadedModel is).  Split into the two forms
+  // the format needs:
+  //   * `name` goes ONLY into the file header -- a model name can contain characters that
+  //     are not safe in a filename, and it is redundant with the sha for routing;
+  //   * `fileTag` is the filename-safe `mv<version>-sha<sha16>` form.
+  struct ModelIdentity {
+    int version = 0;
+    std::string sha16;   // sha256[0:16], or "none" when the model has no sha
+    std::string name;    // for the header only
+    // `mv<version>-sha<sha16>`: used in the file name.
+    std::string fileTag() const {
+      return "mv" + std::to_string(version) + "-sha" + (sha16.empty() ? std::string("none") : sha16);
+    }
+    // `mv<version>-sha<sha16>-name<name>`: written to the header's MODEL field.
+    std::string headerValue() const {
+      return fileTag() + "-name" + (name.empty() ? std::string("none") : name);
+    }
+  };
+
   // One tune decision, taken at most once per (evaluator, device) and reused by every
   // context on that device (t3-shell-plan.md section 2).  Immutable once built.
   struct Decision {
@@ -55,9 +75,8 @@ namespace VulkanTuner {
     bool cacheFileExists = false;
     // The rest of the cache's outer key (t1-schema.md section 4): the same device can hold
     // a different model, board size or max batch, and none of those may share a row set.
-    // `modelIdentity` is derived from the loaded model's description by the caller -- the
-    // shell must not learn what a LoadedModel is.
-    std::string modelIdentity;
+    std::string modelIdentity;    // header form (mv…-sha…-name…)
+    bool negative = false;        // this key's row set is a "deterministically all-rejected" marker
     int nnXLen = 0;
     int nnYLen = 0;
     int maxBatchSize = 0;
@@ -95,7 +114,7 @@ namespace VulkanTuner {
     int nnXLen,
     int nnYLen,
     int maxBatchSize,
-    const std::string& modelIdentity
+    const ModelIdentity& model
   );
 
   // Per-context install.  Called once per ComputeHandle, after the backend exists and
@@ -115,9 +134,24 @@ namespace VulkanTuner {
   //   ROWS <n>               DECLARED row count: a file that lost rows in transit is
   //                          refused instead of being read as a shorter row set
   //   ROW <path> <src0> <src1> <key_m> <key_k> <BM> <BN> <BK> <WM> <WN> <WMITER> <TM> <TN> <BS> <pad> <reshape> <smaller>
-  //   NEGATIVE <reason>      optional: this (device, model, S, mb) was DETERMINISTICALLY
-  //                          all-rejected; no tuning is attempted.  Never written on a
-  //                          timeout, and never written for a partial result.
+  //   NEGATIVE <reason>      this (device, model, S, mb) was DETERMINISTICALLY all-rejected;
+  //                          no tuning is attempted.  Never written on a timeout, and never
+  //                          written for a partial result.
+  //
+  // ONE FILE = ONE KEY (2026-09-13 decision): the file NAME carries the whole outer key --
+  //   <sha256(fingerprint)[0:16]>-<model mvV-shaS>-<X>x<Y>-mb<N>.txt
+  // -- while the header's FINGERPRINT/MODEL/BOARD/MAXBATCH stay the AUTHORITY and are still
+  // checked item by item.  The name routes, the header verifies: a hand-renamed or
+  // cross-machine-copied file is caught by the header, and the two cannot drift because both
+  // are built from the same Decision.  Why the key is in the name rather than in per-row
+  // columns: with one key per file, "re-tune" is a whole-file overwrite instead of a
+  // read-modify-write (the classic way a cache gets corrupted), and only then does a
+  // `benchmark -threads 1,2,4` sweep keep every bucket's rows instead of only the last
+  // one's.  Precedent: OpenCLTuner::defaultFileName, which the plan says to mirror.
+  //
+  // Because one file = one key, ROWS and NEGATIVE are mutually exclusive STATEMENTS about
+  // that key: the writer refuses to emit both (see formatRowsFileImpl).  The reader still
+  // handles a hand-edited file containing both by preferring the rows and saying so loudly.
   std::string formatRowsFile(const Decision& decision);
 
 }  // namespace VulkanTuner
