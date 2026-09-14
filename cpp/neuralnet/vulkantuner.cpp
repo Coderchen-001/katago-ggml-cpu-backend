@@ -225,6 +225,22 @@ namespace VulkanTuner {
       }
     }
 
+    // THE single place that decides whether this process may write a cache file.
+    //
+    // Not `!policy.off` spelled out at each call site: a guardrail can only check TEXT, so the
+    // thing it must recognise has to be ONE NAMED predicate (the same reason R1/R3 exist).  Two
+    // earlier versions of that guardrail were unsound for exactly this reason -- "is the string
+    // policy.off nearby?" is satisfied by an unrelated `if (policy.off) { }`, and it is violated
+    // by a helper gated by its caller (forcing a comment written only to satisfy the guardrail).
+    // So: write permission has ONE decision point, and R16 checks that the innermost condition
+    // at the write site names it.
+    //
+    // KATAGO_VK_TUNE=0 is deliberately not consulted here: it never reaches a decision at all.
+    // This answers only the user-facing read-only mode.
+    bool cacheWriteAllowed(const TunePolicy & policy) {
+      return !policy.off;
+    }
+
     // The policy fingerprint (t1-schema.md section 4): build revision + policy version + the
     // policy-relevant env knobs.  Deliberately assembled HERE rather than asked of the
     // backend, because the interface is capped at four functions (R1) and none of these facts
