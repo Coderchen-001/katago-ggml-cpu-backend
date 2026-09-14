@@ -113,7 +113,7 @@ namespace VulkanTuner {
          << " deviceIdx=" << d.deviceIdx
          << " S=" << nnXLen << "x" << nnYLen
          << " mb=" << maxBatchSize
-         << " rows=" << d.rows
+         << " rows=" << d.rowCount
          << " source=" << (d.imported ? "import" : "none")
          << " tune_ms=" << d.tuneMs
          << " cache=" << d.deviceFile
@@ -236,7 +236,7 @@ namespace VulkanTuner {
 
       // 1b-2b: the row set is empty by construction.  Tuning/cache loading replaces this
       // in step 2 and must produce rows through the same legality table (section 1.7).
-      d->rows = 0;
+      d->rowCount = 0;
       d->tuneMs = chrono::duration<double, milli>(chrono::steady_clock::now() - t0).count();
       cerr << formatDecisionLine(*d, nnXLen, nnYLen, maxBatchSize) << endl;
       return d;
@@ -258,7 +258,7 @@ namespace VulkanTuner {
     // the context), so this side only has to report a failure.
     const vk_tune_row_spec* rows = nullptr;
     string err;
-    if (!backendInstallRows(backend, rows, decision->rows, err)) {
+    if (!backendInstallRows(backend, rows, decision->rowCount, err)) {
       cerr << LOG_PREFIX << "WARNING: install failed for " << decision->deviceName << ": " << err
            << " (fail-open: this context uses the stock heuristic)" << endl;
     }

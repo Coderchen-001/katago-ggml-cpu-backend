@@ -59,7 +59,11 @@ namespace VulkanTuner {
     // only exists at the NEXT startup, so a single run can report the "before" half.
     bool hasPipelineCacheBytes = false;
     size_t pipelineCacheBytesBefore = 0;
-    size_t rows = 0;              // rows handed to the backend (1b-2b: always 0)
+    // How many rows were handed to the backend (1b-2b: always 0).  A COUNT, not the rows
+    // themselves: the rows are the backend's business and only cross the interface once,
+    // inside installForHandle.  The decision log prints it as the `rows=` field -- renaming
+    // the member to rowCount is what keeps "rows" from reading like a row container.
+    size_t rowCount = 0;
     double tuneMs = 0.0;          // wall time of this decision, never mixed into visits/s
     std::string note;             // one short human-readable clause for the log line
   };

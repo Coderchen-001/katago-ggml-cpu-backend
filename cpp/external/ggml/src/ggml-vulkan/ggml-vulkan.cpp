@@ -9725,7 +9725,8 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
     // A real object that the resolver does not return for this family => I2 must
     // reject (pick any non-null, non-resolved candidate).
     const char * reason_mismatch = nullptr;
-    const char * family_name = "n/a";    const vk_matmul_pipeline bf16_cand = ctx->device->pipeline_matmul_bf16;
+    const char * family_name = "n/a";
+    const vk_matmul_pipeline bf16_cand = ctx->device->pipeline_matmul_bf16;
     if (bf16_cand != nullptr && bf16_cand->l != nullptr) {
         reason_mismatch = ggml_vk_tuned_row_check(ctx, bf16_cand, GGML_TYPE_F16, GGML_TYPE_F32);
         family_name = "bf16";
@@ -20087,11 +20088,17 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
         }
     };
     const auto refuse = [&](const std::string & msg) {
-        GGML_LOG_ERROR("ggml_vulkan: [T3] install refused (%s): %s\n",
-                       backend != nullptr && ggml_backend_is_vk(backend)
-                         ? ggml_vk_tune_ctx_tag((ggml_backend_vk_context *)backend->context).c_str()
-                         : "no vulkan context",
-                       msg.c_str());
+        // std::cerr, not GGML_LOG_ERROR: EVERY [T3] line is on stderr so the whole
+        // install/refuse series is one stream.  GGML_LOG_* goes through ggml's log
+        // callback, which an embedder may replace or level-filter -- an evidence line
+        // that can be routed away from stderr is an evidence line the harness will
+        // eventually fail to see (that mistake was already made once while building
+        // this cut's smoke script).  The T2 probe series made the same choice.
+        std::cerr << "ggml_vulkan: [T3] install refused ("
+                  << (backend != nullptr && ggml_backend_is_vk(backend)
+                        ? ggml_vk_tune_ctx_tag((ggml_backend_vk_context *)backend->context)
+                        : std::string("no vulkan context"))
+                  << "): " << msg << std::endl;
         set_err(msg);
         return false;
     };
