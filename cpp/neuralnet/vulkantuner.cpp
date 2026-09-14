@@ -77,11 +77,28 @@ namespace VulkanTuner {
     // while SCHEMA_VERSION moves.
     const int TUNER_VERSION = 2;
 
-    // The policy baseline (t1-schema.md section 4, "baselineVersion"): a row set measured
-    // under one policy must not be reused under another.  Bump this whenever the fork's
-    // DEFAULT policy changes (e.g. a new default FA tile or RMS variant) without any env
-    // change -- that is exactly the case neither the build revision nor the env knobs catch
-    // if a default is edited in place and the revision happens to match.
+    // The policy baseline counter (t1-schema.md section 4, "baselineVersion").
+    //
+    // SAME SOURCE as the `p<N>` component of the policy fingerprint: one counter, recorded in
+    // two places (the POLICY string and the BASELINE field).  NOT split into a second counter
+    // on purpose -- see the note in t1-schema.md section 1.1: two manual counters can each be
+    // forgotten, leaving a key that LOOKS maintained, while the diagnostic distinction they
+    // would buy ("was this a policy change or a baseline change?") is already given by
+    // b<rev16> for anything committed.  Split it later only if the stock baseline becomes
+    // mechanically reportable (a backend-reported baseline id), which today would cost the
+    // fifth interface name that step 5 wants for probe_candidate.
+    //
+    // 🔴 BUMP THIS whenever a change alters what an already-tuned row MEANS, without changing
+    // any env value and without being caught by the build revision (i.e. an in-place edit of a
+    // default, before it is committed):
+    //   1. the scalar l/m/s routing thresholds            (ggml_vk_guess_matmul_pipeline)
+    //   2. the m<=192 / n<=32 style bucket predicates      (same function)
+    //   3. the sentinel set / row-matching rule            (ggml_vk_tuned_row_matches, K1)
+    //   4. a fork default that changes a resolved variant  (FA tile default, RMS subgroup
+    //                                                       variant, M4 fusion default)
+    //   5. the geometry rule table                         (vulkan-tile-validity.h)
+    // Committed changes are ALSO covered by b<rev16>; this counter is the belt for the braces,
+    // so it must not be the only thing anyone relies on.
     const int TUNER_POLICY_VERSION = 1;
 
     // Which header keys are required depends on the CHANNEL, and the split follows what each
@@ -156,7 +173,20 @@ namespace VulkanTuner {
         s += "|";
         s += knob;
         s += "=";
-        s += (v == nullptr) ? string("-") : sanitizeValue(string(v), 24);
+        if (v == nullptr || v[0] == '\0') {
+          s += "-";
+        }
+        else {
+          // LONG VALUES ARE HASHED, NEVER TRUNCATED.  Truncation is lossy AND silent: two
+          // KATAGO_VK_MM_TILE=custom:... values that differ only past the cap would produce
+          // the same fingerprint and the cache would be reused across a policy change.  The
+          // marker also records the original length, so a reader can tell a hash from a value.
+          const size_t MAX_VALUE = 24;
+          const string full = sanitizeValue(string(v), 4096);
+          s += (full.size() <= MAX_VALUE)
+             ? full
+             : ("#" + shortHash(full) + "/" + std::to_string(full.size()));
+        }
       }
       return s;
     }
@@ -613,6 +643,14 @@ namespace VulkanTuner {
   ) {
     const char* importEnv = getenv("KATAGO_VK_TUNE_IMPORT");
     const char* exportEnv = getenv("KATAGO_VK_TUNE_EXPORT");
+    // KATAGO_VK_TUNE_RETUNE=1: ignore whatever is on disk (rows AND the negative entry) and
+    // decide again.  It is the operator's "I do not trust this file" switch, and it is
+    // deliberately about the whole file rather than about the rows or the negative marker:
+    // one file = one key, so a partial override would leave a half-trusted state.
+    const bool retune = getenv("KATAGO_VK_TUNE_RETUNE") != nullptr
+                     && getenv("KATAGO_VK_TUNE_RETUNE")[0] != '\0'
+                     && !(getenv("KATAGO_VK_TUNE_RETUNE")[0] == '0'
+                          && getenv("KATAGO_VK_TUNE_RETUNE")[1] == '\0');
     const bool enabled = tuneEnabled();
 
     if (!enabled) {
@@ -698,6 +736,17 @@ namespace VulkanTuner {
         d->cacheState = "absent";
         d->rowSource = "none";
         d->note = "no cache file for this (device, model, S, mb)";
+      }
+      else if (retune) {
+        // Loudly, because "I set RETUNE and nothing happened" must never be the outcome, and
+        // because the reader has to be able to tell this leg apart from a normal load.
+        d->cacheState = "retune-ignored";
+        d->rowSource = "none";
+        d->note = string("KATAGO_VK_TUNE_RETUNE is set: ") + loadKind
+                + " ignored entirely (rows and negative entry), deciding again";
+        logLine("WARNING: " + string("KATAGO_VK_TUNE_RETUNE is set, so ") + loadKind + " ("
+                + loadPath + ") is IGNORED: neither its rows nor its negative entry are used"
+                " (delete the env to use it again)");
       }
       else {
         RowsFile file;
@@ -823,9 +872,12 @@ namespace VulkanTuner {
                 && file.declaredRowSetHash != rowSetHash(file.rows)) {
               // IMPORT: the declared hash is a HINT, never a refusal reason -- a hand-written
               // fixture cannot compute it, and the rows that were actually parsed are what get
-              // used.  (The cache channel refuses the same mismatch: see above.)
-              keyNote += " [declared ROWSET_HASH differs from the parsed rows;"
-                         " the parsed rows are used]";
+              // used.  But it must be LOUD: silently accepting a file that carries a hash for
+              // different rows is exactly the "it looked fine" trap (lesson #46).
+              logLine("WARNING: " + string(loadKind) + " declares ROWSET_HASH "
+                      + file.declaredRowSetHash + " but the parsed rows hash to "
+                      + rowSetHash(file.rows) + "; using the parsed rows"
+                      " (IMPORT treats the declared hash as a hint)");
             }
             d->imported = fromImport;
             if (fromImport) {
