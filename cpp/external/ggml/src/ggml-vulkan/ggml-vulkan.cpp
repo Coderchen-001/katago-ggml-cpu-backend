@@ -253,6 +253,7 @@ typedef std::weak_ptr<vk_pipeline_struct> vk_pipeline_ref;
 static void ggml_vk_destroy_pipeline(vk::Device& device, vk_pipeline& pipeline);
 
 struct vk_matmul_pipeline_struct;   // the row table below only needs the pointer
+static inline bool vk_t2_on(uint32_t bit);   // defined with the probe state; used by the freeze log
 
 // One tuned row: the replacement pipeline pair for one routing key, plus the
 // identity data the loader must validate before installing it.
@@ -340,7 +341,9 @@ struct vk_tuned_row_table {
 
     // Query.  Freezes the table (first query = the commit point).
     const vk_tuned_row * lookup(const vk_matmul_pipeline_struct * target, uint32_t m, uint32_t k) {
-        frozen = true;
+        frozen = true;   // the caller logs the freeze on the production path (see
+                         // ggml_vk_guess_matmul_pipeline); the self-test's local table
+                         // must not print evidence lines.
         auto it = rows.find(target);
         if (it == rows.end()) {
             return nullptr;
@@ -2335,6 +2338,7 @@ struct vk_t2_stats {
     bool tuned_log_capped = false;
     bool selftest_done = false;
     bool mm_tile_ignored_logged = false;   // S2': "env override ignored" warning, once per context
+    std::map<std::string, bool> dispatch_geom_logged;   // item 12: one-shot k_arg/kpad proof
 };
 static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
@@ -9598,10 +9602,27 @@ static void ggml_vk_t2_log_tuned_row(ggml_backend_vk_context * ctx, const vk_mat
 
 // Invariants a tuned row must satisfy before it is installed (T2 close-out item 1,
 // invariants I1/I2).  Returns nullptr when the row may be installed, otherwise a
-// reason string the loader must print loudly before refusing -- never install a row
-// that fails this, and never fail silently.
+// The invariants a candidate row must satisfy before it is installed.  Returns nullptr
+// when the row may be installed, otherwise a reason string the loader must print loudly
+// before refusing -- never install a row that fails this, and never fail silently.
+//
+// `row` may be null for identity-only checks (the self-test uses that).  The checks are
+// stamped with the same I-numbers as the plan so a rejection is traceable:
+//   I1 stock buckets exist          -- is_empty() ignores tuned rows (see the struct)
+//   I2 the row targets the object this device resolves (uses the real resolver, so it
+//      cannot drift from the selector; measured: the 5080 always resolves .f16acc,
+//      which is exactly why the custom: probe is inert)
+//   I3 the row has an unaligned pipeline -- the aligned variant alone is unusable
+//      whenever aligned == false (t3-shell-plan.md section 1.4)
+//   I4 the row's align does not exceed the stock buckets' align (insurance: a row's
+//      align only selects between its own two variants today -- the dispatched k and
+//      stride_a come from ne10, not kpad -- but a bound keeps that true if rows ever
+//      reach another path)
+//   I5 the row does not target the mmq/q8_1 path, whose shader has its own layout and
+//      where padded_n would start depending on the row's wg_denoms
 static const char * ggml_vk_tuned_row_check(ggml_backend_vk_context * ctx, const vk_matmul_pipeline & target,
-                                            ggml_type src0_type, ggml_type src1_type) {
+                                            ggml_type src0_type, ggml_type src1_type,
+                                            const vk_tuned_row * row = nullptr) {
     // I1: the stock buckets must exist.  is_empty() ignores tuned rows, and the
     // mmq/q8_1 paths plus the mul_mat_id acc selector use it to decide whether a
     // (family, acc) exists at all (the id path then asserts) -- so a tuned-only
@@ -9609,13 +9630,33 @@ static const char * ggml_vk_tuned_row_check(ggml_backend_vk_context * ctx, const
     if (target->l == nullptr || target->a_l == nullptr) {
         return "I1: stock l/aligned_l bucket missing on this (family, acc)";
     }
-    // I2: the row must target the object this device actually selects.  Measured on
-    // the 5080: every path resolves .f16acc, so a row installed on .f32acc would
-    // never be queried (this is exactly why the custom: probe is inert).
-    // Using the real resolver keeps this in sync with the selector by construction.
+    // I2: the row must target the object this device actually selects.  Using the real
+    // resolver keeps this in sync with the selector by construction.
     const vk_matmul_pipeline resolved = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0_type, src1_type, GGML_PREC_DEFAULT, /*quiet_probe*/ true);
     if (resolved != target) {
         return "I2: row targets an (family, acc) object this device never selects";
+    }
+    if (row != nullptr) {
+        // I3: without an unaligned pipeline the row is unusable on unpadded buffers.
+        if (row->unaligned == nullptr) {
+            return "I3: row has no unaligned pipeline (the aligned variant alone is unsafe)";
+        }
+        // I4: bound the row's align by the stock buckets' align.
+        uint32_t stock_align = 0;
+        const vk_pipeline stock[6] = { target->l, target->m, target->s, target->a_l, target->a_m, target->a_s };
+        for (const vk_pipeline & p : stock) {
+            if (p != nullptr && p->align > stock_align) {
+                stock_align = p->align;
+            }
+        }
+        if (row->unaligned->align > stock_align || (row->aligned != nullptr && row->aligned->align > stock_align)) {
+            return "I4: row align exceeds the stock buckets' align";
+        }
+    }
+    // I5: the mmq/q8_1 path is not routable (the selector skips it, and padded_n would
+    // become a function of the row's wg_denoms there).
+    if (src1_type == GGML_TYPE_Q8_1) {
+        return "I5: rows must not target the mmq/q8_1 path";
     }
     return nullptr;
 }
@@ -9637,12 +9678,50 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
     // A real object that the resolver does not return for this family => I2 must
     // reject (pick any non-null, non-resolved candidate).
     const char * reason_mismatch = nullptr;
-    const char * family_name = "n/a";
-    const vk_matmul_pipeline bf16_cand = ctx->device->pipeline_matmul_bf16;
+    const char * family_name = "n/a";    const vk_matmul_pipeline bf16_cand = ctx->device->pipeline_matmul_bf16;
     if (bf16_cand != nullptr && bf16_cand->l != nullptr) {
         reason_mismatch = ggml_vk_tuned_row_check(ctx, bf16_cand, GGML_TYPE_F16, GGML_TYPE_F32);
         family_name = "bf16";
     }
+
+    // I3/I4/I5 (2026-09-13 review): the row-level invariants, exercised on the real
+    // f16/f16 object with local rows.  The pipelines referenced are stock ones, so the
+    // test never creates anything; only null-ness and the align field are read.
+    const vk_matmul_pipeline f16_obj = ctx->device->pipeline_matmul_f16.f16acc;
+    const char * reason_no_unaligned = nullptr;
+    const char * reason_align = nullptr;
+    uint32_t stock_align_dbg = 0;
+    if (f16_obj != nullptr && f16_obj->l != nullptr) {
+        vk_tuned_row only_aligned_row;
+        only_aligned_row.aligned = f16_obj->l;         // no unaligned -> I3
+        reason_no_unaligned = ggml_vk_tuned_row_check(ctx, f16_obj, GGML_TYPE_F16, GGML_TYPE_F16, &only_aligned_row);
+
+        // A row whose align exceeds every stock bucket's align -> I4.
+        const vk_pipeline stock[6] = { f16_obj->l, f16_obj->m, f16_obj->s, f16_obj->a_l, f16_obj->a_m, f16_obj->a_s };
+        for (const vk_pipeline & p : stock) {
+            if (p != nullptr && p->align > stock_align_dbg) {
+                stock_align_dbg = p->align;
+            }
+        }
+        vk_pipeline oversize = std::make_shared<vk_pipeline_struct>();
+        oversize->align = stock_align_dbg * 2 + 1;
+        vk_tuned_row oversize_row;
+        oversize_row.unaligned = oversize;
+        reason_align = ggml_vk_tuned_row_check(ctx, f16_obj, GGML_TYPE_F16, GGML_TYPE_F16, &oversize_row);
+    }
+    const char * reason_q8_1 = ggml_vk_tuned_row_check(ctx, ctx->device->pipeline_matmul_f16.f16acc,
+                                                       GGML_TYPE_F16, GGML_TYPE_Q8_1);
+
+    // Axis classification is a pure table; assert one ENUMERABLE, one DERIVED, one
+    // PINNED and the scalar-vs-cm1 PAD difference, so a future edit to the table is
+    // caught here instead of showing up as enumerator behaviour.
+    const bool axes_ok =
+        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_BM)       == VK_TILE_AXIS_ENUMERABLE &&
+        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_BS)       == VK_TILE_AXIS_DERIVED &&
+        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_WARP)     == VK_TILE_AXIS_PINNED &&
+        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_INERT &&
+        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_ENUMERABLE &&
+        vk_tile_axis_class(VK_TILE_PATH_CM2,    VK_TILE_AXIS_SMALLER)  == VK_TILE_AXIS_ENUMERABLE;
 
     // Row matching rule (t3-shell-plan.md K1, sentinel semantics).  Pure function on
     // local rows: no ctx state is touched, so this cannot influence selection.
@@ -9699,6 +9778,10 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
               << ", table(install ok, lookup ok, late install refused)="
               << (table_ok ? "ok" : "FAILED")
               << " [" << (int) install1 << (int) lookup_before_freeze << (int) !install2 << "]"
+              << ", I3(no unaligned)=" << (reason_no_unaligned != nullptr ? "rejected" : "ACCEPTED (BUG)")
+              << ", I4(oversize align, stock=" << stock_align_dbg << ")=" << (reason_align != nullptr ? "rejected" : "ACCEPTED (BUG)")
+              << ", I5(q8_1 target)=" << (reason_q8_1 != nullptr ? "rejected" : "ACCEPTED (BUG)")
+              << ", axis classes=" << (axes_ok ? "ok" : "FAILED")
               << std::endl;
 }
 
@@ -9725,6 +9808,15 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     // guard a row installed on a q8_1 object would be short-circuited too
     // (t3-shell-plan.md section 1.6 / section 7).
     if (src1_type != GGML_TYPE_Q8_1) {
+        // Evidence line for the install ordering (t3-shell-plan.md section 6.1 item 13):
+        // the FIRST lookup is the first graph build's first matmul, so this line is what
+        // makes "decision -> install -> frozen" readable as three adjacent lines instead
+        // of an inference.  Printed from the production path only (the self-test uses a
+        // local table), and only when the table is still open.
+        if (vk_t2_on(8u) && !ctx->tuned.frozen) {
+            std::cerr << "ggml_vulkan: [T2] tuned rows frozen by first lookup (target families="
+                      << ctx->tuned.rows.size() << ")" << std::endl;
+        }
         const vk_tuned_row * row = ggml_vk_tuned_row_for(ctx, mmp, m, k);
         if (row != nullptr) {
             const vk_pipeline picked = ggml_vk_tuned_row_pick(*row, aligned);
@@ -10306,6 +10398,25 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, ne10, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+
+    // T3 item 12 (t3-shell-plan.md section 6.1): prove the dispatched K is the true K
+    // and not the padded one.  This is the link that decides whether a row's align is
+    // merely insurance or a correctness problem, and it must be MEASURED rather than
+    // read: k_arg is what goes into the push constant (see the ggml_vk_matmul call
+    // below, which passes ne10 for both k and stride_a).  One-shot per distinct
+    // (pipeline, aligned, kpad==k) so it stays off the per-dispatch path.
+    if (vk_t2_on(8u)) {
+        const std::string geom_key = pipeline->name + "|aligned=" + std::to_string((int) aligned)
+                                   + "|kpad_eq_k=" + std::to_string((int) (kpad == ne10));
+        if (ctx->t2.dispatch_geom_logged.find(geom_key) == ctx->t2.dispatch_geom_logged.end() &&
+            ctx->t2.dispatch_geom_logged.size() < 32) {
+            ctx->t2.dispatch_geom_logged[geom_key] = true;
+            std::cerr << "ggml_vulkan: [T2] dispatch geometry: pipeline=" << pipeline->name
+                      << " m=" << ne01 << " n=" << ne11
+                      << " k_arg=" << ne10 << " kpad=" << kpad
+                      << " aligned=" << (int) aligned << " align=" << pipeline->align << std::endl;
+        }
+    }
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);

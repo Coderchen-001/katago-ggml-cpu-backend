@@ -30,10 +30,17 @@ enum vk_tile_path {
     VK_TILE_PATH_CM2    = 2,  // NV_cooperative_matrix2 (cm2 shader)
 };
 
-// Axis ids for vk_tile_axis_is_live().  These are the warptile/spec slots as the create
-// path sees them (ggml_vk_mul_mm_spec order), not a tuner invention:
-//   warptile = { BS, BM, BN, BK, WM, WN, WMITER, TM, TN, WARP, PAD }
-//   spec ids 12/13 = PAD / RESHAPE (shader spec constants)
+// Axis ids for vk_tile_axis_class().  These follow the REAL spec layout of mul_mm.comp
+// (verified 2026-09-13), not a tuner invention:
+//   warptile = { BS, BM, BN, BK, WM, WN, WMITER, TM, TN, TK, WARP }
+//     0=BLOCK_SIZE 1=BM 2=BN [3=BK, quant branch only] 4=WM 5=WN 6=WMITER 7=TM 8=TN
+//     9=TK ("Only needed for coopmat") 10=WARP
+//   11=ALIGNED (host-set, never swept)  12=SHMEM_STRIDE_PAD  13=APPLY_SLM_A_RESHAPE
+//     -> note there is NO "10=PAD" slot; PAD is spec 12.
+//   cm2's own spec is {BLOCK_SIZE, BM, BN, BK, smaller}, where `smaller` is spec id 4
+//   in the shader -- the same number as scalar WM, which is exactly why axis ids must
+//   NOT be reused across paths: this enum keeps distinct numbers for distinct meanings,
+//   and 14 was chosen for SMALLER because 11 is ALIGNED.
 enum vk_tile_axis {
     VK_TILE_AXIS_BS      = 0,
     VK_TILE_AXIS_BM      = 1,
@@ -44,10 +51,22 @@ enum vk_tile_axis {
     VK_TILE_AXIS_WMITER  = 6,
     VK_TILE_AXIS_TM      = 7,
     VK_TILE_AXIS_TN      = 8,
-    VK_TILE_AXIS_WARP    = 9,
-    VK_TILE_AXIS_PAD     = 10,
+    VK_TILE_AXIS_TK      = 9,
+    VK_TILE_AXIS_WARP    = 10,
     VK_TILE_AXIS_SPEC_PAD     = 12,
     VK_TILE_AXIS_SPEC_RESHAPE = 13,
+    VK_TILE_AXIS_SMALLER = 14,   // cm2 only (spec id 4 in the shader)
+};
+
+// What an axis means on a given path.  Two-state "live/dead" was not enough: an axis
+// can be a free enumeration axis, a value that must be filled in correctly but must not
+// be swept, a derived quantity, or simply absent on that path.
+enum vk_tile_axis_class {
+    VK_TILE_AXIS_INERT        = 0,  // does not exist on this path (sweeping it is a no-op)
+    VK_TILE_AXIS_ENUMERABLE   = 1,  // free axis: may be swept
+    VK_TILE_AXIS_PINNED       = 2,  // must be set correctly, must NOT be swept
+    VK_TILE_AXIS_DERIVED      = 3,  // computed from other axes
+    VK_TILE_AXIS_NOT_APPLICABLE = 4 // not an axis of this path at all
 };
 
 // One concrete tile geometry.  Scalar / cm1 use the warptile fields; cm2 uses
@@ -128,21 +147,40 @@ static inline uint64_t vk_tile_canonical_key(int path, const vk_tile_geometry & 
     return h;
 }
 
-// Per-path live axes: the enumeration space, not validity.  Kept here so the enumerator
-// and any validator read one table.  Sources: t1-predicate.md (live/dead axis list, BS
-// derived), t1-candidates.md section 2.2 (cm2's {BS,BM,BN,BK,smaller}), and the measured
-// BK verdict (t1-candidates.md section 4 / census-t05-shapes.md section 4.4).
-static inline int vk_tile_axis_is_live(int path, int axis) {
+// Per-path axis classification: the enumeration space, not validity.  Kept here so the
+// enumerator and any validator read one table.  Sources: t1-predicate.md section 2
+// (2026-09-13 rewrite), t1-candidates.md section 2.2, VENDOR-BASE.md section 2, and the
+// measured BK verdict (census-t05-shapes.md section 4.4).
+//
+// Scalar: BM/BN/WM/WN/WMITER/TM/TN are ENUMERABLE; BS is DERIVED (num_warps*32);
+//   TK and WARP are PINNED (TK==1, WARP==subgroup_size -- fill them in, do not sweep);
+//   BK is INERT on the f16 path (compile-time constant; spec id 3 exists only for the
+//   quant branch), and SHMEM_STRIDE_PAD / APPLY_SLM_A_RESHAPE are INERT because on the
+//   scalar path they are NOT specs at all (mul_mm.comp's COOPMAT guard and its explicit
+//   "DO NOT spec-ize" note -- lesson #41: a multi-level spec array made the Blackwell
+//   driver emit BM-dependent garbage).  That is a stronger statement than "measured
+//   inert": the earlier experiment could not have shown anything else.
+// cm1: as scalar, plus SHMEM_STRIDE_PAD / APPLY_SLM_A_RESHAPE are ENUMERABLE (they are
+//   spec-ized there) but unmeasured -- we have no cm1 machine.
+// cm2: BM/BN/BK/BS/smaller are ENUMERABLE (BLOCK_SIZE is a real cm2 spec, not derived).
+static inline int vk_tile_axis_class(int path, int axis) {
     if (path == VK_TILE_PATH_CM2) {
         switch (axis) {
-            case VK_TILE_AXIS_BS:   // BLOCK_SIZE is a real cm2 spec field
+            case VK_TILE_AXIS_BS:
             case VK_TILE_AXIS_BM:
             case VK_TILE_AXIS_BN:
             case VK_TILE_AXIS_BK:
-                return 1;
+            case VK_TILE_AXIS_SMALLER:
+                return VK_TILE_AXIS_ENUMERABLE;
+            case VK_TILE_AXIS_TK:
+            case VK_TILE_AXIS_WARP:
+                return VK_TILE_AXIS_INERT;   // cm2 has no TK/WARP warptile semantics
             default:
-                return 0;
+                return VK_TILE_AXIS_NOT_APPLICABLE;
         }
+    }
+    if (path != VK_TILE_PATH_SCALAR && path != VK_TILE_PATH_CM1) {
+        return VK_TILE_AXIS_NOT_APPLICABLE;
     }
     switch (axis) {
         case VK_TILE_AXIS_BM:
@@ -152,16 +190,23 @@ static inline int vk_tile_axis_is_live(int path, int axis) {
         case VK_TILE_AXIS_WMITER:
         case VK_TILE_AXIS_TM:
         case VK_TILE_AXIS_TN:
-            return 1;
-        // BS is derived (BS == num_warps*32); BK is a compile-time constant in the
-        // shader (mul_mm.comp defines BK 32); WARP/PAD/RESHAPE were measured inert.
+            return VK_TILE_AXIS_ENUMERABLE;
         case VK_TILE_AXIS_BS:
-        case VK_TILE_AXIS_BK:
+            return VK_TILE_AXIS_DERIVED;
+        case VK_TILE_AXIS_TK:
         case VK_TILE_AXIS_WARP:
-        case VK_TILE_AXIS_PAD:
+            return VK_TILE_AXIS_PINNED;
         case VK_TILE_AXIS_SPEC_PAD:
         case VK_TILE_AXIS_SPEC_RESHAPE:
+            return path == VK_TILE_PATH_CM1 ? VK_TILE_AXIS_ENUMERABLE : VK_TILE_AXIS_INERT;
+        case VK_TILE_AXIS_BK:
+            return VK_TILE_AXIS_INERT;   // f16 family: compile-time constant in the shader
         default:
-            return 0;
+            return VK_TILE_AXIS_NOT_APPLICABLE;
     }
+}
+
+// Convenience for the enumerator: may this axis be swept on this path?
+static inline int vk_tile_axis_is_live(int path, int axis) {
+    return vk_tile_axis_class(path, axis) == VK_TILE_AXIS_ENUMERABLE;
 }
