@@ -1003,6 +1003,11 @@ namespace VulkanTuner {
         const string content = formatRowsFile(*d);
         const string path = exportEnv;
         string err;
+        // WRITE-PATH: export
+        // Declared for guardrail R16.  An export writes a file the OPERATOR named, never the
+        // cache, so it is allowed even in read-only mode (vulkanTune=off) -- which is why this
+        // is the one write path that does not have to sit behind a policy.off gate.  The cache
+        // write path (step 3) carries its own tag and MUST be gated.
         if (writeFileAtomic(path, content, err)) {
           logLine("export path=" + path + " rows=" + to_string(d->rowCount)
                   + " bytes=" + to_string(content.size()) + " ok");
