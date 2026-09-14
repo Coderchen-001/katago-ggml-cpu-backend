@@ -264,9 +264,34 @@ namespace VulkanTuner {
     // (t1-schema.md section 1 discipline (b): "we ran out of time" must never be remembered as
     // "this device cannot be tuned").  Adding a name here is therefore a deliberate act, and both
     // the re-evaluation trigger (section 6.4 item 5) and R17 point at this array.
-    const char* NEGATIVE_REASONS[] = {
-      "no-injection-slot",
-      "no-entry",
+    //
+    // WHY EACH REASON ALSO DECLARES ITS INVALIDATION RULE (2026-09-13 review): a reason alone is
+    // not enough.  "This device cannot be tuned" is a claim that OUTLIVES the process, and a claim
+    // is only sound if something is guaranteed to void it -- otherwise the file becomes "this key
+    // is permanently skipped", which is the worst outcome the negative cache can produce.  So the
+    // rule is DATA here (pinned by R17), not a sentence in a comment.
+    //
+    //   `full-key-set` = the ONLY rule implemented today, and the strongest one available: the
+    //   loader refuses the file unless FINGERPRINT, TUNER_VERSION, POLICY, BASELINE and (on the
+    //   cache channel) MODEL, BOARD, MAXBATCH and ROWSET_HASH all match, so a change of device,
+    //   driver, capability, tuner code, policy, model, board or batch voids the claim.  Every
+    //   reason therefore has the SHORTEST possible lifetime, and over-invalidation is the safe
+    //   direction (the cost is one re-decision, not a stale skip).
+    //
+    // A reason that needs anything else is a FORMAT-LEVEL act, not an edit here: a SHORTER
+    // lifetime means a new invalidation condition, which means a new key in the header and the
+    // file name (R12 forces that decision too); a LONGER lifetime -- surviving a key change -- is
+    // not expressible at all, because the file name carries the whole key.  The practical reason
+    // the rule is per-reason: the reasons are not obviously equal (no-injection-slot is a hard
+    // fact about the device, no-entry leans on the model/family), so "they happen to share a rule
+    // today" has to be written down instead of being assumed.
+    struct NegativeReasonSpec {
+      const char* reason;
+      const char* invalidation;
+    };
+    const NegativeReasonSpec NEGATIVE_REASONS[] = {
+      { "no-injection-slot", "full-key-set" },
+      { "no-entry",          "full-key-set" },
     };
 
     // The closed set holds on BOTH sides: the parser (so an uninterpretable file is refused
@@ -274,8 +299,8 @@ namespace VulkanTuner {
     // write?" predicate below (so free text can never reach the disk).  A set only the reader
     // checks is a set on paper.
     bool negativeReasonKnown(const string & reason) {
-      for (const char* r : NEGATIVE_REASONS) {
-        if (reason == r) {
+      for (const NegativeReasonSpec & r : NEGATIVE_REASONS) {
+        if (reason == r.reason) {
           return true;
         }
       }
@@ -663,9 +688,14 @@ namespace VulkanTuner {
         }
         else if (line.compare(0, 9, "NEGATIVE ") == 0) {
           // Same rule as an unknown key (see the final else): a claim this tuner cannot interpret
-          // must not be read as if it had said nothing.  The reason decides how long the claim
-          // lasts and what invalidates it, so "unrecognised" is not a cosmetic problem -- it is
-          // the difference between "this device can never be tuned" and a free-text guess.
+          // must not be read as if it had said nothing.  Be precise about WHAT the reason decides
+          // (this comment used to overclaim): every reason currently declares the SAME invalidation
+          // rule (the whole key set -- see NEGATIVE_REASONS), so the reason does not change how
+          // long the claim lives TODAY.  What it changes is what the claim MEANS, and that is
+          // enough to refuse a string we do not know: "this device structurally cannot be tuned"
+          // and an arbitrary sentence are not the same assertion, and only one of them is safe to
+          // act on.  Declaring the rule per reason is what keeps a FUTURE reason with a different
+          // lifetime from being added without saying so (R17 pins both fields).
           const string reason = line.substr(9);
           if (!negativeReasonKnown(reason)) {
             err = "NEGATIVE line " + to_string(lineNo) + ": unknown reason '" + reason
@@ -836,8 +866,14 @@ namespace VulkanTuner {
   // structure, plus the behaviour legs that plant a cache and require it byte-identical and that
   // run with no cache file at all and require none to appear.
   //
-  // The CALLER logs; this function only reports.  One writer per line (section 9.3-9), and the
-  // message is born with the path that can actually produce it (step 4).
+  // The CALLER logs; this function only reports -- and that is now TRUE rather than aspirational:
+  // formatRowsFile() REFUSES some decisions by throwing (both ROW and NEGATIVE in one file; a
+  // reason outside the closed set), so the conversion to an error string happens HERE, once.  The
+  // read path states the same contract for the same reason ("every load failure is fail-open +
+  // loud, never an exception out of the hook"), and a caller that later moves outside the
+  // decision's try/catch must not be able to turn a cache refusal into a crash.  Keeping the
+  // function silent is also what keeps one writer per line (section 9.3-9): the message is born
+  // with the path that can actually produce it, which is the caller (step 4).
   bool writeCacheIfAllowed(const Decision& d, const TunePolicy& policy, string& err) {
     if (!cacheWriteAllowed(policy)) {
       // Read-only (cfg vulkanTune=off, or any future second meaning of "read-only"): the cache may
@@ -852,7 +888,13 @@ namespace VulkanTuner {
       return false;
     }
     // WRITE-PATH: cache
-    return writeFileAtomic(d.cachePath, formatRowsFile(d), err);
+    try {
+      return writeFileAtomic(d.cachePath, formatRowsFile(d), err);
+    }
+    catch (const std::exception& e) {
+      err = string("the cache entry was refused: ") + e.what();
+      return false;
+    }
   }
 
   shared_ptr<Decision> makeDecision(
