@@ -100,6 +100,75 @@ struct vk_tune_row_spec {
     struct vk_tile_geometry geom;
 };
 
+// ---------------------------------------------------------------------------
+// B1 (t3-shell-plan.md section 6.7): install-time outcome reporting.
+//
+// A row set is USER DATA (a cache file or KATAGO_VK_TUNE_IMPORT), and the loader has
+// to be able to say "declared N, installed M, dropped for this reason".  Two reasons
+// why a single drop counter is not enough:
+//
+//   1. "every row in the file is hit at least once" is the acceptance for "no row was
+//      tuned for nothing", and its denominator must be M (the rows that installed): a
+//      row that cannot install can never be hit, so grading against N would make that
+//      leg red for a reason that has nothing to do with tuning.
+//   2. the write side (step 5) must write only rows this process really installed, so
+//      the reason is what tells a transient failure from a permanent one.
+//
+// The reason set is closed on purpose: these counts reach the log and (later) the
+// durable-effect decision, so free text must not be able to enter them.
+enum vk_tune_row_drop {
+    VK_TUNE_ROW_DROP_NONE         = 0,
+    VK_TUNE_ROW_DROP_ILLEGAL      = 1,  // vk_tile_candidate_reason() refused it
+    VK_TUNE_ROW_DROP_UNSUPPORTED  = 2,  // family / path / capability (I6) not usable
+    VK_TUNE_ROW_DROP_BUILD_FAILED = 3,  // the pipeline could not be created
+};
+
+struct vk_tune_install_result {
+    unsigned declared;
+    unsigned installed;
+    unsigned dropped_illegal;
+    unsigned dropped_unsupported;
+    unsigned dropped_build_failed;
+};
+
+// ---------------------------------------------------------------------------
+// Which (family, path) combinations have an implementation at all.
+//
+// Same sharing rule as vk_tile_candidate_reason: the enumerator and the loader MUST
+// answer this identically, because a candidate the loader would always drop is a
+// permanent loud line per run -- i.e. "the enumerator proposed something that can
+// never install" is a bug in the enumerator, not a device property.
+//
+// The ggml_type numbers are transcribed deliberately (this header cannot include
+// ggml): GGML_TYPE_F32 = 0, GGML_TYPE_F16 = 1.  The backend asserts both values at
+// compile time (see ggml_backend_vk_tune_install_rows), so a renumbering upstream
+// becomes a build error instead of a wrong-family install.
+enum vk_tune_src_type {
+    VK_TUNE_SRC_F32 = 0,
+    VK_TUNE_SRC_F16 = 1,
+};
+
+// Returns nullptr when a row with this (family, path) has an implementation, else a
+// static reason naming the missing piece.  `path` is only checked for existence here;
+// whether this DEVICE can use that path is capability (I6), which is the backend's to
+// answer at install time -- the shell must not guess it from the fingerprint.
+static inline const char * vk_tune_row_family_reason(int src0_type, int src1_type, int path) {
+    const int f16_f16 = (src0_type == VK_TUNE_SRC_F16 && src1_type == VK_TUNE_SRC_F16);
+    const int f16_f32 = (src0_type == VK_TUNE_SRC_F16 && src1_type == VK_TUNE_SRC_F32);
+    if (!f16_f16 && !f16_f32) {
+        return "no tuned-row implementation for this (src0, src1) family "
+               "(only f16xf16 and f16xf32 are wired)";
+    }
+    if (path == VK_TILE_PATH_CM1) {
+        return "cm1 rows are not wired (no cm1 machine to measure on; refusing beats "
+               "installing an unmeasured geometry)";
+    }
+    if (path != VK_TILE_PATH_SCALAR && path != VK_TILE_PATH_CM2) {
+        return "unknown creation path";
+    }
+    return nullptr;
+}
+
 // Returns nullptr when the geometry is legal, otherwise a static reason string naming
 // the first violated clause.  Callers log it as-is, which is what makes the enumerator
 // and the loader produce the SAME reason for the same bad input.

@@ -4652,6 +4652,82 @@ struct CompileTask {
     uint32_t required_subgroup_size;
 };
 
+// ---------------------------------------------------------------------------
+// Matmul specialization-constant builders (file scope since B1).
+//
+// WHY THEY MOVED OUT OF ggml_vk_load_shaders: the tuned-row resolver has to create a
+// pipeline for an ARBITRARY geometry, and it must use the SAME spec rule the init path
+// uses -- "which constantIDs are pushed, in which order, under which vendor clause" is
+// exactly the kind of rule that cannot have two copies (the same argument that put the
+// tile-validity rules in vulkan-tile-validity.h).  The two P2 probe knobs were already
+// file-scope statics, so `device` was the only capture that had to become a parameter.
+// ggml_vk_load_shaders keeps a one-line forwarder under the old name because its create
+// macros spell that name; behaviour is unchanged, Intel clause included (constantID
+// 12/13 pushed as a pair, defaults 1/false = the shader defaults).
+static std::vector<uint32_t> ggml_vk_scalar_mm_spec(const vk_device & device, std::vector<uint32_t> spec, bool aligned) {
+    spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
+    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
+        device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
+        spec.push_back(0u);  // constantID=12: SHMEM_STRIDE_PAD = 0
+        spec.push_back(1u);  // constantID=13: APPLY_SLM_A_RESHAPE = true
+    } else if (mm_spec_pad >= 0 || mm_spec_reshape >= 0) {
+        // P2 probe knobs: inject 12/13 as a PAIR (position-mapped constantIDs,
+        // GG:3058), defaults 1/false = bit-identical to shader defaults.
+        spec.push_back(mm_spec_pad >= 0 ? (uint32_t)mm_spec_pad : 1u);
+        spec.push_back(mm_spec_reshape >= 0 ? (mm_spec_reshape ? 1u : 0u) : 0u);
+    }
+    return spec;
+}
+
+#if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+static std::vector<uint32_t> ggml_vk_cm2_mm_spec(std::vector<uint32_t> spec, bool aligned, bool mul_mat_id) {
+    // KataGo probe (test-only, 2026-09-11, tuner-exec.md 7 A3 / biteq-source-map.md):
+    // cm2 matmul tile overrides, to answer "which cm2 sweep axes are bit-equal?"
+    // with one error-row comparison per axis. The cm2 spec is
+    // {BLOCK_SIZE, BM, BN, BK, enable_smaller_matrices} (mul_mm_cm2.comp:31-36),
+    // so only spec[3] (BK) resp. spec[1] (BM) is touched => single variable.
+    // Every l/m/s x f16acc/f32acc variant goes through this function, so all
+    // buckets are covered. Unset env => the default path is untouched.
+    static const char* cm2_bk_env = getenv("KATAGO_VK_CM2_BK");
+    static const char* cm2_bm_env = getenv("KATAGO_VK_CM2_BM");
+    static bool cm2_bk_logged = false;
+    static bool cm2_bm_logged = false;
+    if (spec.size() >= 5) {
+        if (cm2_bk_env != nullptr) {
+            const uint32_t v = (uint32_t) atoi(cm2_bk_env);
+            if (v > 0) {
+                if (!cm2_bk_logged) {
+                    ggml_vk_evidence_line("ggml_vulkan: KATAGO_VK_CM2_BK=" + std::to_string(v)
+                                  + " (default spec BK was " + std::to_string(spec[3]) + ")");
+                    cm2_bk_logged = true;
+                }
+                spec[3] = v;
+            }
+        }
+        if (cm2_bm_env != nullptr) {
+            const uint32_t v = (uint32_t) atoi(cm2_bm_env);
+            if (v > 0) {
+                if (!cm2_bm_logged) {
+                    ggml_vk_evidence_line("ggml_vulkan: KATAGO_VK_CM2_BM=" + std::to_string(v)
+                                          + " (default spec BM was " + std::to_string(spec[1]) + ")");
+                    cm2_bm_logged = true;
+                }
+                spec[1] = v;
+            }
+        }
+    }
+    if (mul_mat_id && spec.size() > 5) {
+        spec.insert(spec.begin() + 5, aligned ? 1u : 0u);
+    } else {
+        spec.push_back(aligned ? 1u : 0u);
+    }
+    if (mul_mat_id && spec.size() == 6) {
+        spec.push_back(32);
+    }
+    return spec;
+}
+#endif
+
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -5132,18 +5208,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif
 
     auto const &ggml_vk_mul_mm_spec = [&device](std::vector<uint32_t> spec, bool aligned) {
-        spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
-        if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
-            device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
-            spec.push_back(0u);  // constantID=12: SHMEM_STRIDE_PAD = 0
-            spec.push_back(1u);  // constantID=13: APPLY_SLM_A_RESHAPE = true
-        } else if (mm_spec_pad >= 0 || mm_spec_reshape >= 0) {
-            // P2 probe knobs: inject 12/13 as a PAIR (position-mapped constantIDs,
-            // GG:3058), defaults 1/false = bit-identical to shader defaults.
-            spec.push_back(mm_spec_pad >= 0 ? (uint32_t)mm_spec_pad : 1u);
-            spec.push_back(mm_spec_reshape >= 0 ? (mm_spec_reshape ? 1u : 0u) : 0u);
-        }
-        return spec;
+        // Forwarder: the rule lives in ggml_vk_scalar_mm_spec() (file scope) because the
+        // tuned-row resolver needs the same rule; the name stays because the create macros
+        // below spell it.
+        return ggml_vk_scalar_mm_spec(device, std::move(spec), aligned);
     };
 
     const int mul_mat_id_param_count = 5;
@@ -5151,50 +5219,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
     if (device->coopmat2) {
         auto const &ggml_vk_mul_mm_cm2_spec = [](std::vector<uint32_t> spec, bool aligned, bool mul_mat_id) {
-            // KataGo probe (test-only, 2026-09-11, tuner-exec.md 7 A3 / biteq-source-map.md):
-            // cm2 matmul tile overrides, to answer "which cm2 sweep axes are bit-equal?"
-            // with one error-row comparison per axis. The cm2 spec is
-            // {BLOCK_SIZE, BM, BN, BK, enable_smaller_matrices} (mul_mm_cm2.comp:31-36),
-            // so only spec[3] (BK) resp. spec[1] (BM) is touched => single variable.
-            // Every l/m/s x f16acc/f32acc variant goes through this lambda, so all
-            // buckets are covered. Unset env => the default path is untouched.
-            static const char* cm2_bk_env = getenv("KATAGO_VK_CM2_BK");
-            static const char* cm2_bm_env = getenv("KATAGO_VK_CM2_BM");
-            static bool cm2_bk_logged = false;
-            static bool cm2_bm_logged = false;
-            if (spec.size() >= 5) {
-                if (cm2_bk_env != nullptr) {
-                    const uint32_t v = (uint32_t) atoi(cm2_bk_env);
-                    if (v > 0) {
-                        if (!cm2_bk_logged) {
-                            ggml_vk_evidence_line("ggml_vulkan: KATAGO_VK_CM2_BK=" + std::to_string(v)
-                                          + " (default spec BK was " + std::to_string(spec[3]) + ")");
-                            cm2_bk_logged = true;
-                        }
-                        spec[3] = v;
-                    }
-                }
-                if (cm2_bm_env != nullptr) {
-                    const uint32_t v = (uint32_t) atoi(cm2_bm_env);
-                    if (v > 0) {
-                        if (!cm2_bm_logged) {
-                            ggml_vk_evidence_line("ggml_vulkan: KATAGO_VK_CM2_BM=" + std::to_string(v)
-                                                  + " (default spec BM was " + std::to_string(spec[1]) + ")");
-                            cm2_bm_logged = true;
-                        }
-                        spec[1] = v;
-                    }
-                }
-            }
-            if (mul_mat_id && spec.size() > 5) {
-                spec.insert(spec.begin() + 5, aligned ? 1u : 0u);
-            } else {
-                spec.push_back(aligned ? 1u : 0u);
-            }
-            if (mul_mat_id && spec.size() == 6) {
-                spec.push_back(32);
-            }
-            return spec;
+            // Forwarder: the rule lives in ggml_vk_cm2_mm_spec() (file scope) because the
+            // tuned-row resolver needs the same rule; the name stays because the create
+            // macro below spells it.
+            return ggml_vk_cm2_mm_spec(std::move(spec), aligned, mul_mat_id);
         };
 
         // Create 6 variants, {s,m,l}x{unaligned,aligned}
@@ -20112,21 +20140,201 @@ size_t ggml_backend_vk_tune_fingerprint(ggml_backend_t backend, char * out, size
     return s.size();
 }
 
+// ---------------------------------------------------------------------------
+// B1: row -> pipeline resolution (t3-shell-plan.md section 6.7).
+//
+// The shell hands over WIRE rows (identity + geometry, no pointers).  This is the only
+// place that knows how a geometry becomes a pipeline, and it deliberately goes through
+// the same material the device init uses: the spec builders are shared (hoisted to
+// ggml_vk_scalar_mm_spec / ggml_vk_cm2_mm_spec), the create call is the same
+// synchronous entry the compile step drains with, and the capability checks mirror what
+// init checks before it creates a warptile bucket.  A second, invented pre-check would
+// be an unverified rule -- and the case I6 must actually prevent is concrete: a
+// hand-written IMPORT geometry that needs more shared memory than the device has would
+// otherwise go straight into create.
+//
+// B1 builds the UNALIGNED variant only, with align = 1 -- exactly how init creates
+// every unaligned bucket.  That is not a shortcut: ggml_vk_tuned_row_pick returns the
+// unaligned pipeline when the aligned one is absent, and the align probe calls back
+// through the SAME row lookup, so kpad comes out equal to k (no padding) and the
+// unaligned shader -- which handles an arbitrary k -- receives exactly k.  Building the
+// aligned variant as well needs the align of the bucket the row corresponds to, and
+// getting that too small is a silent wrong-answer bug rather than a slow one, so it is
+// a separate change with its own evidence.
+struct ggml_vk_tuned_row_shader {
+    const void * spv_data;
+    size_t       spv_size;
+    const char * name;
+};
+
+// The shared header transcribes these two ggml_type values (it cannot include ggml), so
+// an upstream renumbering must fail the build here rather than install rows on the wrong
+// family (the same "transcribe deliberately, assert loudly" rule the axis ids follow).
+static_assert(VK_TUNE_SRC_F32 == (int) GGML_TYPE_F32, "vulkan-tile-validity.h transcribes GGML_TYPE_F32");
+static_assert(VK_TUNE_SRC_F16 == (int) GGML_TYPE_F16, "vulkan-tile-validity.h transcribes GGML_TYPE_F16");
+
+// The (family, acc) objects a row may target, in the order {f16acc, f32acc}.  Mirrors
+// ggml_vk_get_mul_mat_mat_pipeline, because the row table is keyed by OBJECT IDENTITY
+// (invariant I2): a row installed on an object the call site never passes would never
+// be found, and that failure would be silent.
+static int ggml_vk_tuned_row_targets(const vk_device & device, int src0_type, int src1_type, vk_matmul_pipeline out[2]) {
+    out[0] = nullptr;
+    out[1] = nullptr;
+    if (src0_type == (int) GGML_TYPE_F16 && src1_type == (int) GGML_TYPE_F16) {
+        out[0] = device->pipeline_matmul_f16.f16acc;
+        out[1] = device->pipeline_matmul_f16.f32acc;
+        return 2;
+    }
+    if (src0_type == (int) GGML_TYPE_F16 && src1_type == (int) GGML_TYPE_F32) {
+        out[0] = device->pipeline_matmul_f16_f32.f16acc;
+        out[1] = device->pipeline_matmul_f16_f32.f32acc;
+        return 2;
+    }
+    return 0;
+}
+
+// I6: capability legality -- "would the init path have created this on this device".
+static const char * ggml_vk_tuned_row_capability_reason(const vk_device & device, const vk_tune_row_spec & r) {
+    if (r.path == VK_TILE_PATH_CM2) {
+        if (!device->coopmat2) {
+            return "path=cm2 but this device does not resolve matmuls through cooperative_matrix2";
+        }
+    } else if (r.path == VK_TILE_PATH_SCALAR) {
+        if (device->coopmat2) {
+            return "path=scalar but this device resolves matmuls through cm2, so the row's shader "
+                   "would not match the dispatch";
+        }
+        if (device->coopmat_support) {
+            return "path=scalar but this device has cooperative_matrix (the cm1 buckets own those objects)";
+        }
+    } else {
+        return "path is neither scalar nor cm2";
+    }
+    if (device->shader_64b_indexing) {
+        return "this device uses 64-bit shader indexing; the B1 row path builds only the 32-bit variant";
+    }
+    if (r.geom.BS > device->properties.limits.maxComputeWorkGroupInvocations) {
+        return "BLOCK_SIZE exceeds maxComputeWorkGroupInvocations";
+    }
+    if (r.path == VK_TILE_PATH_SCALAR) {
+        // The same check the init path runs before creating a warptile bucket.
+        const std::vector<uint32_t> warptile = { r.geom.BS, r.geom.BM, r.geom.BN, 16u,
+                                                 r.geom.WM, r.geom.WN, r.geom.WMITER,
+                                                 r.geom.TM, r.geom.TN, 1u, 32u };
+        if (!ggml_vk_matmul_shmem_support(device, warptile, false, GGML_TYPE_F16)) {
+            return "geometry needs more shared memory than this device has";
+        }
+    }
+    return nullptr;
+}
+
+// The SPIR-V module per (family, acc), mirroring the create macros: the dot2 module
+// when the device has dot2 (the macros select it the same way), the _cm2 module for the
+// cm2 path, and the plain/_f16acc names otherwise.
+static bool ggml_vk_tuned_row_shader_for(const vk_device & device, int src1_type, int path, bool f16acc,
+                                         ggml_vk_tuned_row_shader & out) {
+    const bool f16_f16 = (src1_type == (int) GGML_TYPE_F16);
+    if (path == VK_TILE_PATH_CM2) {
+#if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+        // The cm2 branch of ggml_vk_load_shaders creates ONE non-quant family
+        // (pipeline_matmul_f16); there is no cm2 f16xf32 module at all.  A cm2 + f16xf32
+        // row therefore has no target objects on any device, and the is_empty() check in
+        // the installer drops it as `unsupported` before this function is reached -- this
+        // branch exists so that the rule is stated once instead of relying on that.
+        if (!f16_f16) {
+            return false;
+        }
+        out = f16acc ? ggml_vk_tuned_row_shader { matmul_f16_f16acc_cm2_data, matmul_f16_f16acc_cm2_len, "matmul_f16_f16acc_cm2_tuned_row" }
+                     : ggml_vk_tuned_row_shader { matmul_f16_cm2_data,        matmul_f16_cm2_len,        "matmul_f16_cm2_tuned_row" };
+        return true;
+#else
+        return false;
+#endif
+    }
+    if (f16_f16) {
+        if (device->dot2_f16) {
+            out = f16acc ? ggml_vk_tuned_row_shader { matmul_f16_dot2_f16acc_data, matmul_f16_dot2_f16acc_len, "matmul_f16_dot2_f16acc_tuned_row" }
+                         : ggml_vk_tuned_row_shader { matmul_f16_dot2_data,        matmul_f16_dot2_len,        "matmul_f16_dot2_tuned_row" };
+        } else {
+            out = f16acc ? ggml_vk_tuned_row_shader { matmul_f16_f16acc_data, matmul_f16_f16acc_len, "matmul_f16_f16acc_tuned_row" }
+                         : ggml_vk_tuned_row_shader { matmul_f16_data,        matmul_f16_len,        "matmul_f16_tuned_row" };
+        }
+    } else {
+        if (device->dot2_f16) {
+            out = f16acc ? ggml_vk_tuned_row_shader { matmul_f16_f32_dot2_f16acc_data, matmul_f16_f32_dot2_f16acc_len, "matmul_f16_f32_dot2_f16acc_tuned_row" }
+                         : ggml_vk_tuned_row_shader { matmul_f16_f32_dot2_data,        matmul_f16_f32_dot2_len,        "matmul_f16_f32_dot2_tuned_row" };
+        } else {
+            out = f16acc ? ggml_vk_tuned_row_shader { matmul_f16_f32_f16acc_data, matmul_f16_f32_f16acc_len, "matmul_f16_f32_f16acc_tuned_row" }
+                         : ggml_vk_tuned_row_shader { matmul_f16_f32_data,        matmul_f16_f32_len,        "matmul_f16_f32_tuned_row" };
+        }
+    }
+    return true;
+}
+
+// Build one pipeline for one geometry.  Never throws out of here: the geometry is USER
+// DATA, and a driver refusal must become a dropped row (fail-open), not a crash.  The
+// create entry below is the same one the init path's compile step uses, and it does the
+// whole job synchronously (shader module, layout, createComputePipeline) and registers
+// the pipeline for teardown.
+static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec & r, bool f16acc,
+                                    vk_pipeline & out, std::string & why) {
+    ggml_vk_tuned_row_shader sh {};
+    if (!ggml_vk_tuned_row_shader_for(device, r.src1_type, r.path, f16acc, sh)) {
+        why = "no shader module for this (family, path, acc) in this build";
+        return false;
+    }
+    const std::array<uint32_t, 3> wg_denoms = { r.geom.BM, r.geom.BN, 1 };
+    std::vector<uint32_t> spec;
+    if (r.path == VK_TILE_PATH_CM2) {
+#if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+        const std::vector<uint32_t> geom5 = { r.geom.BS, r.geom.BM, r.geom.BN, r.geom.BK,
+                                              (uint32_t) (r.geom.smaller > 0 ? 1 : 0) };
+        spec = ggml_vk_cm2_mm_spec(geom5, false, false);
+#else
+        why = "cm2 row support is not compiled into this build";
+        return false;
+#endif
+    } else {
+        std::vector<uint32_t> warptile = { r.geom.BS, r.geom.BM, r.geom.BN, 16u, r.geom.WM, r.geom.WN,
+                                           r.geom.WMITER, r.geom.TM, r.geom.TN, 1u, 32u };
+        spec = ggml_vk_scalar_mm_spec(device, std::move(warptile), false);
+    }
+    try {
+        vk_pipeline built = std::make_shared<vk_pipeline_struct>();
+        built->name = sh.name;
+        built->parameter_count = 3;
+        built->push_constant_size = sizeof(vk_mat_mat_push_constants);
+        built->wg_denoms = wg_denoms;
+        built->align = 1;             // the unaligned form, exactly like the init path
+        built->initialized = true;
+        ggml_vk_create_pipeline_func(device, built, sh.spv_size, sh.spv_data, "main", 3, wg_denoms, spec,
+                                     false, false, get_subgroup_size(sh.name, device->architecture));
+        if (built == nullptr || !built->compiled) {
+            why = "the create path returned without a compiled pipeline";
+            return false;
+        }
+        out = built;
+    } catch (const std::exception & e) {
+        why = std::string("pipeline creation failed: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
 // Install a row set into ONE backend context.  Called by the shell once per context,
 // after ggml_backend_vk_init() and before the first graph build (section 6, step 1).
 //
-// 1b-2b scope: the production call is the EMPTY set -- the shell's decision, fingerprint
-// and cache plumbing are in place, while row -> pipeline resolution is T4.  The empty set
-// is a real, successful install (there is simply nothing to write), which is what makes
-// "one decision, one install per context" observable.
+// The empty set is a real, successful install (there is simply nothing to write), which
+// is what makes "one decision, one install per context" observable.
 //
-// A non-empty set is validated against the SAME rule table the enumerator uses (section
-// 1.7) and then refused LOUDLY: accepting rows and quietly not applying them is the
-// "set it and nothing happened" trap (lesson #46).  The validation is not decoration --
-// it is what makes the enumerator and this loader produce the same reason string for the
-// same bad geometry (section 6.1 item 11).
+// A non-empty set is validated against the SAME rule tables the enumerator uses (the
+// shared geometry rules, the family/path support table and the device capability check)
+// and then resolved row by row.  Every rejection is LOUD and counted: accepting rows and
+// quietly not applying them is the "set it and nothing happened" trap (lesson #46), and
+// a bare drop counter has no denominator -- which is why the counts are per reason and
+// why "installed 0 of N rows" is its own line (section 6.7 B1-补①).
 bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row_spec * rows, size_t n_rows,
-                                       char * err, size_t err_size) {
+                                       char * err, size_t err_size, vk_tune_install_result * result) {
     const auto set_err = [&](const std::string & msg) {
         if (err != nullptr && err_size > 0) {
             snprintf(err, err_size, "%s", msg.c_str());
@@ -20142,6 +20350,11 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
         return false;
     };
 
+    if (result != nullptr) {
+        *result = vk_tune_install_result {};
+        result->declared = (unsigned) n_rows;
+    }
+
     if (!ggml_backend_is_vk(backend)) {
         return refuse("not a Vulkan backend");
     }
@@ -20155,24 +20368,114 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
                       "must be installed before the first graph build");
     }
 
-    if (n_rows > 0) {
-        if (rows == nullptr) {
-            return refuse("n_rows > 0 but the row pointer is null");
-        }
-        for (size_t i = 0; i < n_rows; i++) {
-            const char * reason = vk_tile_candidate_reason(rows[i].path, rows[i].geom);
-            if (reason != nullptr) {
-                return refuse("row " + std::to_string(i) + " is not a legal geometry: " + reason);
-            }
-        }
-        return refuse(std::to_string(n_rows) + " row(s) are legal geometries, but row resolution "
-                      "(geometry -> pipeline) arrives in T4; nothing was installed");
+    if (n_rows > 0 && rows == nullptr) {
+        return refuse("n_rows > 0 but the row pointer is null");
     }
 
-    // Empty set: nothing to write, and deliberately no write -- the freeze still happens
-    // on the first lookup, which is what keeps the install/freeze ordering evidence real.
-    ggml_vk_t3_line("install (" + ggml_vk_tune_ctx_tag(ctx)
-                    + "): 0 rows (empty set is the 1b-2b production form)");
+    // One statement per drop, so the counted line has a single writer (section 9.4).
+    const auto drop_row = [&](size_t index, vk_tune_row_drop kind, const std::string & kind_name,
+                              const std::string & why) {
+        if (result != nullptr) {
+            if (kind == VK_TUNE_ROW_DROP_ILLEGAL)          { result->dropped_illegal++; }
+            else if (kind == VK_TUNE_ROW_DROP_UNSUPPORTED) { result->dropped_unsupported++; }
+            else                                           { result->dropped_build_failed++; }
+        }
+        ggml_vk_t3_line("row dropped (" + ggml_vk_tune_ctx_tag(ctx) + "): index="
+                        + std::to_string(index) + " kind=" + kind_name + " reason=" + why);
+    };
+
+    // Resolve first, write once: the table install is a whole-set replacement per
+    // (family, acc) object, so a partially resolved set must not reach it.
+    std::map<const vk_matmul_pipeline_struct *, std::vector<vk_tuned_row>> pending;
+    for (size_t i = 0; i < n_rows; i++) {
+        const vk_tune_row_spec & r = rows[i];
+
+        const char * why = vk_tile_candidate_reason(r.path, r.geom);
+        if (why != nullptr) {
+            drop_row(i, VK_TUNE_ROW_DROP_ILLEGAL, "illegal", why);
+            continue;
+        }
+        why = vk_tune_row_family_reason(r.src0_type, r.src1_type, r.path);
+        if (why != nullptr) {
+            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, "unsupported", why);
+            continue;
+        }
+        why = ggml_vk_tuned_row_capability_reason(ctx->device, r);
+        if (why != nullptr) {
+            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, "unsupported", why);
+            continue;
+        }
+
+        vk_matmul_pipeline targets[2];
+        const int n_targets = ggml_vk_tuned_row_targets(ctx->device, r.src0_type, r.src1_type, targets);
+        if (n_targets == 0) {
+            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, "unsupported", "no (family, acc) object for this src0/src1 pair");
+            continue;
+        }
+
+        // I1: a row must never be installed on an object whose stock buckets are absent
+        // (the mmq/q8_1 and mul_mat_id paths use is_empty() to decide existence at all).
+        bool installed_anywhere = false;
+        for (int t = 0; t < n_targets; t++) {
+            if (targets[t] == nullptr || targets[t]->is_empty()) {
+                continue;
+            }
+            const bool f16acc = (t == 0);
+            vk_pipeline built = nullptr;
+            std::string build_why;
+            if (!ggml_vk_tuned_row_build(ctx->device, r, f16acc, built, build_why)) {
+                // One row may fail for one acc variant and succeed for the other: the
+                // failure is reported and counted, the success is still installed.
+                drop_row(i, VK_TUNE_ROW_DROP_BUILD_FAILED, "build-failed", build_why);
+                continue;
+            }
+            vk_tuned_row row {};
+            row.src0_type = (ggml_type) r.src0_type;
+            row.src1_type = (ggml_type) r.src1_type;
+            row.key_m = r.key_m;
+            row.key_k = r.key_k;
+            row.unaligned = built;
+            row.aligned = nullptr;    // B1 scope: see ggml_vk_tuned_row_build's comment
+            pending[targets[t].get()].push_back(row);
+            installed_anywhere = true;
+        }
+        if (!installed_anywhere) {
+            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, "unsupported",
+                     "the device has no stock (family, acc) buckets for this row");
+            continue;
+        }
+        if (result != nullptr) {
+            result->installed++;
+        }
+    }
+
+    for (auto & entry : pending) {
+        std::string reject;
+        if (!ctx->tuned.install(entry.first, std::move(entry.second), &reject)) {
+            return refuse(reject);
+        }
+    }
+
+    const unsigned declared  = (unsigned) n_rows;
+    const unsigned installed = (result != nullptr) ? result->installed : 0;
+    const unsigned d_illegal = (result != nullptr) ? result->dropped_illegal : 0;
+    const unsigned d_unsup   = (result != nullptr) ? result->dropped_unsupported : 0;
+    const unsigned d_build   = (result != nullptr) ? result->dropped_build_failed : 0;
+    ggml_vk_t3_line("install (" + ggml_vk_tune_ctx_tag(ctx) + "): "
+                    + std::to_string(declared) + " declared, " + std::to_string(installed) + " installed, dropped("
+                    + "illegal=" + std::to_string(d_illegal)
+                    + " unsupported=" + std::to_string(d_unsup)
+                    + " build-failed=" + std::to_string(d_build) + ")"
+                    + (declared == 0 ? " (empty set is the 1b-2b production form)" : ""));
+
+    // A file that installs nothing at all is the "user set it and nothing happened" case
+    // (lesson #46): per-row lines exist, but nobody greps counts to discover that the
+    // whole set was a no-op, so it gets a line of its own.
+    if (declared > 0 && installed == 0) {
+        ggml_vk_t3_line("installed 0 of " + std::to_string(declared)
+                        + " rows (" + ggml_vk_tune_ctx_tag(ctx)
+                        + "): the stock heuristic is used for every shape");
+    }
     return true;
 }
 

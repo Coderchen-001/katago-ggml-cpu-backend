@@ -39,7 +39,13 @@
 size_t ggml_backend_vk_tune_fingerprint(ggml_backend_t backend, char* out, size_t outSize);
 // Installs a row set into ONE context.  Returns false and fills `err` on refusal; the
 // backend logs the refusal loudly itself.
-bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row_spec* rows, size_t nRows, char* err, size_t errSize);
+//
+// `out` (optional, B1) reports the install in three counts plus a per-reason breakdown:
+// declared / installed / dropped_*.  The shell needs them because "every row in the file
+// is hit at least once" is graded against the rows that INSTALLED, and because the write
+// side (step 5) may only write rows this process really installed.
+bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row_spec* rows, size_t nRows,
+                                       char* err, size_t errSize, vk_tune_install_result* out);
 
 namespace VulkanTuner {
 
@@ -143,6 +149,14 @@ namespace VulkanTuner {
     // keeps "rows" from reading like a row container.
     size_t rowCount = 0;
     double tuneMs = 0.0;          // wall time of this decision, never mixed into visits/s
+    // B1: what the backend actually DID with the rows above, accumulated over the contexts
+    // of this device.  The accumulation is deliberately conservative, because the durable
+    // set (what step 5 may write) is the rows that installed in EVERY context sharing this
+    // file key: `installed` keeps the MINIMUM seen and each drop count the MAXIMUM, so a row
+    // that failed anywhere can never be counted as installed everywhere.  Aggregates cannot
+    // express the per-row intersection, so this is a sound bound rather than the set itself.
+    vk_tune_install_result install {};
+    bool installSeen = false;
     std::string note;             // one short human-readable clause for the log line
   };
 

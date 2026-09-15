@@ -8,6 +8,7 @@
 #include "../dataio/homedata.h"
 
 #include <chrono>
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -912,9 +913,10 @@ namespace VulkanTuner {
     return ::ggml_backend_vk_tune_fingerprint(backend, out, outSize);
   }
 
-  bool backendInstallRows(ggml_backend_t backend, const vk_tune_row_spec* rows, size_t nRows, string& err) {
+  bool backendInstallRows(ggml_backend_t backend, const vk_tune_row_spec* rows, size_t nRows, string& err,
+                          vk_tune_install_result& out) {
     vector<char> errBuf(512, '\0');
-    const bool ok = ::ggml_backend_vk_tune_install_rows(backend, rows, nRows, errBuf.data(), errBuf.size());
+    const bool ok = ::ggml_backend_vk_tune_install_rows(backend, rows, nRows, errBuf.data(), errBuf.size(), &out);
     if (!ok) {
       err = string(errBuf.data());
     }
@@ -1427,12 +1429,33 @@ namespace VulkanTuner {
       return;
     }
     // The backend prints the per-context install line (it is the only side that can name
-    // the context), so this side only has to report a failure.
+    // the context), so this side reports a failure, and -- B1 -- the IMPORT face: an
+    // imported row set is USER DATA that decides which production pipelines get built, and
+    // the one thing it must never do is change behaviour without saying so (lesson #46).
     const vk_tune_row_spec* rows = decision->rows.empty() ? nullptr : decision->rows.data();
+    vk_tune_install_result installed {};
     string err;
-    if (!backendInstallRows(backend, rows, decision->rows.size(), err)) {
+    if (!backendInstallRows(backend, rows, decision->rows.size(), err, installed)) {
       logLine("WARNING: install failed for " + decision->deviceName + ": " + err
               + " (fail-open: this context uses the stock heuristic)");
+      return;
+    }
+    // Conservative accumulation over this device's contexts: a row belongs to the durable
+    // set only if EVERY context installed it, so keep the smallest `installed` and the
+    // largest drop counts (see the field comment in the header).
+    if (!decision->installSeen) {
+      decision->install = installed;
+      decision->installSeen = true;
+    } else {
+      decision->install.installed = std::min(decision->install.installed, installed.installed);
+      decision->install.dropped_illegal = std::max(decision->install.dropped_illegal, installed.dropped_illegal);
+      decision->install.dropped_unsupported = std::max(decision->install.dropped_unsupported, installed.dropped_unsupported);
+      decision->install.dropped_build_failed = std::max(decision->install.dropped_build_failed, installed.dropped_build_failed);
+    }
+    if (decision->imported && installed.declared > 0) {
+      logLine("IMPORT installed " + to_string(installed.installed) + " of "
+              + to_string(installed.declared) + " row(s) from " + decision->importedFrom
+              + " (not key-checked: IMPORT is a reflow/development channel, not evidence that we measured it)");
     }
   }
 
