@@ -1451,6 +1451,11 @@ namespace VulkanTuner {
       decision->install.dropped_illegal = std::max(decision->install.dropped_illegal, installed.dropped_illegal);
       decision->install.dropped_unsupported = std::max(decision->install.dropped_unsupported, installed.dropped_unsupported);
       decision->install.dropped_build_failed = std::max(decision->install.dropped_build_failed, installed.dropped_build_failed);
+      // The two per-target fields are inside no equality (they describe one row twice), so
+      // the conservative direction for them is the maximum: a partial install or a failed
+      // variant anywhere disqualifies the stronger claim.
+      decision->install.partial = std::max(decision->install.partial, installed.partial);
+      decision->install.variant_failed = std::max(decision->install.variant_failed, installed.variant_failed);
     }
     if (decision->imported && installed.declared > 0) {
       logLine("IMPORT installed " + to_string(installed.installed) + " of "

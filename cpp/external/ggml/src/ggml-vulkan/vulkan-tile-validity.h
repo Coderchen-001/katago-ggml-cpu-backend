@@ -123,12 +123,40 @@ enum vk_tune_row_drop {
     VK_TUNE_ROW_DROP_BUILD_FAILED = 3,  // the pipeline could not be created
 };
 
+// Row-level counts, and they are an EQUALITY:
+//
+//     installed + dropped_illegal + dropped_unsupported + dropped_build_failed == declared
+//
+// A row is counted as installed when it landed on at least one non-empty target object
+// (union, so a row that is usable is never thrown away), and it is counted as dropped only
+// when it landed NOWHERE.  That is what keeps the three numbers addable: an earlier shape
+// counted `installed` per row but the drops per TARGET, so one row whose two accumulator
+// variants failed differently could push installed + dropped past declared.
+//
+// The per-target detail lives in two fields that are deliberately OUTSIDE that equality
+// (they describe one row twice, they do not partition the declared set):
+//
+//   * partial        -- rows that installed, but not on every non-empty target (a SUBSET
+//                       flag of `installed`, not a third bucket: a third bucket would
+//                       reopen the "which side does it fall on" question)
+//   * variant_failed -- (row, target) build failures
+//
+// Why "installed" is a union and the authority for "was it really used" is the HIT, not any
+// install-time predicate: the accumulator variant is chosen PER NODE from dst->op_params[0],
+// and KATAGO_VK_MMPREC_F32 (a policy knob, i.e. a legitimate production configuration) can
+// rewrite the whole graph or a subset of nodes (vulkanbackend.cpp:2748-2758), so both
+// variants may be in use inside one process and no predicate evaluated at install time can
+// name "the" required one.  A dead row -- installed on a variant production never resolves,
+// or on a variant that is empty while the other is not -- is what the per-row hit assertion
+// catches.
 struct vk_tune_install_result {
     unsigned declared;
     unsigned installed;
     unsigned dropped_illegal;
     unsigned dropped_unsupported;
     unsigned dropped_build_failed;
+    unsigned partial;          // subset of `installed` (see above)
+    unsigned variant_failed;   // (row, target) build failures (see above)
 };
 
 // ---------------------------------------------------------------------------

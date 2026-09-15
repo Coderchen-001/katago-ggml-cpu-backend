@@ -20271,35 +20271,51 @@ static bool ggml_vk_tuned_row_shader_for(const vk_device & device, int src1_type
     return true;
 }
 
-// Build one pipeline for one geometry.  Never throws out of here: the geometry is USER
-// DATA, and a driver refusal must become a dropped row (fail-open), not a crash.  The
-// create entry below is the same one the init path's compile step uses, and it does the
-// whole job synchronously (shader module, layout, createComputePipeline) and registers
-// the pipeline for teardown.
+// Build one pipeline for one geometry.  NEVER THROWS -- and that claim is two layers, not
+// one (t3-shell-plan.md section 6.8 B1-fix-3):
+//
+//   (a) THE MAIN LINE: every guard BEFORE create is exhaustive, so a user geometry cannot
+//       reach a driver call or an assert that reads row data.  The asserts that matter are
+//       inside ggml_vk_create_pipeline_func and they DO read this call's arguments
+//       (parameter_count is the constant 3, but wg_denoms = {BM, BN, 1} comes straight from
+//       the row), which is why the rules table's zero-dimension clause -- the guard for them
+//       -- has its own leg (a hand-written BM=0 row must be refused at parse time with the
+//       process alive).  NOT VERIFIED ON THIS MACHINE beyond that one guard and a source
+//       review: a table-legal, I6-legal geometry that still trips an assert has not been
+//       produced.
+//   (b) THE FALLBACK: the WHOLE body sits in try/catch, and (b) is not exercised at all
+//       here.  So catch(...) is NOT the guarantee -- it is the last line for the case (a)
+//       cannot cover (driver/resource failures), and its conversion to a dropped row is
+//       best-effort until a device produces one.  The trigger condition to look for: a row
+//       that passes the rules table and I6 but still fails to build.
+//
+// The spec construction is inside the try on purpose: std::vector growth can throw
+// bad_alloc, and leaving it outside would make "never throws" true only for the part of the
+// function that happens to be inside.
 static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec & r, bool f16acc,
                                     vk_pipeline & out, std::string & why) {
-    ggml_vk_tuned_row_shader sh {};
-    if (!ggml_vk_tuned_row_shader_for(device, r.src1_type, r.path, f16acc, sh)) {
-        why = "no shader module for this (family, path, acc) in this build";
-        return false;
-    }
-    const std::array<uint32_t, 3> wg_denoms = { r.geom.BM, r.geom.BN, 1 };
-    std::vector<uint32_t> spec;
-    if (r.path == VK_TILE_PATH_CM2) {
-#if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
-        const std::vector<uint32_t> geom5 = { r.geom.BS, r.geom.BM, r.geom.BN, r.geom.BK,
-                                              (uint32_t) (r.geom.smaller > 0 ? 1 : 0) };
-        spec = ggml_vk_cm2_mm_spec(geom5, false, false);
-#else
-        why = "cm2 row support is not compiled into this build";
-        return false;
-#endif
-    } else {
-        std::vector<uint32_t> warptile = { r.geom.BS, r.geom.BM, r.geom.BN, 16u, r.geom.WM, r.geom.WN,
-                                           r.geom.WMITER, r.geom.TM, r.geom.TN, 1u, 32u };
-        spec = ggml_vk_scalar_mm_spec(device, std::move(warptile), false);
-    }
     try {
+        ggml_vk_tuned_row_shader sh {};
+        if (!ggml_vk_tuned_row_shader_for(device, r.src1_type, r.path, f16acc, sh)) {
+            why = "no shader module for this (family, path, acc) in this build";
+            return false;
+        }
+        const std::array<uint32_t, 3> wg_denoms = { r.geom.BM, r.geom.BN, 1 };
+        std::vector<uint32_t> spec;
+        if (r.path == VK_TILE_PATH_CM2) {
+#if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+            const std::vector<uint32_t> geom5 = { r.geom.BS, r.geom.BM, r.geom.BN, r.geom.BK,
+                                                  (uint32_t) (r.geom.smaller > 0 ? 1 : 0) };
+            spec = ggml_vk_cm2_mm_spec(geom5, false, false);
+#else
+            why = "cm2 row support is not compiled into this build";
+            return false;
+#endif
+        } else {
+            std::vector<uint32_t> warptile = { r.geom.BS, r.geom.BM, r.geom.BN, 16u, r.geom.WM, r.geom.WN,
+                                               r.geom.WMITER, r.geom.TM, r.geom.TN, 1u, 32u };
+            spec = ggml_vk_scalar_mm_spec(device, std::move(warptile), false);
+        }
         vk_pipeline built = std::make_shared<vk_pipeline_struct>();
         built->name = sh.name;
         built->parameter_count = 3;
@@ -20316,6 +20332,9 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
         out = built;
     } catch (const std::exception & e) {
         why = std::string("pipeline creation failed: ") + e.what();
+        return false;
+    } catch (...) {
+        why = "pipeline creation failed with a non-standard exception";
         return false;
     }
     return true;
@@ -20373,9 +20392,14 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
     }
 
     // One statement per drop, so the counted line has a single writer (section 9.4).
+    //
+    // `counts_as_row_drop` is what keeps the row-level equality honest: a target-level build
+    // failure (one of the two accumulator variants) is loud and counted in `variant_failed`,
+    // but it is NOT a row drop -- the row is still installed on the other variant, so adding
+    // it to `dropped_*` would push installed + dropped past declared (section 6.8 B1-fix-1).
     const auto drop_row = [&](size_t index, vk_tune_row_drop kind, const std::string & kind_name,
-                              const std::string & why) {
-        if (result != nullptr) {
+                              const std::string & why, bool counts_as_row_drop = true) {
+        if (result != nullptr && counts_as_row_drop) {
             if (kind == VK_TUNE_ROW_DROP_ILLEGAL)          { result->dropped_illegal++; }
             else if (kind == VK_TUNE_ROW_DROP_UNSUPPORTED) { result->dropped_unsupported++; }
             else                                           { result->dropped_build_failed++; }
@@ -20415,18 +20439,34 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
 
         // I1: a row must never be installed on an object whose stock buckets are absent
         // (the mmq/q8_1 and mul_mat_id paths use is_empty() to decide existence at all).
+        //
+        // Counted per ROW, and only a row that landed NOWHERE is a drop -- that is what keeps
+        // `installed + sum(dropped_*) == declared` true.  The two per-TARGET facts go into
+        // fields outside that equality (they describe one row twice): a target that failed to
+        // build is `variant_failed`, and a row that installed without covering every
+        // non-empty target is `partial`.  `installed` itself stays a union on purpose: the
+        // accumulator variant is resolved per node (dst->op_params[0], which
+        // KATAGO_VK_MMPREC_F32 can rewrite for all or some nodes), so no install-time
+        // predicate can name "the" required target -- the per-row HIT assertion is the
+        // authority for "this row was really used", and it is what catches a dead row.
         bool installed_anywhere = false;
+        unsigned targets_present = 0;
+        unsigned targets_built = 0;
         for (int t = 0; t < n_targets; t++) {
             if (targets[t] == nullptr || targets[t]->is_empty()) {
                 continue;
             }
+            targets_present++;
             const bool f16acc = (t == 0);
             vk_pipeline built = nullptr;
             std::string build_why;
             if (!ggml_vk_tuned_row_build(ctx->device, r, f16acc, built, build_why)) {
                 // One row may fail for one acc variant and succeed for the other: the
                 // failure is reported and counted, the success is still installed.
-                drop_row(i, VK_TUNE_ROW_DROP_BUILD_FAILED, "build-failed", build_why);
+                if (result != nullptr) {
+                    result->variant_failed++;
+                }
+                drop_row(i, VK_TUNE_ROW_DROP_BUILD_FAILED, "variant-failed", build_why, /*counts_as_row_drop=*/false);
                 continue;
             }
             vk_tuned_row row {};
@@ -20438,6 +20478,7 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
             row.aligned = nullptr;    // B1 scope: see ggml_vk_tuned_row_build's comment
             pending[targets[t].get()].push_back(row);
             installed_anywhere = true;
+            targets_built++;
         }
         if (!installed_anywhere) {
             drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, "unsupported",
@@ -20446,6 +20487,9 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
         }
         if (result != nullptr) {
             result->installed++;
+            if (targets_built < targets_present) {
+                result->partial++;
+            }
         }
     }
 
@@ -20461,11 +20505,17 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
     const unsigned d_illegal = (result != nullptr) ? result->dropped_illegal : 0;
     const unsigned d_unsup   = (result != nullptr) ? result->dropped_unsupported : 0;
     const unsigned d_build   = (result != nullptr) ? result->dropped_build_failed : 0;
+    const unsigned d_partial = (result != nullptr) ? result->partial : 0;
+    const unsigned d_variant = (result != nullptr) ? result->variant_failed : 0;
+    // Row-level counts first (they are the equality: installed + dropped_* == declared), then
+    // the two per-target fields, which describe one row twice and are NOT part of it.
     ggml_vk_t3_line("install (" + ggml_vk_tune_ctx_tag(ctx) + "): "
                     + std::to_string(declared) + " declared, " + std::to_string(installed) + " installed, dropped("
                     + "illegal=" + std::to_string(d_illegal)
                     + " unsupported=" + std::to_string(d_unsup)
                     + " build-failed=" + std::to_string(d_build) + ")"
+                    + " partial=" + std::to_string(d_partial)
+                    + " variant-failed=" + std::to_string(d_variant)
                     + (declared == 0 ? " (empty set is the 1b-2b production form)" : ""));
 
     // A file that installs nothing at all is the "user set it and nothing happened" case
