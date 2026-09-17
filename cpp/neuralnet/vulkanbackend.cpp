@@ -2824,7 +2824,8 @@ struct ComputeHandle {
     else if(reqF32) {
       forceF32AccOnF16MulMats(graph, true, &builder.faFeedGemmPtrs);
       precF32Acc = true;
-      precSource = (mmp == '2' || mmp == '3') ? "requested(subsumes env subset)" : "requested";
+      precSource = (mmp == '2' || mmp == '3') ? "requested(subsumes env subset)"
+                 : (mmpEnv != nullptr ? "requested(env named no class)" : "requested");
     }
     else if(mmp == '2' || mmp == '3') {
       forceF32AccOnF16MulMats(graph, false, &builder.faFeedGemmPtrs);
