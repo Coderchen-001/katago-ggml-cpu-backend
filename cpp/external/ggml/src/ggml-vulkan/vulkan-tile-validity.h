@@ -277,6 +277,24 @@ static inline uint64_t vk_tile_canonical_key(int path, const vk_tile_geometry & 
     return h;
 }
 
+// The align a row's ALIGNED variant must be created with, per path (t3-shell-plan.md 6.9).
+// Derived from the stock buckets so that a row and the bucket it shadows agree:
+//   cm2   : warptiles are {BLOCK_SIZE,BM,BN,BK,smaller} = {256,128,256,64,1} / {256,128,128,64,0}
+//           / {128,64,64,64,0} and stock aligns l/m/s = 128/64/32 = BN/2 (ggml-vulkan.cpp:4806-4808);
+//   scalar: warptiles have BM == BN and stock aligns 128/64/32 (ggml-vulkan.cpp:4875-4877),
+//           which max(BM,BN) reproduces exactly.
+// DIRECTION DISCIPLINE (the same one KATAGO_VK_MM_TILE=custom: states): too small means the
+// shader reads across rows -- a silent wrong answer; too large only means fewer aligned hits --
+// slower.  So there is nothing to measure when the two candidates disagree: take the larger.
+// Taking the smaller needs shader-level evidence, never an A/B run.  An odd cm2 BN falls back to
+// BN itself because BN/2 would truncate (i.e. round down = the dangerous direction).
+static inline uint32_t vk_tile_row_align_for(int path, const vk_tile_geometry & g) {
+    if (path == VK_TILE_PATH_CM2) {
+        return (g.BN % 2 == 0) ? (g.BN / 2) : g.BN;
+    }
+    return g.BM > g.BN ? g.BM : g.BN;
+}
+
 // Per-path axis classification: the enumeration space, not validity.  Kept here so the
 // enumerator and any validator read one table.  Sources: t1-predicate.md section 2
 // (2026-09-13 rewrite), t1-candidates.md section 2.2, VENDOR-BASE.md section 2, and the

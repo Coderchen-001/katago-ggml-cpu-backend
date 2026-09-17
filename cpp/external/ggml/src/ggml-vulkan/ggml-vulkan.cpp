@@ -5534,7 +5534,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     if (ok) {
                         const std::array<uint32_t, 3> custom_wg_denoms = { BM, BN, 1 };
                         const std::vector<uint32_t> custom_warptile = { BS, BM, BN, 16, WM, WN, WMITER, TM, TN, 1, 32 };
-                        const uint32_t custom_align = std::max(BM, BN);  // conservative: too-small align = vec8 reads across rows (silent wrong); too-large = slower only
+                        const uint32_t custom_align = vk_tile_row_align_for(VK_TILE_PATH_SCALAR, tile);  // ONE rule with the row path (t3-shell-plan.md 6.9 item 7 / G-E8). On the scalar path this IS max(BM,BN); the shared rule exists so that a future cm2 injection channel cannot measure with one align and take effect with another. Direction discipline lives with the rule: too-small = vec8 reads across rows (silent wrong); too-large = fewer aligned hits (slower only).
                         mm_spec_pad = PAD;
                         mm_spec_reshape = RESHAPE;
                         // Per-device slots on the PRODUCTION family pipeline_matmul_f16_f32.f32acc
@@ -9711,9 +9711,9 @@ static void ggml_vk_t2_log_tuned_row(ggml_backend_vk_context * ctx, const vk_mat
 //      variant is deliberately NOT a rejection -- see ggml_vk_tuned_row_align_advice.
 //   I5 the row does not target the mmq/q8_1 path, whose shader has its own layout and
 //      where padded_n would start depending on the row's wg_denoms
-static const char * ggml_vk_tuned_row_check(ggml_backend_vk_context * ctx, const vk_matmul_pipeline & target,
-                                            ggml_type src0_type, ggml_type src1_type,
-                                            const vk_tuned_row * row = nullptr) {
+static const char * ggml_vk_tuned_row_check_impl(ggml_backend_vk_context * ctx, const vk_matmul_pipeline & target,
+                                                 ggml_type src0_type, ggml_type src1_type,
+                                                 const vk_tuned_row * row, bool live_resolver) {
     // I1: the stock buckets must exist.  is_empty() ignores tuned rows, and the
     // mmq/q8_1 paths plus the mul_mat_id acc selector use it to decide whether a
     // (family, acc) exists at all (the id path then asserts) -- so a tuned-only
@@ -9722,10 +9722,13 @@ static const char * ggml_vk_tuned_row_check(ggml_backend_vk_context * ctx, const
         return "I1: stock l/aligned_l bucket missing on this (family, acc)";
     }
     // I2: the row must target the object this device actually selects.  Using the real
-    // resolver keeps this in sync with the selector by construction.
-    const vk_matmul_pipeline resolved = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0_type, src1_type, GGML_PREC_DEFAULT, /*quiet_probe*/ true);
-    if (resolved != target) {
-        return "I2: row targets an (family, acc) object this device never selects";
+    // resolver keeps this in sync with the selector by construction.  `live_resolver` is false
+    // on the install path only -- see ggml_vk_tuned_row_check_install_time below.
+    if (live_resolver) {
+        const vk_matmul_pipeline resolved = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0_type, src1_type, GGML_PREC_DEFAULT, /*quiet_probe*/ true);
+        if (resolved != target) {
+            return "I2: row targets an (family, acc) object this device never selects";
+        }
     }
     if (row != nullptr) {
         // I3: without an unaligned pipeline the row is unusable on unpadded buffers.
@@ -9759,6 +9762,28 @@ static const char * ggml_vk_tuned_row_check(ggml_backend_vk_context * ctx, const
     return nullptr;
 }
 
+// Two named entries over ONE clause body (t3-shell-plan.md 9.1, clause-attribution table):
+//   * self-test : all clauses, I2 included.  I2 is the cross-check of the target list against
+//                 the object resolver, and it is the only clause that queries.
+//   * install   : the same clauses MINUS I2.  I2 must not run from the install path: it calls
+//                 ggml_vk_get_mul_mat_mat_pipeline, which today returns the device object
+//                 directly for every f16/bf16 family (no row-table access, so nothing freezes),
+//                 but the rule here is structural -- if that resolver ever routed through the
+//                 bucket selector, the row lookup would freeze the table (R3) and the install
+//                 itself would be refused.  I2 is also structurally satisfied on this path: the
+//                 target came from ggml_vk_tuned_row_targets, which mirrors that resolver.
+static const char * ggml_vk_tuned_row_check(ggml_backend_vk_context * ctx, const vk_matmul_pipeline & target,
+                                            ggml_type src0_type, ggml_type src1_type,
+                                            const vk_tuned_row * row = nullptr) {
+    return ggml_vk_tuned_row_check_impl(ctx, target, src0_type, src1_type, row, /*live_resolver=*/true);
+}
+
+static const char * ggml_vk_tuned_row_check_install_time(const vk_matmul_pipeline & target,
+                                                         ggml_type src0_type, ggml_type src1_type,
+                                                         const vk_tuned_row & row) {
+    return ggml_vk_tuned_row_check_impl(nullptr, target, src0_type, src1_type, &row, /*live_resolver=*/false);
+}
+
 // Non-fatal advice for an oversized ALIGNED variant (t3-shell-plan.md section 6.1 item
 // 14b): the row may be installed, but the caller should warn and count it as
 // "conservative, not correctness" (predicate_rejects).  Returns nullptr when there is
@@ -9775,7 +9800,13 @@ static const char * ggml_vk_tuned_row_align_advice(const vk_matmul_pipeline & ta
         }
     }
     if (row->aligned->align > stock_align) {
-        return "aligned variant align exceeds the stock buckets' align (conservative, not correctness)";
+        // NOT "never selected": the row's own align governs kpad (the align probe calls back
+        // through the same row lookup), so a larger align only means FEWER shapes take the
+        // aligned variant -- the rest fall back to this row's unaligned pipeline (correct, and
+        // possibly slower than stock, which pads k to its smaller align and uses its aligned
+        // bucket).  Whether any covered shape satisfies k % align == 0 is a question about the
+        // COVERAGE SET, so the tuner checks it (B2/B3), not the backend at install time.
+        return "aligned variant align exceeds every stock bucket: only shapes whose k is a multiple of it use it, the rest fall back to this row's unaligned pipeline (correct, possibly slower than stock)";
     }
     return nullptr;
 }
@@ -20293,7 +20324,7 @@ static bool ggml_vk_tuned_row_shader_for(const vk_device & device, int src1_type
 // bad_alloc, and leaving it outside would make "never throws" true only for the part of the
 // function that happens to be inside.
 static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec & r, bool f16acc,
-                                    vk_pipeline & out, std::string & why) {
+                                    bool aligned_variant, vk_pipeline & out, std::string & why) {
     try {
         ggml_vk_tuned_row_shader sh {};
         if (!ggml_vk_tuned_row_shader_for(device, r.src1_type, r.path, f16acc, sh)) {
@@ -20306,7 +20337,7 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
             const std::vector<uint32_t> geom5 = { r.geom.BS, r.geom.BM, r.geom.BN, r.geom.BK,
                                                   (uint32_t) (r.geom.smaller > 0 ? 1 : 0) };
-            spec = ggml_vk_cm2_mm_spec(geom5, false, false);
+            spec = ggml_vk_cm2_mm_spec(geom5, aligned_variant, false);
 #else
             why = "cm2 row support is not compiled into this build";
             return false;
@@ -20314,17 +20345,28 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
         } else {
             std::vector<uint32_t> warptile = { r.geom.BS, r.geom.BM, r.geom.BN, 16u, r.geom.WM, r.geom.WN,
                                                r.geom.WMITER, r.geom.TM, r.geom.TN, 1u, 32u };
-            spec = ggml_vk_scalar_mm_spec(device, std::move(warptile), false);
+            spec = ggml_vk_scalar_mm_spec(device, std::move(warptile), aligned_variant);
         }
+        // The THREE creation parameters live in one place (t3-shell-plan.md 6.9 item 8).  The cm1
+        // batch will flip kRequireFullSubgroups to true (G-D3: init's cm1 macro ends with
+        // `1, false, true`), and a second copy of these values below would be the copy nobody
+        // updates.  Values are unchanged by this batch.
+        const bool kDisableRobustness      = false;
+        const bool kRequireFullSubgroups   = false;
+        const uint32_t kRequiredSubgroup   = get_subgroup_size(sh.name, device->architecture);
         vk_pipeline built = std::make_shared<vk_pipeline_struct>();
-        built->name = sh.name;
+        built->name = aligned_variant ? (std::string(sh.name) + "_aligned") : std::string(sh.name);
         built->parameter_count = 3;
         built->push_constant_size = sizeof(vk_mat_mat_push_constants);
         built->wg_denoms = wg_denoms;
-        built->align = 1;             // the unaligned form, exactly like the init path
+        // The ONE write of `align` on this path (there is no align argument in the create
+        // function -- ggml_vk_create_pipeline_func has no such parameter, unlike the init-side
+        // lambda).  Setting it here, with the other fields, is what keeps it a single write
+        // point; do not patch it after the create call.
+        built->align = aligned_variant ? vk_tile_row_align_for(r.path, r.geom) : 1;
         built->initialized = true;
         ggml_vk_create_pipeline_func(device, built, sh.spv_size, sh.spv_data, "main", 3, wg_denoms, spec,
-                                     false, false, get_subgroup_size(sh.name, device->architecture));
+                                     kDisableRobustness, kRequireFullSubgroups, kRequiredSubgroup);
         if (built == nullptr || !built->compiled) {
             why = "the create path returned without a compiled pipeline";
             return false;
@@ -20411,6 +20453,11 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
     // Resolve first, write once: the table install is a whole-set replacement per
     // (family, acc) object, so a partially resolved set must not reach it.
     std::map<const vk_matmul_pipeline_struct *, std::vector<vk_tuned_row>> pending;
+    // lambda (the resident-pipeline count, t1-schema.md section 1 "pipeline cache growth"):
+    // pipelines this install created, reported as `pipes=` below.  Per row the ceiling is
+    // 2 variants x 2 accumulator targets = 4 per context -- one row is one geometry pair and
+    // carries both align variants, not a family of geometries (t3-shell-plan.md 6.9).
+    unsigned pipes_created = 0;
     for (size_t i = 0; i < n_rows; i++) {
         const vk_tune_row_spec & r = rows[i];
 
@@ -20460,7 +20507,7 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
             const bool f16acc = (t == 0);
             vk_pipeline built = nullptr;
             std::string build_why;
-            if (!ggml_vk_tuned_row_build(ctx->device, r, f16acc, built, build_why)) {
+            if (!ggml_vk_tuned_row_build(ctx->device, r, f16acc, /*aligned_variant=*/false, built, build_why)) {
                 // One row may fail for one acc variant and succeed for the other: the
                 // failure is reported and counted, the success is still installed.
                 if (result != nullptr) {
@@ -20469,13 +20516,44 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
                 drop_row(i, VK_TUNE_ROW_DROP_BUILD_FAILED, "variant-failed", build_why, /*counts_as_row_drop=*/false);
                 continue;
             }
+            pipes_created++;
+            // The aligned twin: SAME geometry, spec flipped, align from the shared rule
+            // (vk_tile_row_align_for).  An aligned failure keeps the row usable --
+            // ggml_vk_tuned_row_pick falls back to the unaligned pipeline -- so it is counted
+            // and loud, never a row drop (tune-gaps.md G-D24).
+            vk_pipeline built_aligned = nullptr;
+            std::string aligned_why;
+            if (ggml_vk_tuned_row_build(ctx->device, r, f16acc, /*aligned_variant=*/true, built_aligned, aligned_why)) {
+                pipes_created++;
+            } else {
+                if (result != nullptr) {
+                    result->variant_failed++;
+                }
+                ggml_vk_t3_line("aligned variant not built (" + ggml_vk_tune_ctx_tag(ctx) + "): index="
+                                + std::to_string(i) + " acc=" + (f16acc ? "f16acc" : "f32acc")
+                                + " reason=" + aligned_why);
+            }
             vk_tuned_row row {};
             row.src0_type = (ggml_type) r.src0_type;
             row.src1_type = (ggml_type) r.src1_type;
             row.key_m = r.key_m;
             row.key_k = r.key_k;
             row.unaligned = built;
-            row.aligned = nullptr;    // B1 scope: see ggml_vk_tuned_row_build's comment
+            row.aligned = built_aligned;
+            // Install-time clauses: I1/I3/I4/I5 only.  I2 stays in the self-test because it is
+            // the only clause that queries, and querying here would freeze the table (R3) and
+            // make this very install impossible -- see ggml_vk_tuned_row_check_install_time.
+            if (const char * clause = ggml_vk_tuned_row_check_install_time(targets[t], (ggml_type) r.src0_type,
+                                                                          (ggml_type) r.src1_type, row)) {
+                drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, "unsupported", clause);
+                continue;
+            }
+            // Advice (loud, not a rejection): an aligned variant whose align exceeds every stock
+            // bucket serves fewer shapes than stock's aligned bucket would.
+            if (const char * advice = ggml_vk_tuned_row_align_advice(targets[t], &row)) {
+                ggml_vk_t3_line("row advice (" + ggml_vk_tune_ctx_tag(ctx) + "): index=" + std::to_string(i)
+                                + " " + advice);
+            }
             pending[targets[t].get()].push_back(row);
             installed_anywhere = true;
             targets_built++;
@@ -20516,6 +20594,7 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
                     + " build-failed=" + std::to_string(d_build) + ")"
                     + " partial=" + std::to_string(d_partial)
                     + " variant-failed=" + std::to_string(d_variant)
+                    + " pipes=" + std::to_string(pipes_created)
                     + (declared == 0 ? " (empty set is the 1b-2b production form)" : ""));
 
     // A file that installs nothing at all is the "user set it and nothing happened" case
