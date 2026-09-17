@@ -4664,6 +4664,48 @@ struct CompileTask {
 // ggml_vk_load_shaders keeps a one-line forwarder under the old name because its create
 // macros spell that name; behaviour is unchanged, Intel clause included (constantID
 // 12/13 pushed as a pair, defaults 1/false = the shader defaults).
+// G-D14 / R1b-3: the THREE pipeline-create flags in ONE table.  What the caller wants (family/path,
+// geometry, align variant, acc target) is the decision; the flags are DERIVED from the family.  They
+// used to be spelled at every create site -- the init macros and the tuned-row build each carried
+// their own copy -- and they genuinely differ per family.  TODAY's values, written down here:
+//
+//   family | disable_robustness | require_full_subgroups        | required_subgroup_size
+//   -------+--------------------+-------------------------------+------------------------
+//   scalar | false              | (call-site REQSUBGROUPSIZE>0)  | call-site REQ (0 => name lookup)
+//   cm1    | false              | true                           | 0 (no fallback is wanted: already full)
+//   cm2    | true               | false                          | 0 (=> name lookup)
+//
+// Why this is worth a table: the cm1 batch (G-D3) will flip `require_full_subgroups` for the row
+// path, and :20408 already warns that a second copy of these values would be "the copy nobody
+// updates".  Guardrail R27 mechanically matches the init macros against this table, so changing a
+// value here without changing them (or vice versa) is red -- no 24-site macro rewrite needed for
+// the mechanical tie, and no silent divergence either way.
+enum vk_tile_kernel_family { VK_TILE_FAMILY_SCALAR = 0, VK_TILE_FAMILY_CM1 = 1, VK_TILE_FAMILY_CM2 = 2 };
+
+struct vk_tile_kernel_create_flags {
+    bool     disable_robustness;
+    bool     require_full_subgroups;
+    uint32_t required_subgroup_size;
+};
+
+static vk_tile_kernel_create_flags ggml_vk_tile_create_flags_of(vk_tile_kernel_family fam, uint32_t callSiteReqSubgroups) {
+    vk_tile_kernel_create_flags f {};
+    if (fam == VK_TILE_FAMILY_CM2) {
+        f.disable_robustness     = true;
+        f.require_full_subgroups = false;
+        f.required_subgroup_size = 0;                       // 0 => resolved by name in the create entry
+    } else if (fam == VK_TILE_FAMILY_CM1) {
+        f.disable_robustness     = false;
+        f.require_full_subgroups = true;
+        f.required_subgroup_size = 0;                       // full subgroups already => no fallback
+    } else {
+        f.disable_robustness     = false;
+        f.require_full_subgroups = (callSiteReqSubgroups > 0);
+        f.required_subgroup_size = callSiteReqSubgroups;    // 0 => resolved by name in the create entry
+    }
+    return f;
+}
+
 static std::vector<uint32_t> ggml_vk_scalar_mm_spec(const vk_device & device, std::vector<uint32_t> spec, bool aligned) {
     spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
     if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
@@ -20408,8 +20450,15 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
         // batch will flip kRequireFullSubgroups to true (G-D3: init's cm1 macro ends with
         // `1, false, true`), and a second copy of these values below would be the copy nobody
         // updates.  Values are unchanged by this batch.
-        const bool kDisableRobustness      = false;
-        const bool kRequireFullSubgroups   = false;
+        // The create flags come from the ONE table (G-D14 / R1b-3).  The row targets the SCALAR
+        // family, so this yields today's values unchanged: disable_robustness=false,
+        // require_full_subgroups=false.  The required subgroup size stays an explicit lookup below,
+        // because it is resolved from THIS shader's name (the same name the bucket it shadows
+        // resolves) and the low-level create entry does not do that fallback itself.
+        const vk_tile_kernel_create_flags kCreateFlags =
+            ggml_vk_tile_create_flags_of(VK_TILE_FAMILY_SCALAR, /*callSiteReqSubgroups=*/0);
+        const bool kDisableRobustness      = kCreateFlags.disable_robustness;
+        const bool kRequireFullSubgroups   = kCreateFlags.require_full_subgroups;
         const uint32_t kRequiredSubgroup   = get_subgroup_size(sh.name, device->architecture);
         vk_pipeline built = std::make_shared<vk_pipeline_struct>();
         built->name = aligned_variant ? (std::string(sh.name) + "_aligned") : std::string(sh.name);
