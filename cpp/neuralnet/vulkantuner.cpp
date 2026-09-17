@@ -449,8 +449,14 @@ namespace VulkanTuner {
     // struct's bytes: padding would make the hash depend on the compiler).  This is what
     // ROWSET_HASH declares, and on the cache channel a mismatch means the file does not
     // describe the rows it contains.
+    //
+    // FNV-1a 64 with the STANDARD parameters: offset basis 0xCBF29CE484222325 = 14695981039346656037,
+    // prime 0x100000001B3 = 1099511628211.  They MUST be the standard values (t1-schema.md 1.3):
+    // ROWSET_HASH is a cross-repo contract, so a port that implements FNV-1a from the standard has
+    // to agree with us byte for byte.  The empty row set (the four zero bytes of the row count) is
+    // pinned by cacheWriteSelfTest() below -- that is the leg that keeps this constant honest.
     string rowSetHash(const vector<vk_tune_row_spec>& rows) {
-      uint64_t h = 1469598103934665603ull;
+      uint64_t h = 14695981039346656037ull;
       auto feed = [&h](uint32_t v) {
         for (int i = 0; i < 4; i++) {
           h ^= (v >> (8 * i)) & 0xffu;
@@ -1006,6 +1012,21 @@ namespace VulkanTuner {
     int declared = 0, refused = 0, allowed = 0;
     bool ok = true;
     string firstBad;
+    // R0 leg: pin rowSetHash() to the STANDARD FNV-1a 64 parameters with one vector whose expected
+    // value is computed by hand (t1-schema.md 1.3).  The empty row set feeds exactly four zero bytes
+    // (the row count), so the expected hash is basis * prime^4 mod 2^64 = 0x4d25767f9dce13f5.
+    // It fails INSIDE this existing verdict line (no new counted line, no new writer, and the
+    // success text is byte-identical to before) -- the point is that a wrong constant must not be
+    // able to look green while every imported file silently mismatches.
+    {
+      const string got = rowSetHash(vector<vk_tune_row_spec>());
+      const string want = "4d25767f9dce13f5";
+      if (got != want) {
+        ok = false;
+        firstBad = "rowSetHash({}) = " + got + ", want " + want
+                   + " (FNV-1a 64 offset basis must be 0xCBF29CE484222325)";
+      }
+    }
     for (const DecisionOutcomeSpec & o : DECISION_OUTCOMES) {
       Decision d;
       d.outcome = o.outcome;

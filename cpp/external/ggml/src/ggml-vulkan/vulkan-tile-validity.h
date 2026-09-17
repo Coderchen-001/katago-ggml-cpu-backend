@@ -258,7 +258,7 @@ static inline uint64_t vk_tile_canonical_key(int path, const vk_tile_geometry & 
     const uint32_t parts[10] = {
         (uint32_t) path, g.BM, bn_eff, g.BK, g.WM, g.WN, g.WMITER, g.TM, g.TN, g.BS,
     };
-    uint64_t h = 1469598103934665603ull;   // FNV-1a: stable across compilers/platforms
+    uint64_t h = 14695981039346656037ull;  // FNV-1a 64 OFFSET BASIS = 0xCBF29CE484222325 (standard; see t1-schema.md 1.3).  Fed one u32 at a time (NOT the standard byte-wise feed) and used only as an in-process dedup identity -- never persisted, never compared across repos.
     for (int i = 0; i < 10; i++) {
         h ^= parts[i];
         h *= 1099511628211ull;
