@@ -153,6 +153,12 @@ struct OnnxToGgml {
   // tensors have no layout semantics and are exempt (ensure() never touches
   // them; C10-4②).
   unordered_map<string, AnnotatedTensor> annTensors;
+  // All prescan passes used to rebuild this map locally: 8 identical copies of the same two loops.
+  // It is built ONCE in build() and read-only afterwards -- one truth, and a new prescan cannot
+  // forget to build it.  Named `producerIndex` and not `producer` on purpose: a member called
+  // `producer` would be SHADOWED by any leftover local of that name and the compiler would stay
+  // silent (it would just use the empty local) -- the exact failure this refactor must avoid.
+  unordered_map<string, int> producerIndex;
 
   // C-N34 (2026-08-28): fa-feed GEMM pointer set for selective f32acc (R1).
   // Filled at graph-build time with the fused qkv projection GEMM output (Y
@@ -228,17 +234,13 @@ struct OnnxToGgml {
 
   void prescanSwish() {
     const auto& nodes = model.graph().node();
-    unordered_map<string, int> producer;
-    for(int i = 0; i < (int)nodes.size(); i++)
-      for(int j = 0; j < nodes[i].output_size(); j++)
-        producer[nodes[i].output(j)] = i;
     for(int i = 0; i < (int)nodes.size(); i++) {
       const onnx::NodeProto& n = nodes[i];
       if(n.op_type() != "Mul" || n.input_size() != 2)
         continue;
       for(int k = 0; k < 2; k++) {
-        auto itSig = producer.find(n.input(k));
-        if(itSig == producer.end())
+        auto itSig = producerIndex.find(n.input(k));
+        if(itSig == producerIndex.end())
           continue;
         const onnx::NodeProto& sig = nodes[itSig->second];
         if(sig.op_type() != "Sigmoid" || sig.input_size() < 1)
@@ -311,10 +313,6 @@ struct OnnxToGgml {
 
   void prescanSoftmaxScale() {
     const auto& nodes = model.graph().node();
-    unordered_map<string, int> producer;
-    for(int i = 0; i < (int)nodes.size(); i++)
-      for(int j = 0; j < nodes[i].output_size(); j++)
-        producer[nodes[i].output(j)] = i;
 
     for(int i = 0; i < (int)nodes.size(); i++) {
       const onnx::NodeProto& n = nodes[i];
@@ -326,8 +324,8 @@ struct OnnxToGgml {
           axisLast = false;
       if(!axisLast)
         continue;
-      auto itAdd = producer.find(n.input(0));
-      if(itAdd == producer.end())
+      auto itAdd = producerIndex.find(n.input(0));
+      if(itAdd == producerIndex.end())
         continue;
       const onnx::NodeProto& addN = nodes[itAdd->second];
       if(addN.op_type() != "Add" || addN.input_size() != 2)
@@ -337,8 +335,8 @@ struct OnnxToGgml {
       int mulIdx = -1;
       string mulNodeName, addNodeName = addN.name();
       for(int k = 0; k < 2; k++) {
-        auto itMul = producer.find(addN.input(k));
-        if(itMul == producer.end())
+        auto itMul = producerIndex.find(addN.input(k));
+        if(itMul == producerIndex.end())
           continue;
         const onnx::NodeProto& mulN = nodes[itMul->second];
         if(mulN.op_type() != "Mul" || mulN.input_size() != 2)
@@ -398,10 +396,6 @@ struct OnnxToGgml {
 
   void prescanFa() {
     const auto& nodes = model.graph().node();
-    unordered_map<string, int> producer;
-    for(int i = 0; i < (int)nodes.size(); i++)
-      for(int j = 0; j < nodes[i].output_size(); j++)
-        producer[nodes[i].output(j)] = i;
     for(int i = 0; i < (int)nodes.size(); i++) {
       const onnx::NodeProto& n = nodes[i];
       if(n.op_type() != "MatMul" || n.input_size() < 2)
@@ -434,22 +428,22 @@ struct OnnxToGgml {
       if(svOut.empty())
         continue;
       // q: scores input(0) is qT transpose output; its producer's input is q rope out
-      auto itQ = producer.find(n.input(0));
-      if(itQ == producer.end())
+      auto itQ = producerIndex.find(n.input(0));
+      if(itQ == producerIndex.end())
         continue;
       const onnx::NodeProto& qT = nodes[itQ->second];
       if(qT.op_type() != "Transpose" || qT.input_size() < 1)
         continue;
       // k: scores input(1) is the rope output directly
       // v: sv input(1) is vT transpose output; producer's input is v reshape out
-      auto itSv = producer.find(svOut);
-      if(itSv == producer.end())
+      auto itSv = producerIndex.find(svOut);
+      if(itSv == producerIndex.end())
         continue;
       const onnx::NodeProto& svN = nodes[itSv->second];
       if(svN.input_size() < 2)
         continue;
-      auto itVT = producer.find(svN.input(1));
-      if(itVT == producer.end())
+      auto itVT = producerIndex.find(svN.input(1));
+      if(itVT == producerIndex.end())
         continue;
       const onnx::NodeProto& vT = nodes[itVT->second];
       if(vT.op_type() != "Transpose" || vT.input_size() < 1)
@@ -498,10 +492,6 @@ struct OnnxToGgml {
 
   void prescanRope() {
     const auto& nodes = model.graph().node();
-    unordered_map<string, int> producer;
-    for(int i = 0; i < (int)nodes.size(); i++)
-      for(int j = 0; j < nodes[i].output_size(); j++)
-        producer[nodes[i].output(j)] = i;
 
     for(int i = 0; i < (int)nodes.size(); i++) {
       const onnx::NodeProto& n = nodes[i];
@@ -514,8 +504,8 @@ struct OnnxToGgml {
       if(axis != 2)
         continue;
       // data = reshape output (q/k), indices = swapidx initializer
-      auto itData = producer.find(n.input(0));
-      if(itData == producer.end())
+      auto itData = producerIndex.find(n.input(0));
+      if(itData == producerIndex.end())
         continue;
       const onnx::NodeProto& reshapeN = nodes[itData->second];
       if(reshapeN.op_type() != "Reshape")
@@ -665,10 +655,6 @@ struct OnnxToGgml {
 
   void prescanProjFusion() {
     const auto& nodes = model.graph().node();
-    unordered_map<string, int> producer;
-    for(int i = 0; i < (int)nodes.size(); i++)
-      for(int j = 0; j < nodes[i].output_size(); j++)
-        producer[nodes[i].output(j)] = i;
 
     // Map xSrc -> {convOut -> (init, nodeName)} for every 1x1 Conv, plus the
     // q/k roles from the rope sites (their reshape consumes the conv output).
@@ -690,8 +676,8 @@ struct OnnxToGgml {
     unordered_map<string, bool> isQ;   // convOut -> is q (vs k)
     for(auto& kv : ropeSites) {
       const string& reshapeOut = kv.first;
-      auto itReshape = producer.find(reshapeOut);
-      if(itReshape == producer.end())
+      auto itReshape = producerIndex.find(reshapeOut);
+      if(itReshape == producerIndex.end())
         continue;
       const onnx::NodeProto& rn = nodes[itReshape->second];
       if(rn.op_type() != "Reshape" || rn.input_size() < 1)
@@ -745,8 +731,8 @@ struct OnnxToGgml {
       auto findConvOut = [&](const string& start) -> string {
         string cur = start;
         for(int hop = 0; hop < 5; hop++) {
-          auto it = producer.find(cur);
-          if(it == producer.end())
+          auto it = producerIndex.find(cur);
+          if(it == producerIndex.end())
             return "";
           const onnx::NodeProto& pn = nodes[it->second];
           if(pn.op_type() == "Conv" && pn.output_size() > 0)
@@ -935,18 +921,14 @@ struct OnnxToGgml {
 
   void prescanMaskReassoc() {
     const auto& nodes = model.graph().node();
-    unordered_map<string, int> producer;
-    for(int i = 0; i < (int)nodes.size(); i++)
-      for(int j = 0; j < nodes[i].output_size(); j++)
-        producer[nodes[i].output(j)] = i;
 
     for(int i = 0; i < (int)nodes.size(); i++) {
       const onnx::NodeProto& n = nodes[i];
       if(n.op_type() != "Add" || n.input_size() != 2)
         continue;
       // The masked branch must be input(1): Mul(proj, InputMask).
-      auto itMul = producer.find(n.input(1));
-      if(itMul == producer.end())
+      auto itMul = producerIndex.find(n.input(1));
+      if(itMul == producerIndex.end())
         continue;
       const onnx::NodeProto& mulN = nodes[itMul->second];
       if(mulN.op_type() != "Mul" || mulN.input_size() != 2)
@@ -962,13 +944,13 @@ struct OnnxToGgml {
         continue;
       // B must be produced by a Conv/MatMul (a real projection) and A must be
       // a computed tensor, not a graph input or initializer.
-      auto itProj = producer.find(mulN.input(projIdx));
-      if(itProj == producer.end())
+      auto itProj = producerIndex.find(mulN.input(projIdx));
+      if(itProj == producerIndex.end())
         continue;
       const onnx::NodeProto& projN = nodes[itProj->second];
       if(projN.op_type() != "Conv" && projN.op_type() != "MatMul")
         continue;
-      if(producer.find(n.input(0)) == producer.end())
+      if(producerIndex.find(n.input(0)) == producerIndex.end())
         continue;   // A is a graph input: not a residual chain
       MaskReassoc f;
       f.active = true;
@@ -981,37 +963,33 @@ struct OnnxToGgml {
 
   void prescanRms() {
     const auto& nodes = model.graph().node();
-    unordered_map<string, int> producer;
-    for(int i = 0; i < (int)nodes.size(); i++)
-      for(int j = 0; j < nodes[i].output_size(); j++)
-        producer[nodes[i].output(j)] = i;
 
     for(int i = 0; i < (int)nodes.size(); i++) {
       const onnx::NodeProto& n = nodes[i];
       if(n.op_type() != "Div")
         continue;
       // Div(x, rmsstd): rmsstd = Sqrt(Add(ReduceMean(Pow(x,2)), eps))
-      auto itRms = producer.find(n.input(1));
-      if(itRms == producer.end())
+      auto itRms = producerIndex.find(n.input(1));
+      if(itRms == producerIndex.end())
         continue;
       const onnx::NodeProto& sqrtN = nodes[itRms->second];
       if(sqrtN.op_type() != "Sqrt")
         continue;
-      auto itAdd = producer.find(sqrtN.input(0));
-      if(itAdd == producer.end())
+      auto itAdd = producerIndex.find(sqrtN.input(0));
+      if(itAdd == producerIndex.end())
         continue;
       const onnx::NodeProto& addN = nodes[itAdd->second];
       if(addN.op_type() != "Add")
         continue;
       // Add(input(0)) is the ReduceMean(Pow(x,2)) output.
-      auto itMean = producer.find(addN.input(0));
-      if(itMean == producer.end())
+      auto itMean = producerIndex.find(addN.input(0));
+      if(itMean == producerIndex.end())
         continue;
       const onnx::NodeProto& meanN = nodes[itMean->second];
       if(meanN.op_type() != "ReduceMean")
         continue;
-      auto itSq = producer.find(meanN.input(0));
-      if(itSq == producer.end())
+      auto itSq = producerIndex.find(meanN.input(0));
+      if(itSq == producerIndex.end())
         continue;
       const onnx::NodeProto& sqN = nodes[itSq->second];
       if(sqN.op_type() != "Pow")
@@ -1095,10 +1073,6 @@ struct OnnxToGgml {
 
   void prescanSilu() {
     const auto& nodes = model.graph().node();
-    unordered_map<string, int> producer;
-    for(int i = 0; i < (int)nodes.size(); i++)
-      for(int j = 0; j < nodes[i].output_size(); j++)
-        producer[nodes[i].output(j)] = i;
 
     for(int i = 0; i < (int)nodes.size(); i++) {
       const onnx::NodeProto& n = nodes[i];
@@ -1106,8 +1080,8 @@ struct OnnxToGgml {
         continue;
       // final swiglu Mul: one input is the silu product, other is the gate
       for(int inIdx = 0; inIdx < 2; inIdx++) {
-        auto itProd = producer.find(n.input(inIdx));
-        if(itProd == producer.end())
+        auto itProd = producerIndex.find(n.input(inIdx));
+        if(itProd == producerIndex.end())
           continue;
         const onnx::NodeProto& prod = nodes[itProd->second];
         if(prod.op_type() != "Mul")
@@ -1115,8 +1089,8 @@ struct OnnxToGgml {
         // prod = a * sigmoid(a): find the sigmoid among prod's inputs
         string sigTensorName, sigInput, sigNodeName;
         for(int pIdx = 0; pIdx < 2; pIdx++) {
-          auto itSig = producer.find(prod.input(pIdx));
-          if(itSig == producer.end())
+          auto itSig = producerIndex.find(prod.input(pIdx));
+          if(itSig == producerIndex.end())
             continue;
           if(nodes[itSig->second].op_type() == "Sigmoid") {
             sigTensorName = prod.input(pIdx);
@@ -1138,8 +1112,8 @@ struct OnnxToGgml {
         // not a graph input or initializer. Otherwise plain swish activations
         // (a*sigmoid(a)) followed by a mask Mul get misidentified as SwiGLU.
         {
-          auto itGate = producer.find(f.gateSrc);
-          if(itGate == producer.end())
+          auto itGate = producerIndex.find(f.gateSrc);
+          if(itGate == producerIndex.end())
             continue;   // gate is a graph input (e.g. InputMask): not a SwiGLU
           const onnx::NodeProto& gateN = nodes[itGate->second];
           if(gateN.op_type() != "Conv" && gateN.op_type() != "MatMul")
@@ -1776,6 +1750,16 @@ struct OnnxToGgml {
       tensors[kv.first] = kv.second;
       // Graph inputs are uploaded in NCHW/F32 (F10): L1 default domain.
       annTensors[kv.first] = {kv.second, Layout::L_NCHW, GGML_TYPE_F32};
+    }
+
+    {
+      // Built once for every prescan (see the member comment).  clear() first: a member outlives a
+      // single build(), so stale entries would otherwise be invisible.
+      producerIndex.clear();
+      const auto& nodes = model.graph().node();
+      for(int i = 0; i < (int)nodes.size(); i++)
+        for(int j = 0; j < nodes[i].output_size(); j++)
+          producerIndex[nodes[i].output(j)] = i;
     }
 
     prescanSilu();
@@ -3340,3 +3324,4 @@ bool NeuralNet::testEvaluateGlobalPoolingResidualBlock(
 }
 
 #endif  // USE_VULKAN_BACKEND
+
