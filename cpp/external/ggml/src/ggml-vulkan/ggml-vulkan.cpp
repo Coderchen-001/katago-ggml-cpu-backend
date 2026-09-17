@@ -4680,12 +4680,13 @@ struct CompileTask {
 //   if (!require_full_subgroups && required_subgroup_size == 0) required = get_subgroup_size(name, arch);
 // -- while the low-level `ggml_vk_create_pipeline_func` (the entry the tuned-row build calls) has NO
 // such fallback, so a 0 handed to it stays a literal 0.  Hence
-// `ggml_vk_tile_required_subgroup_size()` below is the one place that turns the intent into the
-// EFFECTIVE value, the row build goes through it, and R27 pins this function and that lambda against
-// each other by content.  Without this, a future cm2 ROW that copied `required_subgroup_size` straight
-// out of this table would pass 0 where its stock bucket passes the name lookup -- a new silent
-// divergence of exactly the kind this table exists to prevent, and one that an "row == table value"
-// assertion would have called green.
+// `ggml_vk_tile_effective_required_subgroup_size()` below is the one place that turns the intent into
+// the EFFECTIVE value, BOTH entries go through it, and R27 pins each caller against it (it pins the
+// CALL, not a text fragment: a condition that "is still there" can still have changed meaning).
+// Without this, a future cm2 ROW that copied `required_subgroup_size` straight out of this table
+// would pass 0 where its stock bucket passes the name lookup -- a new silent divergence of exactly
+// the kind this table exists to prevent, and one that an "row == table value" assertion would have
+// called green.
 //
 // Why this is worth a table: the cm1 batch (G-D3) will flip `require_full_subgroups` for the row
 // path, and :20408 already warns that a second copy of these values would be "the copy nobody
@@ -4718,18 +4719,20 @@ static vk_tile_kernel_create_flags ggml_vk_tile_create_flags_of(vk_tile_kernel_f
     return f;
 }
 
-// The one place that turns the table's INTENT into the EFFECTIVE required subgroup size.  It mirrors
-// the init entry's fallback exactly (`!require_full_subgroups && required_subgroup_size == 0` =>
-// name lookup) and exists because the low-level row entry does NOT do that fallback.  Callers that
-// must agree with a stock bucket (the row build) go through here rather than reading the table field
-// directly; R27 pins the two implementations against each other so they cannot drift.
-static uint32_t ggml_vk_tile_required_subgroup_size(const vk_tile_kernel_create_flags & f,
-                                                    const std::string & shaderName,
-                                                    const vk_device_architecture & arch) {
+// The one place that turns the table's INTENT into the EFFECTIVE required subgroup size.  The name
+// says `effective` on purpose: the table field is an intent (0 = "resolve by name"), and calling this
+// "the" required subgroup size would invite reading it as a raw fact -- the same discipline that made
+// the shell's `deviceSubgroupSize` a raw device fact and not a derived "wave".
+// BOTH entries call it: this mirrors the init lambda's original fallback exactly
+// (`!require_full_subgroups && required_subgroup_size == 0` => name lookup) and it exists because the
+// low-level row entry does NOT do that fallback.
+static uint32_t ggml_vk_tile_effective_required_subgroup_size(const vk_tile_kernel_create_flags & f,
+                                                             const std::string & shaderName,
+                                                             const vk_device_architecture & arch) {
     if (f.require_full_subgroups || f.required_subgroup_size > 0) {
         return f.required_subgroup_size;               // the table value is already effective
     }
-    return get_subgroup_size(shaderName, arch);        // 0 => resolve by name, as the init entry does
+    return get_subgroup_size(shaderName, arch);        // 0 => resolve by name, as the init entry did
 }
 
 static std::vector<uint32_t> ggml_vk_scalar_mm_spec(const vk_device & device, std::vector<uint32_t> spec, bool aligned) {
@@ -5027,8 +5030,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                               uint32_t parameter_count, uint32_t push_constant_size, std::array<uint32_t, 3> wg_denoms, const std::vector<uint32_t>& specialization_constants,
                                               uint32_t align, bool disable_robustness = false, bool require_full_subgroups = false, uint32_t required_subgroup_size = 0) {
 
-        if (!require_full_subgroups && required_subgroup_size == 0) {
-            required_subgroup_size = get_subgroup_size(name, device->architecture);
+        // batch 6: the INTENT -> EFFECTIVE conversion is delegated to the ONE function.  The original
+        // inline fallback is DELETED, not kept alongside it: two copies of one rule is exactly what
+        // this batch removes, and keeping the old lines "for history" would leave the second copy in
+        // place.  The flags struct is built from the PARAMETERS, before this assignment.
+        {
+            const vk_tile_kernel_create_flags reqFlags { disable_robustness, require_full_subgroups, required_subgroup_size };
+            required_subgroup_size = ggml_vk_tile_effective_required_subgroup_size(reqFlags, name, device->architecture);
         }
 
         vk_pipeline *ptr = &base_pipeline;
@@ -20486,7 +20494,7 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
             ggml_vk_tile_create_flags_of(VK_TILE_FAMILY_SCALAR, /*callSiteReqSubgroups=*/0);
         const bool kDisableRobustness      = kCreateFlags.disable_robustness;
         const bool kRequireFullSubgroups   = kCreateFlags.require_full_subgroups;
-        const uint32_t kRequiredSubgroup   = ggml_vk_tile_required_subgroup_size(kCreateFlags, sh.name, device->architecture);
+        const uint32_t kRequiredSubgroup   = ggml_vk_tile_effective_required_subgroup_size(kCreateFlags, sh.name, device->architecture);
         vk_pipeline built = std::make_shared<vk_pipeline_struct>();
         built->name = aligned_variant ? (std::string(sh.name) + "_aligned") : std::string(sh.name);
         built->parameter_count = 3;
