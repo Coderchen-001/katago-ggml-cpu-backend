@@ -217,6 +217,15 @@ static inline const char * vk_tile_candidate_reason(int path, const vk_tile_geom
     // silent-wrong-answer direction.  Callers pass vk_tile_wave_for(device->subgroup_size).  Zero is
     // a caller-contract violation and is refused rather than divided by (fail-closed, same style as
     // the clause list below: an unknown input is never "legal").
+    // wave == 0 is refused for EVERY path, including cm2.  cm2's spec (BLOCK_SIZE/BM/BN/BK/smaller)
+    // has no wave semantics at all, so this is a deliberate over-refusal: the wave is a property of
+    // the DEVICE, and "this device's wave is unknown" means the row cannot be attributed to a device
+    // class yet -- refusing it is the safe direction (the row is dropped loudly, not judged wrongly).
+    //
+    // Fail-closed vs fail-open, side by side, so nobody reads them as a contradiction:
+    //   * the JUDGEMENT side (here) is fail-closed -- an unknown input is never "legal";
+    //   * the FUNCTION side is fail-open -- the shell refuses to tune at all (no rows injected) and
+    //     the production path keeps the stock heuristic.
     if (wave == 0) {
         return "wave == 0 (the device's wave/subgroup size must be known before validating)";
     }

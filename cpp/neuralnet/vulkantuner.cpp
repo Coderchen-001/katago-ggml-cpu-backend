@@ -725,6 +725,18 @@ namespace VulkanTuner {
       // legal depends on the device it is FOR.  Keeping the clause here (instead of dropping it at
       // parse time) is what preserves the SSOT property -- one bad row, one identical reason string
       // -- for the devices the rows are meant for.
+      // R1b-2b close-out (2026-09-17): the CONSUMER guards the wave, not the caller.  Why here and
+      // not only at the Decision: `vk_tile_wave_for(0)` returns 8 (it must stay identical to stock's
+      // `subgroup_size_8 = max(sg,8)`, so it can never be changed to return 0), which means an
+      // unfilled subgroup size would otherwise be judged as wave 8 -- silently legal-or-not for the
+      // wrong hardware.  The predicate's own `wave == 0` clause stays as the second line of defence;
+      // this one is what a future caller (the ⑤ enumerator) cannot forget, because the value is
+      // consumed here.
+      if(deviceSubgroupSize == 0) {
+        err = "ROW line " + to_string(lineNo) + ": the device's subgroup/wave size is unknown (0), "
+              "so no geometry can be judged (a 0 here means the caller never filled it in)";
+        return false;
+      }
       const char* reason = vk_tile_candidate_reason(path, out.geom, vk_tile_wave_for(deviceSubgroupSize));
       if (reason != nullptr) {
         err = "ROW line " + to_string(lineNo) + ": illegal geometry: " + reason;
@@ -1232,6 +1244,38 @@ namespace VulkanTuner {
                      + (refusedOurGap ? "no" : "YES (BUG)") + ", device-only writable="
                      + (allowedDeviceOnly ? "yes" : "NO (BUG)");
         }
+      }
+    }
+
+    // R1b-2b close-out: the two ways a wave-less call can reach the geometry table, asserted here
+    // because both need NO device -- the earlier registration said "implemented but unreachable on
+    // this machine", which was the wrong diagnosis: vk_tile_wave_for(0) is 8, so the predicate's
+    // `wave == 0` clause is unreachable through a caller that uses the helper, and what actually
+    // protects us is the consumer guard above.  A self-test can reach both directly.
+    {
+      vk_tile_geometry g0 = {};
+      g0.BM = 128; g0.BN = 128; g0.BK = 0;
+      g0.WM = 32;  g0.WN = 64;  g0.WMITER = 2;
+      g0.TM = 2;   g0.TN = 2;   g0.BS = 256;
+      g0.pad = -1; g0.reshape = -1; g0.smaller = -1;
+      const char* r0 = vk_tile_candidate_reason(VK_TILE_PATH_SCALAR, g0, 0);
+      if(r0 == nullptr || string(r0).find("wave == 0") == string::npos) {
+        ok = false;
+        if(firstBad.empty())
+          firstBad = string("predicate with wave=0 said ") + (r0 == nullptr ? "LEGAL (BUG)" : r0);
+      }
+      RowsFile rf0; string err0;
+      const bool parsed0 = parseRowsFile("ROW scalar 1 1 0 0 32 32 32 0 0 0 0 0 0 0 0 0\n", 0, rf0, err0);
+      if(parsed0 || !rf0.rows.empty()) {
+        ok = false;
+        if(firstBad.empty())
+          firstBad = "parseRowsFile accepted a ROW line with an unknown wave (0): rows="
+                     + to_string(rf0.rows.size());
+      }
+      else if(err0.find("subgroup") == string::npos && err0.find("unknown") == string::npos) {
+        ok = false;
+        if(firstBad.empty())
+          firstBad = "the unknown-wave ROW refusal does not name the cause: " + err0;
       }
     }
 
