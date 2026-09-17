@@ -20225,6 +20225,40 @@ static int ggml_vk_tuned_row_targets(const vk_device & device, int src0_type, in
 }
 
 // I6: capability legality -- "would the init path have created this on this device".
+// G-D20 (t3-shell-plan.md 6.9): every I6 refusal names either a DEVICE PROPERTY (this device
+// really cannot run that geometry) or OUR IMPLEMENTATION STATE (we have not built that variant
+// yet).  Only the first may ever take part in a writable conclusion; the second must stay
+// non-writable ("no-path" + loud), because "we have not built it" is not a property of the
+// device -- writing it down would remember our gap forever and never rescan after it closes.
+//
+// The split is DATA (this table), not prose, so a new refusal has to choose a class here, and
+// an unclassified refusal is conservatively treated as OUR GAP (the safe direction: it can then
+// never be written down as a device verdict).
+struct vk_tuned_row_capability_class {
+    const char * reason;
+    bool our_gap;
+};
+static const vk_tuned_row_capability_class VK_TUNE_CAPABILITY_CLASSES[] = {
+    { "path=cm2 but this device does not resolve matmuls through cooperative_matrix2", false },
+    { "path=scalar but this device resolves matmuls through cm2, so the row's shader would not match the dispatch", false },
+    { "path=scalar but this device has cooperative_matrix (the cm1 buckets own those objects)", false },
+    { "path is neither scalar nor cm2", true },
+    { "this device uses 64-bit shader indexing; the B1 row path builds only the 32-bit variant", true },
+    { "BLOCK_SIZE exceeds maxComputeWorkGroupInvocations", false },
+    { "geometry needs more shared memory than this device has", false },
+};
+static bool ggml_vk_tuned_row_capability_is_our_gap(const char * reason) {
+    if (reason == nullptr) {
+        return false;
+    }
+    for (const vk_tuned_row_capability_class & c : VK_TUNE_CAPABILITY_CLASSES) {
+        if (strcmp(c.reason, reason) == 0) {
+            return c.our_gap;
+        }
+    }
+    return true;   // unclassified => our gap (never a device verdict)
+}
+
 static const char * ggml_vk_tuned_row_capability_reason(const vk_device & device, const vk_tune_row_spec & r) {
     if (r.path == VK_TILE_PATH_CM2) {
         if (!device->coopmat2) {
@@ -20473,7 +20507,10 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
         }
         why = ggml_vk_tuned_row_capability_reason(ctx->device, r);
         if (why != nullptr) {
-            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, "unsupported", why);
+            // G-D20: "our build has not implemented it" must not be recorded as a device verdict,
+            // so the loud line (and, once the write side exists, the outcome) carries the class.
+            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED,
+                     ggml_vk_tuned_row_capability_is_our_gap(why) ? "unsupported (our gap)" : "unsupported", why);
             continue;
         }
 
