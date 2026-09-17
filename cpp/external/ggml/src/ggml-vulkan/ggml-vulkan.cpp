@@ -4675,6 +4675,18 @@ struct CompileTask {
 //   cm1    | false              | true                           | 0 (no fallback is wanted: already full)
 //   cm2    | true               | false                          | 0 (=> name lookup)
 //
+// ⚠️ THAT LAST COLUMN IS AN INTENT, NOT ALWAYS AN EFFECTIVE VALUE (review round, 2026-09-17): `0`
+// means "resolve by name" in the INIT entry only -- the lambda applies
+//   if (!require_full_subgroups && required_subgroup_size == 0) required = get_subgroup_size(name, arch);
+// -- while the low-level `ggml_vk_create_pipeline_func` (the entry the tuned-row build calls) has NO
+// such fallback, so a 0 handed to it stays a literal 0.  Hence
+// `ggml_vk_tile_required_subgroup_size()` below is the one place that turns the intent into the
+// EFFECTIVE value, the row build goes through it, and R27 pins this function and that lambda against
+// each other by content.  Without this, a future cm2 ROW that copied `required_subgroup_size` straight
+// out of this table would pass 0 where its stock bucket passes the name lookup -- a new silent
+// divergence of exactly the kind this table exists to prevent, and one that an "row == table value"
+// assertion would have called green.
+//
 // Why this is worth a table: the cm1 batch (G-D3) will flip `require_full_subgroups` for the row
 // path, and :20408 already warns that a second copy of these values would be "the copy nobody
 // updates".  Guardrail R27 mechanically matches the init macros against this table, so changing a
@@ -4693,7 +4705,7 @@ static vk_tile_kernel_create_flags ggml_vk_tile_create_flags_of(vk_tile_kernel_f
     if (fam == VK_TILE_FAMILY_CM2) {
         f.disable_robustness     = true;
         f.require_full_subgroups = false;
-        f.required_subgroup_size = 0;                       // 0 => resolved by name in the create entry
+        f.required_subgroup_size = 0;                       // INTENT: 0 => resolve by name (see below)
     } else if (fam == VK_TILE_FAMILY_CM1) {
         f.disable_robustness     = false;
         f.require_full_subgroups = true;
@@ -4701,9 +4713,23 @@ static vk_tile_kernel_create_flags ggml_vk_tile_create_flags_of(vk_tile_kernel_f
     } else {
         f.disable_robustness     = false;
         f.require_full_subgroups = (callSiteReqSubgroups > 0);
-        f.required_subgroup_size = callSiteReqSubgroups;    // 0 => resolved by name in the create entry
+        f.required_subgroup_size = callSiteReqSubgroups;    // INTENT: 0 => resolve by name (see below)
     }
     return f;
+}
+
+// The one place that turns the table's INTENT into the EFFECTIVE required subgroup size.  It mirrors
+// the init entry's fallback exactly (`!require_full_subgroups && required_subgroup_size == 0` =>
+// name lookup) and exists because the low-level row entry does NOT do that fallback.  Callers that
+// must agree with a stock bucket (the row build) go through here rather than reading the table field
+// directly; R27 pins the two implementations against each other so they cannot drift.
+static uint32_t ggml_vk_tile_required_subgroup_size(const vk_tile_kernel_create_flags & f,
+                                                    const std::string & shaderName,
+                                                    const vk_device_architecture & arch) {
+    if (f.require_full_subgroups || f.required_subgroup_size > 0) {
+        return f.required_subgroup_size;               // the table value is already effective
+    }
+    return get_subgroup_size(shaderName, arch);        // 0 => resolve by name, as the init entry does
 }
 
 static std::vector<uint32_t> ggml_vk_scalar_mm_spec(const vk_device & device, std::vector<uint32_t> spec, bool aligned) {
@@ -20452,14 +20478,15 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
         // updates.  Values are unchanged by this batch.
         // The create flags come from the ONE table (G-D14 / R1b-3).  The row targets the SCALAR
         // family, so this yields today's values unchanged: disable_robustness=false,
-        // require_full_subgroups=false.  The required subgroup size stays an explicit lookup below,
-        // because it is resolved from THIS shader's name (the same name the bucket it shadows
-        // resolves) and the low-level create entry does not do that fallback itself.
+        // require_full_subgroups=false.  The required subgroup size goes through the ONE resolver
+        // rather than a local lookup, because this entry does NOT apply the init entry's
+        // `0 => name lookup` fallback: resolving it here is what keeps a row and the bucket it
+        // shadows on the same rule for every family (cm2 included, where the table says 0).
         const vk_tile_kernel_create_flags kCreateFlags =
             ggml_vk_tile_create_flags_of(VK_TILE_FAMILY_SCALAR, /*callSiteReqSubgroups=*/0);
         const bool kDisableRobustness      = kCreateFlags.disable_robustness;
         const bool kRequireFullSubgroups   = kCreateFlags.require_full_subgroups;
-        const uint32_t kRequiredSubgroup   = get_subgroup_size(sh.name, device->architecture);
+        const uint32_t kRequiredSubgroup   = ggml_vk_tile_required_subgroup_size(kCreateFlags, sh.name, device->architecture);
         vk_pipeline built = std::make_shared<vk_pipeline_struct>();
         built->name = aligned_variant ? (std::string(sh.name) + "_aligned") : std::string(sh.name);
         built->parameter_count = 3;
