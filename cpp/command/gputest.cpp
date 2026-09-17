@@ -89,6 +89,21 @@ int MainCmds::testgpuerror(const vector<string>& args) {
   logger.write("Testing on " + boardSizeDataset);
   logger.write("Testing average errors between different GPU configurations...");
 
+  // F1 (precision-class alignment, 2026-09-17): this command is the project's MARGIN GATE, and
+  // without `-reference-file` it compares the backend against itself -- the tool falls back to the
+  // device's own unbatched fp32 outputs as the reference, so EVERY segment reads 0 (measured
+  // 2026-09-10: "fp32 段与 batched/current-cfg 段全 0x") and the run has no discriminating power at
+  // all.  A measurement that cannot fail is worse than no measurement, so this is refused rather
+  // than warned: generate the reference with an Eigen build (docs/ONNX_Model_Files.md) and pass
+  // `-reference-file <path>`.
+  if(referenceFileName.empty()) {
+    logger.write("ERROR: testgpuerror needs -reference-file. Without it the tool uses this device's "
+                 "own unbatched fp32 output as the reference, which makes every segment read 0x and "
+                 "the whole run meaningless (see precision-class-gate.md section 4). Generate the "
+                 "reference with an Eigen build and re-run: -reference-file <ref.bin>");
+    return 1;
+  }
+
   const string expectedSha256 = "";
   int maxBatchSize;
   if(cfg.contains("nnMaxBatchSize")) {

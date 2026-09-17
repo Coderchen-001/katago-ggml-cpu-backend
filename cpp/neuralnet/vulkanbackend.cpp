@@ -2778,10 +2778,32 @@ struct ComputeHandle {
     //   '3' = C-N34 R2: R1 + the fa out-projection conv GEMM.
     // F32xF16 nodes from matmul() are unconditionally f32acc (GV:7723/4886) and
     // correctly left untouched; future Q8_0 nodes have non-F16 src0 and skip.
+    // F1 (precision-class alignment, 2026-09-17): ONE rule decides the accumulation width and ONE
+    // line reports what it decided, in priority order:
+    //
+    //   1. KATAGO_VK_MMPREC_F32 -- the dev override, wins over everything (its '1'/'2'/'3' subsets
+    //      are unchanged);
+    //   2. the REQUESTED precision -- `useFP16Mode == enabled_t::False` means "do not use fp16".
+    //      Until this change that request was honoured only in the REPORT (`isUsingFP16`), never in
+    //      the graph: the "fp32" evaluator that `testgpuerror` builds computed the SAME f16acc
+    //      pipelines, so testnnevalcanary's fp32 segment was a self-comparison judged by the strict
+    //      limits (all 9 metrics bit-identical to the fp16 path, only the divisors differed) -- i.e.
+    //      a margin that could not be attributed to any real precision class;
+    //   3. the device capability -- `Auto`/`True` leave ggml-vulkan's own choice alone (f16acc when
+    //      the device has fp16, else f32acc), so production runs are bit-identical to before.
+    //
+    // The class goes into the "graph built" line below, so no margin number is ever quoted without
+    // it: the project's batteries disagree about MMPREC_F32 (some set it, some scrub it) and b11
+    // differs 2.1x between the two widths.
+    bool precF32Acc = false;          // we forced f32 accumulation on every F16-src0 mul_mat
+    bool precMixed = false;           // env set it on a SUBSET only ('2'/'3')
+    const char* precSource = "capability";
     if(getenv("KATAGO_VK_MMPREC_F32") != nullptr) {
       const char mmp = getenv("KATAGO_VK_MMPREC_F32")[0];
+      precSource = "env";
       if(mmp == '1' || mmp == '2' || mmp == '3') {
         const bool global = (mmp == '1');
+        if(global) precF32Acc = true; else precMixed = true;
         const int nNodes = ggml_graph_n_nodes(graph);
         for(int i = 0; i < nNodes; i++) {
           ggml_tensor* node = ggml_graph_node(graph, i);
@@ -2790,7 +2812,26 @@ struct ComputeHandle {
               ggml_mul_mat_set_prec(node, GGML_PREC_F32);
         }
       }
+      // Any other value is NOT silently reinterpreted as "on": the env is a dev knob and an unknown
+      // value leaves ggml-vulkan's default in place (source=env still says so, so the class is
+      // never guessed).
     }
+    else if(ctx->useFP16Mode == enabled_t::False) {
+      // The request, honoured in the graph rather than only in the report (this is the whole point
+      // of F1).  Same treatment as MMPREC_F32=1, same predicate, so "the request" and "the env" can
+      // never diverge into two mechanisms.
+      precF32Acc = true;
+      precSource = "requested";
+      const int nNodes = ggml_graph_n_nodes(graph);
+      for(int i = 0; i < nNodes; i++) {
+        ggml_tensor* node = ggml_graph_node(graph, i);
+        if(node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F16)
+          ggml_mul_mat_set_prec(node, GGML_PREC_F32);
+      }
+    }
+    const char* precClass = precF32Acc ? "f32acc"
+                          : (precMixed ? "mixed(env subset)"
+                                       : "ggml-default(f16acc on fp16 devices)");
 
     // --- Allocate and upload weights ---
     // Weights get their own buffers first (either per-tensor in the debug
@@ -2821,7 +2862,8 @@ struct ComputeHandle {
 
     if(logger != NULL)
       logger->write("VULKAN backend: graph built (" + Global::uint64ToString((uint64_t)onnxBytes.size()) + " onnx bytes, " +
-                    Global::uint64ToString((uint64_t)ggml_graph_n_nodes(graph)) + " ggml nodes)");
+                    Global::uint64ToString((uint64_t)ggml_graph_n_nodes(graph)) + " ggml nodes) [prec] accumulation=" +
+                    string(precClass) + " source=" + string(precSource) + " requested=" + ctx->useFP16Mode.toString());
   }
 
   ~ComputeHandle() {
