@@ -10659,7 +10659,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                             + " m=" + std::to_string(ne01) + " n=" + std::to_string(ne11)
                             + " k_arg=" + std::to_string(ne10) + " kpad=" + std::to_string(kpad)
                             + " aligned=" + std::to_string((int) aligned)
-                            + " align=" + std::to_string(pipeline->align));
+                            + " align=" + std::to_string(pipeline->align)
+                            // R1a leg2: the tile's BN travels WITH the proof.  For a tuned row this is
+                            // the row spec's BN (the row build passes wg_denoms = {BM, BN, 1}); for a
+                            // stock bucket it is that bucket's BN -- the SAME field, so a row and the
+                            // bucket it shadows can be compared on one line instead of by inference.
+                            + " BN=" + std::to_string(pipeline->wg_denoms[1]));
         }
     }
 
