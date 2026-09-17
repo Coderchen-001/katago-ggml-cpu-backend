@@ -197,10 +197,29 @@ static inline const char * vk_tune_row_family_reason(int src0_type, int src1_typ
     return nullptr;
 }
 
+// The ONE place that names where a wave/subgroup size comes from.  On the scalar path stock fills
+// the warptile's WARP field with subgroup_size_8 = max(device->subgroup_size, 8)
+// (ggml-vulkan.cpp:4735-4742, used at :4823-4825 and :5854-5855).  The row build and the custom
+// probe must put the SAME value into their warptile, so that the predicate, the build and stock
+// agree by construction; writing max(subgroup_size, 8) at each call site is how two truths are born.
+static inline uint32_t vk_tile_wave_for(uint32_t device_subgroup_size) {
+    return device_subgroup_size > 8 ? device_subgroup_size : 8;
+}
+
 // Returns nullptr when the geometry is legal, otherwise a static reason string naming
 // the first violated clause.  Callers log it as-is, which is what makes the enumerator
 // and the loader produce the SAME reason for the same bad input.
-static inline const char * vk_tile_candidate_reason(int path, const vk_tile_geometry & g) {
+static inline const char * vk_tile_candidate_reason(int path, const vk_tile_geometry & g, uint32_t wave) {
+    // The wave (subgroup) size is an INPUT, never a constant: on a wave64 device the stock scalar
+    // warptiles set the warptile's WARP field to 64 (subgroup_size_8 = max(device->subgroup_size, 8),
+    // ggml-vulkan.cpp:4735-4742, used at :4823-4825 and :5854-5855), so a hardcoded 32 here would
+    // refuse every legal wave64 geometry and accept illegal ones -- and for BS "refused" is the
+    // silent-wrong-answer direction.  Callers pass vk_tile_wave_for(device->subgroup_size).  Zero is
+    // a caller-contract violation and is refused rather than divided by (fail-closed, same style as
+    // the clause list below: an unknown input is never "legal").
+    if (wave == 0) {
+        return "wave == 0 (the device's wave/subgroup size must be known before validating)";
+    }
     if (path == VK_TILE_PATH_CM2) {
         // cm2's spec is {BLOCK_SIZE, BM, BN, BK, enable_smaller_matrices}
         // (mul_mm_cm2.comp:31-36).  The scalar warptile clauses below do NOT describe
@@ -228,16 +247,16 @@ static inline const char * vk_tile_candidate_reason(int path, const vk_tile_geom
         return "zero dimension (BM/BN/WM/WN/WMITER/TM/TN must be > 0)";
     }
     const uint32_t num_warps = (g.BM / g.WM) * (g.BN / g.WN);
-    const uint32_t wniter = g.WM * g.WN / (32 * g.TM * g.TN * g.WMITER);
+    const uint32_t wniter = g.WM * g.WN / (wave * g.TM * g.TN * g.WMITER);
     if (g.BM % g.WM != 0)               return "BM % WM != 0";
     if (g.BN % g.WN != 0)               return "BN % WN != 0";
     if (g.WM % g.WMITER != 0)           return "WM % WMITER != 0";
     if ((g.WM / g.WMITER) % g.TM != 0)  return "(WM / WMITER) % TM != 0";
-    if (wniter < 1)                     return "wniter < 1 (TM*TN*WMITER too large for WM*WN/32)";
-    if (g.WN % wniter != 0)             return "WN % wniter != 0";
-    if ((g.WN / wniter) % g.TN != 0)    return "(WN / wniter) % TN != 0";
-    if (g.BS != num_warps * 32)         return "BS != num_warps * 32 (BS is derived, not free)";
-    if (g.TM * g.TN > g.WM * g.WN / 32) return "TM * TN > WM * WN / 32";
+    if (wniter < 1)                       return "wniter < 1 (TM*TN*WMITER too large for WM*WN/wave)";
+    if (g.WN % wniter != 0)               return "WN % wniter != 0";
+    if ((g.WN / wniter) % g.TN != 0)      return "(WN / wniter) % TN != 0";
+    if (g.BS != num_warps * wave)         return "BS != num_warps * wave (BS is derived, not free)";
+    if (g.TM * g.TN > g.WM * g.WN / wave) return "TM * TN > WM * WN / wave";
     if (g.BS > 1024)                    return "BS > 1024";
     if (g.TM % 2 != 0)                  return "TM % 2 != 0";
     if (g.pad >= 0 && g.pad > 4)        return "PAD outside [0,4]";
@@ -300,8 +319,9 @@ static inline uint32_t vk_tile_row_align_for(int path, const vk_tile_geometry & 
 // (2026-09-13 rewrite), t1-candidates.md section 2.2, VENDOR-BASE.md section 2, and the
 // measured BK verdict (census-t05-shapes.md section 4.4).
 //
-// Scalar: BM/BN/WM/WN/WMITER/TM/TN are ENUMERABLE; BS is DERIVED (num_warps*32);
-//   TK and WARP are PINNED (TK==1, WARP==subgroup_size -- fill them in, do not sweep);
+// Scalar: BM/BN/WM/WN/WMITER/TM/TN are ENUMERABLE; BS is DERIVED (num_warps*wave);
+//   TK and WARP are PINNED (TK==1, WARP==vk_tile_wave_for(subgroup_size) -- fill them in from the
+//   device, do not sweep: the wave is a hardware property, not a tunable);
 //   BK is INERT on the f16 path (compile-time constant; spec id 3 exists only for the
 //   quant branch), and SHMEM_STRIDE_PAD / APPLY_SLM_A_RESHAPE are INERT because on the
 //   scalar path they are NOT specs at all (mul_mm.comp's COOPMAT guard and its explicit

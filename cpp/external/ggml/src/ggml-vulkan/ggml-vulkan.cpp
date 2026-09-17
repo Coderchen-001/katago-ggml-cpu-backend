@@ -5529,11 +5529,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     tile.BM = BM; tile.BN = BN; tile.WM = WM; tile.WN = WN;
                     tile.WMITER = WMITER; tile.TM = TM; tile.TN = TN; tile.BS = BS;
                     tile.pad = PAD; tile.reshape = RESHAPE; tile.smaller = -1;
-                    const char * tile_reason = vk_tile_candidate_reason(VK_TILE_PATH_SCALAR, tile);
+                    const char * tile_reason = vk_tile_candidate_reason(VK_TILE_PATH_SCALAR, tile, vk_tile_wave_for(device->subgroup_size));
                     const bool ok = (tile_reason == nullptr);
                     if (ok) {
                         const std::array<uint32_t, 3> custom_wg_denoms = { BM, BN, 1 };
-                        const std::vector<uint32_t> custom_warptile = { BS, BM, BN, 16, WM, WN, WMITER, TM, TN, 1, 32 };
+                        const std::vector<uint32_t> custom_warptile = { BS, BM, BN, 16, WM, WN, WMITER, TM, TN, 1, vk_tile_wave_for(device->subgroup_size) };
                         const uint32_t custom_align = vk_tile_row_align_for(VK_TILE_PATH_SCALAR, tile);  // ONE rule with the row path (t3-shell-plan.md 6.9 item 7 / G-E8). On the scalar path this IS max(BM,BN); the shared rule exists so that a future cm2 injection channel cannot measure with one align and take effect with another. Direction discipline lives with the rule: too-small = vec8 reads across rows (silent wrong); too-large = fewer aligned hits (slower only).
                         mm_spec_pad = PAD;
                         mm_spec_reshape = RESHAPE;
@@ -20134,12 +20134,25 @@ bool ggml_backend_is_vk(ggml_backend_t backend) {
 // Returns the number of bytes written excluding the terminator, or 0 when the caller's
 // buffer is too small or the backend is not a Vulkan one -- a truncated fingerprint would
 // silently alias two devices, so refusing is the only safe failure.
-size_t ggml_backend_vk_tune_fingerprint(ggml_backend_t backend, char * out, size_t out_size) {
+size_t ggml_backend_vk_tune_fingerprint(ggml_backend_t backend, char * out, size_t out_size, uint32_t * sgOut) {
+    // `sgOut` is the RAW device fact (subgroup_size), NOT a wave: the one and only conversion lives
+    // in vk_tile_wave_for (vulkan-tile-validity.h), because converting in two places is exactly how
+    // "32" and "this device's wave" become two truths (G-C3 / t3-shell-plan.md 9.1 R21(b)).  It is
+    // written from the SAME expression that goes into the fingerprint string below, so the string
+    // and the out-param cannot disagree -- that is the "same source" property by construction
+    // rather than by checking.  Reset to 0 first: a caller must be able to tell "not filled" from
+    // "filled", and 0 is refused downstream (never silently treated as wave 32).
+    if (sgOut != nullptr) {
+        *sgOut = 0;
+    }
     if (out == nullptr || out_size == 0 || !ggml_backend_is_vk(backend)) {
         return 0;
     }
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     const vk_device & device = ctx->device;
+    // One read, two uses (the string and the out-param): the row path derives BS as
+    // num_warps * vk_tile_wave_for(sg), so this value decides which geometries are legal at all.
+    const uint32_t sg = device->subgroup_size;
 
     // Field list: the required header fields of t1-schema.md section 1 (vendorID,
     // deviceID, driverVersion, sg, coopmat2/cm1, shaderCoreCount) plus the flags that
@@ -20154,7 +20167,7 @@ size_t ggml_backend_vk_tune_fingerprint(ggml_backend_t backend, char * out, size
        << "|deviceID=" << device->properties.deviceID
        << "|driverVersion=" << device->properties.driverVersion
        << "|apiVersion=" << device->properties.apiVersion
-       << "|sg=" << device->subgroup_size
+       << "|sg=" << sg
        << "|cm1=" << (device->coopmat_support ? 1 : 0)
        << "|cm1acc16=" << (device->coopmat_acc_f16_support ? 1 : 0)
        << "|cm2=" << (device->coopmat2 ? 1 : 0)
@@ -20168,6 +20181,9 @@ size_t ggml_backend_vk_tune_fingerprint(ggml_backend_t backend, char * out, size
         return 0;
     }
     std::memcpy(out, s.c_str(), s.size() + 1);
+    if (sgOut != nullptr) {
+        *sgOut = sg;
+    }
     return s.size();
 }
 
@@ -20377,8 +20393,15 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
             return false;
 #endif
         } else {
+            // WARP is the device's wave/subgroup size, NOT a constant (t3-shell-plan.md 6.9
+            // R1b-2b): stock fills the scalar warptile's WARP field with
+            // subgroup_size_8 = max(device->subgroup_size, 8) (GV:4735-4742, :4823-4825).  The row
+            // must put the SAME value in, or the row's `BS` would be validated against one wave and
+            // executed with another.  TK stays pinned at 1 (it is inert on the f16 path, see
+            // vk_tile_axis_class: TK/WARP are fill-ins, not sweep axes).
             std::vector<uint32_t> warptile = { r.geom.BS, r.geom.BM, r.geom.BN, 16u, r.geom.WM, r.geom.WN,
-                                               r.geom.WMITER, r.geom.TM, r.geom.TN, 1u, 32u };
+                                               r.geom.WMITER, r.geom.TM, r.geom.TN, 1u,
+                                               vk_tile_wave_for(device->subgroup_size) };
             spec = ggml_vk_scalar_mm_spec(device, std::move(warptile), aligned_variant);
         }
         // The THREE creation parameters live in one place (t3-shell-plan.md 6.9 item 8).  The cm1
@@ -20495,7 +20518,7 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
     for (size_t i = 0; i < n_rows; i++) {
         const vk_tune_row_spec & r = rows[i];
 
-        const char * why = vk_tile_candidate_reason(r.path, r.geom);
+        const char * why = vk_tile_candidate_reason(r.path, r.geom, vk_tile_wave_for(ctx->device->subgroup_size));
         if (why != nullptr) {
             drop_row(i, VK_TUNE_ROW_DROP_ILLEGAL, "illegal", why);
             continue;

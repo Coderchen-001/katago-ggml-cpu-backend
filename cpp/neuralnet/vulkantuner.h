@@ -36,7 +36,7 @@
 //
 // Returns the written length (excluding the terminator) or 0 when the backend is not a
 // Vulkan one / the buffer is too small.
-size_t ggml_backend_vk_tune_fingerprint(ggml_backend_t backend, char* out, size_t outSize);
+size_t ggml_backend_vk_tune_fingerprint(ggml_backend_t backend, char* out, size_t outSize, uint32_t* sgOut);
 // Installs a row set into ONE context.  Returns false and fills `err` on refusal; the
 // backend logs the refusal loudly itself.
 //
@@ -100,6 +100,14 @@ namespace VulkanTuner {
     // The rest of the cache's outer key (t1-schema.md section 4): the same device can hold
     // a different model, board size or max batch, and none of those may share a row set.
     std::string modelIdentity;    // header form (mv…-sha…-name…)
+    // The DEVICE's raw subgroup size, injected by the backend through the fingerprint call
+    // (ggml_backend_vk_tune_fingerprint's `sgOut`), NOT a wave: the shell never converts it, it
+    // calls vk_tile_wave_for() at each use.  Why the shell needs it at all (G-C3): a row's BS is
+    // derived as num_warps * wave, so the geometry table cannot judge a row without knowing the
+    // wave of the device the row is FOR -- and the shell's own parse-time validation has no device
+    // handle.  Default 0 = "not injected"; 0 is refused downstream (both here and by
+    // vk_tile_candidate_reason's wave == 0 clause) rather than silently standing in for wave 32.
+    uint32_t deviceSubgroupSize = 0;
     bool negative = false;        // this key's row set is a "deterministically all-rejected" marker
     // HOW THIS DECISION WAS REACHED, as one string from the closed set in vulkantuner.cpp
     // (step "3-4").  The default is NOT writable, deliberately: a decision nobody gave an outcome

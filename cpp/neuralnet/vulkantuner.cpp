@@ -359,6 +359,15 @@ namespace VulkanTuner {
     // writable, so a caller that invents a state cannot write by accident.
     struct DecisionOutcomeSpec {
       const char* outcome;
+      // `klass` has exactly three roles, and NONE of them is the runtime verdict:
+      //   (1) R19's whitelist key in the guardrail (t3-guardrails.py WRITABLE_CLASSES);
+      //   (2) the self-test's FIXTURE SELECTOR (:1084/:1092 choose which shape to build);
+      //   (3) a documentation label on the outcome name.
+      // The production decision path never reads it: `outcomeWritable` uses `writable` + `condition`
+      // only.  A rename is therefore LOUD twice over, never silent -- R19 reddens (whitelist), and
+      // the self-test reddens too (a class with no fixture builder makes `outcomeWritable` disagree
+      // with `o.writable`), which is what makes "add a writable class, forget its fixture"
+      // impossible to land green.
       const char* klass;       // "structural" / "completed" / "gate" / "measurement"
       bool writable;
       // The EXTRA condition on top of `writable` (G-D20): "" = none, "device-only" = every
@@ -662,7 +671,10 @@ namespace VulkanTuner {
     // checked by vk_tile_candidate_reason(), the same table the enumerator uses, so a bad
     // row is refused with the identical reason string in both places (t3-shell-plan.md
     // section 1.7 and section 6.1 item 11).
-    bool parseRowLine(const string& rest, size_t lineNo, vk_tune_row_spec& out, string& err) {
+    // `deviceSubgroupSize` comes from Decision.deviceSubgroupSize (injected by the backend through
+    // the fingerprint call).  It is a PARAMETER, not a global: one process can hold several devices,
+    // and a global would let one device's wave judge another device's rows (G-C3's second pitfall).
+    bool parseRowLine(const string& rest, size_t lineNo, uint32_t deviceSubgroupSize, vk_tune_row_spec& out, string& err) {
       istringstream is(rest);
       int src0 = 0, src1 = 0, path = 0;
       long long keyM = 0, keyK = 0;
@@ -709,7 +721,11 @@ namespace VulkanTuner {
       out.geom.pad = (int) g[9];
       out.geom.reshape = (int) g[10];
       out.geom.smaller = (int) g[11];
-      const char* reason = vk_tile_candidate_reason(path, out.geom);
+      // The geometry table needs the wave: BS is derived as num_warps * wave, so whether a row is
+      // legal depends on the device it is FOR.  Keeping the clause here (instead of dropping it at
+      // parse time) is what preserves the SSOT property -- one bad row, one identical reason string
+      // -- for the devices the rows are meant for.
+      const char* reason = vk_tile_candidate_reason(path, out.geom, vk_tile_wave_for(deviceSubgroupSize));
       if (reason != nullptr) {
         err = "ROW line " + to_string(lineNo) + ": illegal geometry: " + reason;
         return false;
@@ -717,7 +733,7 @@ namespace VulkanTuner {
       return true;
     }
 
-    bool parseRowsFile(const string& text, RowsFile& out, string& err) {
+    bool parseRowsFile(const string& text, uint32_t deviceSubgroupSize, RowsFile& out, string& err) {
       istringstream is(text);
       string line;
       size_t lineNo = 0;
@@ -810,7 +826,7 @@ namespace VulkanTuner {
             return false;
           }
           vk_tune_row_spec row;
-          if (!parseRowLine(line.substr(4), lineNo, row, err)) {
+          if (!parseRowLine(line.substr(4), lineNo, deviceSubgroupSize, row, err)) {
             return false;
           }
           out.rows.push_back(row);
@@ -933,8 +949,8 @@ namespace VulkanTuner {
 
   }  // namespace
 
-  size_t backendFingerprint(ggml_backend_t backend, char* out, size_t outSize) {
-    return ::ggml_backend_vk_tune_fingerprint(backend, out, outSize);
+  size_t backendFingerprint(ggml_backend_t backend, char* out, size_t outSize, uint32_t* sgOut) {
+    return ::ggml_backend_vk_tune_fingerprint(backend, out, outSize, sgOut);
   }
 
   bool backendInstallRows(ggml_backend_t backend, const vk_tune_row_spec* rows, size_t nRows, string& err,
@@ -1058,16 +1074,37 @@ namespace VulkanTuner {
       // The vector's row must be LEGAL, and that is checked here rather than claimed: a vector
       // over an illegal row would still hash, but it would stop describing a row the tuner can
       // actually produce (and if the predicate ever started rejecting it, nobody would notice).
-      const char * why = vk_tile_candidate_reason(v.path, v.geom);
+      // R1b-2b: the wave is an INPUT now, so this check must exercise BOTH generations -- and it
+      // SYNTHESIZES them rather than reading the injected value: this function has no device (it runs
+      // from the cache-dir self-test) and the wave-dependent clauses still need a writer on both
+      // sides.  `v` is the wave32 fixture (BM=128,BN=128,WM=32,WN=64,WMITER=2,TM=2,TN=2,BS=256 =>
+      // num_warps = 4*2 = 8 = 256/32), so wave64 must REFUSE it; `v64` is the mirror
+      // (WM=WN=64,WMITER=4,TM=TN=4 => num_warps = 2*2 = 4 = 256/64), so wave32 must refuse it.
+      // The cross-check is the point: a fixture that only ever passes under one wave would also pass
+      // if the parameter were ignored entirely, so it would prove nothing about the wave.
+      const uint32_t wave32 = vk_tile_wave_for(32);
+      const uint32_t wave64 = vk_tile_wave_for(64);
+      const char * why     = vk_tile_candidate_reason(v.path, v.geom, wave32);              // want legal
+      const char * why64no = vk_tile_candidate_reason(v.path, v.geom, wave64);              // want refused
+      vk_tune_row_spec v64 = v;
+      v64.geom.WM = 64; v64.geom.WN = 64; v64.geom.WMITER = 4; v64.geom.TM = 4; v64.geom.TN = 4;
+      v64.geom.BS = 256;
+      const char * why64ok = vk_tile_candidate_reason(v64.path, v64.geom, wave64);          // want legal
+      const char * why32no = vk_tile_candidate_reason(v64.path, v64.geom, wave32);          // want refused
       const string gotEmpty = rowSetHash(vector<vk_tune_row_spec>());
       const string gotOne   = rowSetHash(vector<vk_tune_row_spec>{ v });
       const string wantEmpty = "4d25767f9dce13f5";
       const string wantOne   = "e3cde8d1133b7112";
-      if (why != nullptr || gotEmpty != wantEmpty || gotOne != wantOne) {
+      if (why != nullptr || why64no == nullptr || why64ok != nullptr || why32no == nullptr
+          || gotEmpty != wantEmpty || gotOne != wantOne) {
         ok = false;
         firstBad = "rowSetHash vector: legal=" + string(why == nullptr ? "yes" : why)
                    + " empty=" + gotEmpty + " (want " + wantEmpty + ")"
-                   + " one-row=" + gotOne + " (want " + wantOne + ")";
+                   + " one-row=" + gotOne + " (want " + wantOne + ")"
+                   + " wave cross-check: v@32=" + (why == nullptr ? "legal" : "REFUSED")
+                   + " v@64=" + (why64no == nullptr ? "LEGAL (BUG)" : "refused")
+                   + " v64@64=" + (why64ok == nullptr ? "legal" : "REFUSED (BUG)")
+                   + " v64@32=" + (why32no == nullptr ? "LEGAL (BUG)" : "refused");
       }
     }
     for (const DecisionOutcomeSpec & o : DECISION_OUTCOMES) {
@@ -1131,8 +1168,12 @@ namespace VulkanTuner {
           }
         }
       }
+      // The `completed` fixture builds one legal row (BM=BN=64, WM=WN=32 => num_warps = 4, BS=128),
+      // which is a WAVE32 row: synthesized here for the same reason as above (no device in this
+      // function), and the writer of that leg documents the wave it assumes.
       const bool fixtureOk = d.rows.empty()
-                          || vk_tile_candidate_reason(d.rows[0].path, d.rows[0].geom) == nullptr;
+                          || vk_tile_candidate_reason(d.rows[0].path, d.rows[0].geom,
+                                                      vk_tile_wave_for(32)) == nullptr;
       if (!o.writable) {
         // The STATE gate itself must refuse, and the error string must name it -- with a
         // write-ALLOWED policy, so the mode cannot be the thing that refused, and with the string
@@ -1246,12 +1287,28 @@ namespace VulkanTuner {
 
     try {
       char fp[512];
-      const size_t fpLen = backendFingerprint(backend, fp, sizeof(fp));
+      // The backend hands back BOTH the identity string and the raw subgroup size in one call, so
+      // "the sg inside the string" and "the sg the row path uses" cannot drift (G-C3: the shell has
+      // no device handle, so the wave can only be INJECTED, and this call is the seam that already
+      // existed).  `sg` stays RAW here: vk_tile_wave_for() is the single conversion and it is called
+      // where the wave is used, never here.
+      uint32_t sg = 0;
+      const size_t fpLen = backendFingerprint(backend, fp, sizeof(fp), &sg);
       if (fpLen == 0) {
         logLine("WARNING: the backend could not describe the device; the tuner is disabled for device "
                 + to_string(deviceIdx) + " (fail-open: no tuned rows)");
         return nullptr;
       }
+      if (sg == 0) {
+        // Fail-closed, in the same direction as the predicate's `wave == 0` clause: a device whose
+        // wave we do not know cannot have its geometry judged, and assuming 32 would silently refuse
+        // every legal wave64 row (or accept illegal wave32 ones).  Loud, and fail-open (no rows).
+        logLine("WARNING: the backend reported subgroup size 0 for device " + to_string(deviceIdx)
+                + "; the tuner is disabled for it (a geometry cannot be judged without the wave; "
+                  "fail-open: no tuned rows)");
+        return nullptr;
+      }
+      d->deviceSubgroupSize = sg;
       d->fingerprint = string(fp, fpLen);
 
       // The device name comes out of the fingerprint rather than from a second query: one
@@ -1328,7 +1385,7 @@ namespace VulkanTuner {
         RowsFile file;
         string err;
         string text;
-        if (!readWholeFile(loadPath, text, err) || !parseRowsFile(text, file, err)) {
+        if (!readWholeFile(loadPath, text, err) || !parseRowsFile(text, d->deviceSubgroupSize, file, err)) {
           d->cacheState = "rejected";
           refuseLoad(loadKind, err);
           d->note = string(loadKind) + " unreadable/unparsable, using the stock heuristic";
