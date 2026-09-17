@@ -361,34 +361,40 @@ namespace VulkanTuner {
       const char* outcome;
       const char* klass;       // "structural" / "completed" / "gate" / "measurement"
       bool writable;
+      // The EXTRA condition on top of `writable` (G-D20): "" = none, "device-only" = every
+      // rejection reason must be a device property.  It lives in the table on purpose -- a
+      // condition expressed as a branch on `klass` would let a class rename silently change what
+      // may be written, which is the "implicit knowledge in a branch" the first design rule bans.
+      const char* condition;
     };
     const DecisionOutcomeSpec DECISION_OUTCOMES[] = {
-      { "structural-all-reject", "structural",  true  },
-      { "measured",              "completed",   true  },
-      { "gate-reject",           "gate",        false },
-      { "running",               "measurement", false },
-      { "timeout",               "measurement", false },
-      { "io-error",              "measurement", false },
-      { "device-lost",           "measurement", false },
-      { "no-winner",             "measurement", false },
+      { "structural-all-reject", "structural",  true,  "device-only" },
+      { "measured",              "completed",   true,  ""            },
+      { "gate-reject",           "gate",        false, ""            },
+      { "running",               "measurement", false, ""            },
+      { "timeout",               "measurement", false, ""            },
+      { "io-error",              "measurement", false, ""            },
+      { "device-lost",           "measurement", false, ""            },
+      { "no-winner",             "measurement", false, ""            },
     };
+
+    // The extra condition named by a table row (G-D20).  Fail-closed: an unknown condition is
+    // never satisfied, so a typo in the table cannot make something writable.
+    bool outcomeConditionOk(const Decision & d, const char * condition) {
+      const string c = (condition == nullptr) ? string() : string(condition);
+      if (c.empty()) {
+        return true;
+      }
+      if (c == "device-only") {
+        return d.allRejectReasonsAreDevice;
+      }
+      return false;
+    }
 
     bool outcomeWritable(const Decision & d) {
       for (const DecisionOutcomeSpec & o : DECISION_OUTCOMES) {
         if (d.outcome == o.outcome) {
-          if (!o.writable) {
-            return false;
-          }
-          // G-D20: the only writable `structural` outcome is "this device has no injectable slot".
-          // A rejection that came from OUR implementation state (cm1 not wired, the 64-bit variant
-          // not built) is not a property of the device, so the claim must not be remembered -- it
-          // would never be rescanned once the gap closes.  The flag is the install accounting's
-          // verdict; unset => not writable (safe direction, and it keeps this rule independent of
-          // the write side existing).
-          if (string(o.klass) == "structural") {
-            return d.allRejectReasonsAreDevice;
-          }
-          return true;
+          return o.writable && outcomeConditionOk(d, o.condition);
         }
       }
       return false;
@@ -1111,6 +1117,20 @@ namespace VulkanTuner {
       string err;
       bool verdict = false;
       const bool stateOk = (outcomeWritable(d) == o.writable);   // the table agrees with itself
+      // The condition's OTHER direction, per row (G-D20): a row that names an extra condition must
+      // be REFUSED when that condition does not hold.  Asserting only the satisfying direction would
+      // leave the condition itself untested (and would let it decay into a comment).
+      if (string(o.condition).size() > 0) {
+        Decision dCond = d;
+        dCond.allRejectReasonsAreDevice = false;
+        if (outcomeWritable(dCond)) {
+          ok = false;
+          if (firstBad.empty()) {
+            firstBad = string("outcome ") + o.outcome + " is writable while its condition ("
+                       + o.condition + ") does not hold";
+          }
+        }
+      }
       const bool fixtureOk = d.rows.empty()
                           || vk_tile_candidate_reason(d.rows[0].path, d.rows[0].geom) == nullptr;
       if (!o.writable) {
