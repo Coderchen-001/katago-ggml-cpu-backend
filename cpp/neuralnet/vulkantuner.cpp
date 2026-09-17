@@ -1012,19 +1012,44 @@ namespace VulkanTuner {
     int declared = 0, refused = 0, allowed = 0;
     bool ok = true;
     string firstBad;
-    // R0 leg: pin rowSetHash() to the STANDARD FNV-1a 64 parameters with one vector whose expected
-    // value is computed by hand (t1-schema.md 1.3).  The empty row set feeds exactly four zero bytes
-    // (the row count), so the expected hash is basis * prime^4 mod 2^64 = 0x4d25767f9dce13f5.
-    // It fails INSIDE this existing verdict line (no new counted line, no new writer, and the
-    // success text is byte-identical to before) -- the point is that a wrong constant must not be
-    // able to look green while every imported file silently mismatches.
+    // R0 legs: pin rowSetHash() to the STANDARD FNV-1a 64 parameters AND to the wire protocol
+    // (field set, field order, 4-byte little-endian feed).  Both expected values come from an
+    // INDEPENDENT implementation (python, logs-t3/1b2b/r0-*), never from this function:
+    //   empty row set (the four zero bytes of the row count) -> basis * prime^4 mod 2^64
+    //                                                        = 0x4d25767f9dce13f5
+    //   one legal row (count + 17 fields = 18 feeds)          = 0xe3cde8d1133b7112
+    // The empty vector alone does NOT pin the protocol: four zero bytes leave the digest
+    // insensitive to the xor order, the byte order and the field order.  Sensitivity proof --
+    // both values DIFFER from the expected one, so a weakened vector cannot pass by accident:
+    //   swap two field positions -> 0x12b27bd83877cd52 ;  feed the bytes big-endian -> 0x85f45fe6df78624c
+    // LITERAL DISCIPLINE (t1-schema.md 1.3): these two literals may only come from the
+    // independent implementation.  REFERENCE them; never recompute them in place and never edit
+    // them to match a red leg -- "make the literal agree with the code" is the ONE way this
+    // check can silently become a no-op.
     {
-      const string got = rowSetHash(vector<vk_tune_row_spec>());
-      const string want = "4d25767f9dce13f5";
-      if (got != want) {
+      vk_tune_row_spec v {};
+      v.path = VK_TILE_PATH_SCALAR;
+      v.src0_type = 1;   // f16
+      v.src1_type = 1;   // f16
+      v.key_m = 192;
+      v.key_k = 512;
+      v.geom.BM = 128; v.geom.BN = 128; v.geom.BK = 32;
+      v.geom.WM = 32;  v.geom.WN = 64;  v.geom.WMITER = 2;
+      v.geom.TM = 2;   v.geom.TN = 2;   v.geom.BS = 256;
+      v.geom.pad = 1;  v.geom.reshape = 0; v.geom.smaller = 0;
+      // The vector's row must be LEGAL, and that is checked here rather than claimed: a vector
+      // over an illegal row would still hash, but it would stop describing a row the tuner can
+      // actually produce (and if the predicate ever started rejecting it, nobody would notice).
+      const char * why = vk_tile_candidate_reason(v.path, v.geom);
+      const string gotEmpty = rowSetHash(vector<vk_tune_row_spec>());
+      const string gotOne   = rowSetHash(vector<vk_tune_row_spec>{ v });
+      const string wantEmpty = "4d25767f9dce13f5";
+      const string wantOne   = "e3cde8d1133b7112";
+      if (why != nullptr || gotEmpty != wantEmpty || gotOne != wantOne) {
         ok = false;
-        firstBad = "rowSetHash({}) = " + got + ", want " + want
-                   + " (FNV-1a 64 offset basis must be 0xCBF29CE484222325)";
+        firstBad = "rowSetHash vector: legal=" + string(why == nullptr ? "yes" : why)
+                   + " empty=" + gotEmpty + " (want " + wantEmpty + ")"
+                   + " one-row=" + gotOne + " (want " + wantOne + ")";
       }
     }
     for (const DecisionOutcomeSpec & o : DECISION_OUTCOMES) {

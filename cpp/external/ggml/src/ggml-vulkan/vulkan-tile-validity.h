@@ -258,10 +258,21 @@ static inline uint64_t vk_tile_canonical_key(int path, const vk_tile_geometry & 
     const uint32_t parts[10] = {
         (uint32_t) path, g.BM, bn_eff, g.BK, g.WM, g.WN, g.WMITER, g.TM, g.TN, g.BS,
     };
-    uint64_t h = 14695981039346656037ull;  // FNV-1a 64 OFFSET BASIS = 0xCBF29CE484222325 (standard; see t1-schema.md 1.3).  Fed one u32 at a time (NOT the standard byte-wise feed) and used only as an in-process dedup identity -- never persisted, never compared across repos.
+    // Standard FNV-1a 64 (offset basis 0xCBF29CE484222325, prime 0x100000001B3), fed one BYTE at
+    // a time in little-endian order -- the same wire protocol the shell's rowSetHash() uses, so
+    // both hashes are "FNV-1a" in the standard sense.  R0 changed the basis to the standard value
+    // and the feed from one u32 per step to bytes; the function has no callers, is never
+    // persisted and never compared across repos, so this only changes an in-process dedup key.
+    // NOTE: `bn_eff` above exists for DEDUP only (two geometries that create the same tile must
+    // share a key) -- it must NOT be reused as the pipeline align (t3-shell-plan.md 6.9: the
+    // align rule is per path and is derived from the stock buckets, not from this identity).
+    uint64_t h = 14695981039346656037ull;
     for (int i = 0; i < 10; i++) {
-        h ^= parts[i];
-        h *= 1099511628211ull;
+        const uint32_t v = parts[i];
+        for (int b = 0; b < 4; b++) {
+            h ^= (uint64_t) ((v >> (8 * b)) & 0xffu);
+            h *= 1099511628211ull;
+        }
     }
     return h;
 }
