@@ -1932,8 +1932,32 @@ struct OnnxToGgml {
           registerOut(out, Layout::L_CS, GGML_TYPE_F32);
         }
         else {
-          // k>1 (stem conv_spatial only): keep the im2col path in NCHW.
-          ggml_tensor* x = annX.t;   // stem input is NCHW (graph input)
+          // k>1: im2col needs NCHW, and the input may currently be in the CS domain.
+          //
+          // C1 REGRESSION FIX.  L2-A introduced the CS domain and left this branch reading `annX.t`
+          // raw, under the assumption written in its comment: "k>1 (stem conv_spatial only)".  That
+          // assumption was true for EVERY net in the tree at the time (b10c384 / b10c512 / b11c768
+          // each have exactly ONE k>1 conv -- the stem), and false in general: a classic
+          // two-3x3-per-block trunk (kata1-zhizi-b28c512nbt) has 122 of them, so from the second one
+          // on the input is CS [C,S,N] and ggml_im2col's `is_2D` clause (ggml.c:4481,
+          // a->ne[2] == b->ne[2]) aborted the process during graph build.  Before L2-A there was no
+          // CS domain at all (every tensor was NCHW), which is why the same net ran then, only
+          // slower (1x1 convs paid im2col too).
+          //
+          // `ensure` is a NO-OP when the tensor already has the wanted layout (see ensure()), so
+          // single-spatial-conv nets -- all of them before this one -- keep a bit-identical graph;
+          // the conversion is cached per source tensor, and both directions are already counted
+          // (nConvToCS / nConvToNCHW, observable with KATAGO_VK_LAYOUTDBG_EDGE), so the price of the
+          // classic trunk can be accounted instead of guessed.
+          ggml_tensor* x = ensure(annX, Layout::L_NCHW, GGML_TYPE_F32);
+          // Loud, in our own words: a channel mismatch here would otherwise surface as an upstream
+          // GGML_ASSERT abort with no hint of which conv or which layout produced it.
+          if(x->ne[2] != w->ne[2])
+            throw StringError("VULKAN backend: conv channel mismatch at " + currentOpName
+                              + " (input channels " + std::to_string((long long)x->ne[2])
+                              + " vs kernel " + std::to_string((long long)w->ne[2])
+                              + ", input layout id " + std::to_string((int)annX.layout)
+                              + ") -- im2col needs the input in NCHW");
           registerOut(ggml_conv_2d_s1_ph(ctx, w, x), Layout::L_NCHW, GGML_TYPE_F32);
         }
       }
@@ -2012,10 +2036,10 @@ struct OnnxToGgml {
             // ONNX scores[n,m] lives at (m=S_k,n=S_q): softmax along ne0=S_k.
             // mul_mat needs contiguous (non-transposed) operands, so the
             // permuted views are materialized.
-            ggml_tensor* a = annB.t;   // k [D,H,S,N]
+            ggml_tensor* a = annB.t;   // RAW-OK: L_MAT-by-assert (both operands asserted L_MAT at the branch head)
             if(a->ne[1] < a->ne[2])
               a = ggml_cont(ctx, ggml_permute(ctx, a, 0, 2, 1, 3));   // -> [D,S,H,N]
-            ggml_tensor* b = annA.t;   // qT [D,H,S,N] (identity in L_MAT)
+            ggml_tensor* b = annA.t;   // RAW-OK: L_MAT-by-assert (qT [D,H,S,N], identity in L_MAT)
             if(b->ne[1] < b->ne[2])
               b = ggml_cont(ctx, ggml_permute(ctx, b, 0, 2, 1, 3));   // -> [D,S,H,N]
             // EXPERIMENT b': F16 operands -> F16 tensor-core GEMM path
@@ -2037,7 +2061,7 @@ struct OnnxToGgml {
             //   B = probs as-is [S_k, S_q, H, N]
             //   -> [D, S_q, H, N].
             ggml_tensor* a = ggml_cont(ctx, ggml_permute(ctx, annB.t, 1, 2, 0, 3)); // v [D,H,S,N]->[S_k,D,H,N]
-            ggml_tensor* b = annA.t;   // probs [S_k,S_q,H,N] as-is
+            ggml_tensor* b = annA.t;   // RAW-OK: L_MAT-by-assert (probs [S_k,S_q,H,N] as-is)
             // EXPERIMENT b': F16 operands for the tensor-core path (see scores)
             a = ggml_cast(ctx, a, GGML_TYPE_F16);
             b = ggml_cast(ctx, b, GGML_TYPE_F16);
@@ -2056,7 +2080,7 @@ struct OnnxToGgml {
           if(findInitializer(node.input(1)) != NULL)
             b = initializerTensor(node.input(1), GGML_TYPE_F16);
           else
-            b = annB.t;
+            b = annB.t;   // RAW-OK: GEMM-any-layout (mul_mat consumes either domain; shape is the annotation's)
           registerOut(matmul(annA.t, b));
         }
       }
@@ -2224,7 +2248,7 @@ struct OnnxToGgml {
           testAssert(axis == 2);
           AnnotatedTensor ann = in(0);      // [D,H,S,N] L_MAT
           GGML_ASSERT(ann.layout == Layout::L_MAT);
-          ggml_tensor* q = ann.t;           // [D,H,S,N]
+          ggml_tensor* q = ann.t;           // RAW-OK: L_MAT-by-assert (see the GGML_ASSERT above)
           const int64_t D = site.D, H = site.H, S = site.S;
           const int64_t N = q->ne[3];
           // Layout the tensor as [H,S,N,D] contiguous so get_rows' ne0 is
@@ -2344,10 +2368,19 @@ struct OnnxToGgml {
       else if(op == "Concat") {
         int64_t axis = getAttr(node, "axis").i();
         testAssert(axis >= 0 && axis < 4);
+        // C1 audit: ggml_concat works on whatever it is given, and the axis arithmetic below
+        // (ggmlAxis = 3 - ONNX axis) is a statement about NCHW axes.  A CS input would therefore
+        // concatenate along a different logical axis than the ONNX node asked for -- and it would do
+        // so SILENTLY, because the resulting ggml shape stays self-consistent.  All inputs must be in
+        // ONE domain, so the requirement is asserted instead of assumed (this is the same class of
+        // bug as the conv one this batch fixes: an implicit layout assumption).
         int ggmlAxis = 3 - (int)axis;
-        ggml_tensor* acc = in(0).t;
-        for(int i = 1; i < node.input_size(); i++)
-          acc = ggml_concat(ctx, acc, in(i).t, ggmlAxis);
+        const Layout accLayout = in(0).layout;
+        ggml_tensor* acc = in(0).t;   // RAW-OK: same-domain-concat (asserted in the loop below)
+        for(int i = 1; i < node.input_size(); i++) {
+          testAssert(in(i).layout == accLayout);
+          acc = ggml_concat(ctx, acc, in(i).t, ggmlAxis);   // RAW-OK: same-domain-concat
+        }
         registerOut(acc);
       }
       else if(op == "Softmax") {
