@@ -376,7 +376,19 @@ namespace VulkanTuner {
     bool outcomeWritable(const Decision & d) {
       for (const DecisionOutcomeSpec & o : DECISION_OUTCOMES) {
         if (d.outcome == o.outcome) {
-          return o.writable;
+          if (!o.writable) {
+            return false;
+          }
+          // G-D20: the only writable `structural` outcome is "this device has no injectable slot".
+          // A rejection that came from OUR implementation state (cm1 not wired, the 64-bit variant
+          // not built) is not a property of the device, so the claim must not be remembered -- it
+          // would never be rescanned once the gap closes.  The flag is the install accounting's
+          // verdict; unset => not writable (safe direction, and it keeps this rule independent of
+          // the write side existing).
+          if (string(o.klass) == "structural") {
+            return d.allRejectReasonsAreDevice;
+          }
+          return true;
         }
       }
       return false;
@@ -1067,6 +1079,9 @@ namespace VulkanTuner {
         // The one writable shape that says something without rows.
         d.negative = true;
         d.negativeReason = "no-injection-slot";
+        // G-D20: "the device has no injectable slot" is writable only when every rejection reason
+        // is a device property; the fixture has to say so explicitly (unset => not writable).
+        d.allRejectReasonsAreDevice = true;
       }
       else if (o.writable && string(o.klass) == "completed") {
         // The rows-file shape: one legal row, so the CONTENT gate passes and only the state gate
@@ -1128,8 +1143,38 @@ namespace VulkanTuner {
         }
       }
     }
-    const bool absent = !FileUtils::exists(probePath);
-    logLine("cache write self-test: " + to_string(declared) + " outcome(s) declared, "
+    // G-D20 leg (R1b-2a): a `structural-all-reject` whose reasons came from OUR implementation
+    // gap must be refused by the state gate even though the declared table says the outcome is
+    // writable.  This is the RULE's execution body, and it needs no write side: the plumbing that
+    // fills `allRejectReasonsAreDevice` from the install accounting is what waits for B5/B6.
+    {
+      Decision d;
+      d.cachePath = probePath;
+      d.nnXLen = 19;
+      d.nnYLen = 19;
+      d.maxBatchSize = 8;
+      d.fingerprint = "self-test";
+      d.policyFingerprint = "self-test";
+      d.baselineVersion = "1";
+      d.modelIdentity = "self-test";
+      d.outcome = "structural-all-reject";
+      d.negative = true;
+      d.negativeReason = "no-injection-slot";
+      d.allRejectReasonsAreDevice = false;   // one reason came from our own gap
+      const bool refusedOurGap = !outcomeWritable(d);
+      d.allRejectReasonsAreDevice = true;    // every reason is a device property
+      const bool allowedDeviceOnly = outcomeWritable(d);
+      if (!refusedOurGap || !allowedDeviceOnly) {
+        ok = false;
+        if (firstBad.empty()) {
+          firstBad = string("G-D20: our-gap structural-all-reject writable=")
+                     + (refusedOurGap ? "no" : "YES (BUG)") + ", device-only writable="
+                     + (allowedDeviceOnly ? "yes" : "NO (BUG)");
+        }
+      }
+    }
+
+    const bool absent = !FileUtils::exists(probePath);    logLine("cache write self-test: " + to_string(declared) + " outcome(s) declared, "
             + to_string(refused) + " refused by the state gate, " + to_string(allowed)
             + " state-writable; probe file " + (absent ? "absent" : "PRESENT") + " ["
             + ((ok && absent) ? "ok" : "FAIL") + "]"

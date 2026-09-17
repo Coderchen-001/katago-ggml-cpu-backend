@@ -116,6 +116,16 @@ namespace VulkanTuner {
     // validation gate) and class (c) (timeout / IO failure / device lost / no winner) are
     // deliberately absent from it, so they cannot be written at all.
     std::string negativeReason;
+
+    // G-D20 (t3-shell-plan.md 6.9): "deterministically all-rejected" is a claim about the DEVICE
+    // only when every rejection reason is a device property.  A rejection caused by OUR
+    // implementation gap (cm1 not wired, the 64-bit variant not built) is NOT a device verdict, and
+    // writing it down would remember our gap forever and never rescan after it closes.
+    //
+    // Filled by the install accounting.  Default false = "not proven device-only", so an unset flag
+    // can never make a structural verdict writable (the safe direction, like the fail-closed
+    // outcome lookup below).
+    bool allRejectReasonsAreDevice = false;
     // The policy half of the header (t1-schema.md section 4): a row set measured under one
     // policy must not be reused under another.  `policyFingerprint` covers the build
     // revision, the tuner's policy version and the policy-relevant env knobs;
