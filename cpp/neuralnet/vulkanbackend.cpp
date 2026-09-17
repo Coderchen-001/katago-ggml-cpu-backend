@@ -2511,6 +2511,22 @@ void NeuralNet::freeComputeContext(ComputeContext* computeContext) {
 
 //--------------------------------------------------------------
 
+// ONE implementation of "force f32 accumulation on the F16-src0 mul_mats".  Both the env override
+// (KATAGO_VK_MMPREC_F32) and the REQUESTED precision come through here, so they cannot drift into
+// two copies: the first version of F1 had this loop twice (same predicate, same API, but one edit
+// could have changed only one of them, and "两处拷贝靠纪律" is exactly what this project refuses).
+static void forceF32AccOnF16MulMats(ggml_cgraph* g, bool global,
+                                    const unordered_set<const ggml_tensor*>* faFeedOnly) {
+  const int nNodes = ggml_graph_n_nodes(g);
+  for(int i = 0; i < nNodes; i++) {
+    ggml_tensor* node = ggml_graph_node(g, i);
+    if(node->op != GGML_OP_MUL_MAT || node->src[0]->type != GGML_TYPE_F16)
+      continue;
+    if(global || (faFeedOnly != nullptr && faFeedOnly->count(node) > 0))
+      ggml_mul_mat_set_prec(node, GGML_PREC_F32);
+  }
+}
+
 struct ComputeHandle {
   ComputeContext* ctx;
   const LoadedModel* loadedModel;
@@ -2778,56 +2794,47 @@ struct ComputeHandle {
     //   '3' = C-N34 R2: R1 + the fa out-projection conv GEMM.
     // F32xF16 nodes from matmul() are unconditionally f32acc (GV:7723/4886) and
     // correctly left untouched; future Q8_0 nodes have non-F16 src0 and skip.
-    // F1 (precision-class alignment, 2026-09-17): ONE rule decides the accumulation width and ONE
-    // line reports what it decided, in priority order:
+    // --- Precision class (F1): ONE rule, ONE implementation, ONE report -------------------------
+    // Priority, highest first:
+    //   '1'  (env, a FULL class)   -> f32acc on every F16-src0 mul_mat          source=env
+    //   the  REQUESTED precision   -> f32acc on every F16-src0 mul_mat          source=requested
+    //   '2'/'3' (env, a SUBSET)    -> f32acc on the fa-feed GEMMs only          source=env(subset)
+    //   nothing names a class      -> ggml-vulkan's own choice (f16acc on fp16 devices)
     //
-    //   1. KATAGO_VK_MMPREC_F32 -- the dev override, wins over everything (its '1'/'2'/'3' subsets
-    //      are unchanged);
-    //   2. the REQUESTED precision -- `useFP16Mode == enabled_t::False` means "do not use fp16".
-    //      Until this change that request was honoured only in the REPORT (`isUsingFP16`), never in
-    //      the graph: the "fp32" evaluator that `testgpuerror` builds computed the SAME f16acc
-    //      pipelines, so testnnevalcanary's fp32 segment was a self-comparison judged by the strict
-    //      limits (all 9 metrics bit-identical to the fp16 path, only the divisors differed) -- i.e.
-    //      a margin that could not be attributed to any real precision class;
-    //   3. the device capability -- `Auto`/`True` leave ggml-vulkan's own choice alone (f16acc when
-    //      the device has fp16, else f32acc), so production runs are bit-identical to before.
+    // Why the request is NOT the env's else-branch (review finding, 2026-09-17): with a subset env
+    // ('2'/'3') or an unrecognized value ('0'), a request of "no fp16" was skipped entirely, so the
+    // "fp32" evaluator testgpuerror builds stayed f16acc/mixed -- F1's disease, revived, with the
+    // margin gate still green because it only checks that a reference file was passed.  A request for
+    // the full class now wins over any subset, and the source string says so.
     //
-    // The class goes into the "graph built" line below, so no margin number is ever quoted without
-    // it: the project's batteries disagree about MMPREC_F32 (some set it, some scrub it) and b11
-    // differs 2.1x between the two widths.
-    bool precF32Acc = false;          // we forced f32 accumulation on every F16-src0 mul_mat
-    bool precMixed = false;           // env set it on a SUBSET only ('2'/'3')
+    // `mode=` in the report is the mode AFTER Setup's `disableFP16` rewrite (setup.cpp:342), i.e. the
+    // value this backend actually receives; setup.cpp's own "useFP16 X" line prints the request
+    // BEFORE that rewrite, so the two lines can legitimately differ (they say different things).
+    const char* mmpEnv = getenv("KATAGO_VK_MMPREC_F32");
+    const char mmp = (mmpEnv != nullptr && mmpEnv[0] != '\0') ? mmpEnv[0] : '\0';
+    const bool reqF32 = (ctx->useFP16Mode == enabled_t::False);
+    bool precF32Acc = false;
+    bool precMixed = false;
     const char* precSource = "capability";
-    if(getenv("KATAGO_VK_MMPREC_F32") != nullptr) {
-      const char mmp = getenv("KATAGO_VK_MMPREC_F32")[0];
-      precSource = "env";
-      if(mmp == '1' || mmp == '2' || mmp == '3') {
-        const bool global = (mmp == '1');
-        if(global) precF32Acc = true; else precMixed = true;
-        const int nNodes = ggml_graph_n_nodes(graph);
-        for(int i = 0; i < nNodes; i++) {
-          ggml_tensor* node = ggml_graph_node(graph, i);
-          if(node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F16)
-            if(global || builder.faFeedGemmPtrs.count(node) > 0)
-              ggml_mul_mat_set_prec(node, GGML_PREC_F32);
-        }
-      }
-      // Any other value is NOT silently reinterpreted as "on": the env is a dev knob and an unknown
-      // value leaves ggml-vulkan's default in place (source=env still says so, so the class is
-      // never guessed).
-    }
-    else if(ctx->useFP16Mode == enabled_t::False) {
-      // The request, honoured in the graph rather than only in the report (this is the whole point
-      // of F1).  Same treatment as MMPREC_F32=1, same predicate, so "the request" and "the env" can
-      // never diverge into two mechanisms.
+    if(mmp == '1') {
+      forceF32AccOnF16MulMats(graph, true, &builder.faFeedGemmPtrs);
       precF32Acc = true;
-      precSource = "requested";
-      const int nNodes = ggml_graph_n_nodes(graph);
-      for(int i = 0; i < nNodes; i++) {
-        ggml_tensor* node = ggml_graph_node(graph, i);
-        if(node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F16)
-          ggml_mul_mat_set_prec(node, GGML_PREC_F32);
-      }
+      precSource = "env";
+    }
+    else if(reqF32) {
+      forceF32AccOnF16MulMats(graph, true, &builder.faFeedGemmPtrs);
+      precF32Acc = true;
+      precSource = (mmp == '2' || mmp == '3') ? "requested(subsumes env subset)" : "requested";
+    }
+    else if(mmp == '2' || mmp == '3') {
+      forceF32AccOnF16MulMats(graph, false, &builder.faFeedGemmPtrs);
+      precMixed = true;
+      precSource = "env(subset)";
+    }
+    else if(mmpEnv != nullptr) {
+      // An unrecognized value is NOT silently reinterpreted as "on", but it is also no longer allowed
+      // to hide the request above: it only means "the env named no class".
+      precSource = "env(no class named)";
     }
     const char* precClass = precF32Acc ? "f32acc"
                           : (precMixed ? "mixed(env subset)"
@@ -2863,7 +2870,7 @@ struct ComputeHandle {
     if(logger != NULL)
       logger->write("VULKAN backend: graph built (" + Global::uint64ToString((uint64_t)onnxBytes.size()) + " onnx bytes, " +
                     Global::uint64ToString((uint64_t)ggml_graph_n_nodes(graph)) + " ggml nodes) [prec] accumulation=" +
-                    string(precClass) + " source=" + string(precSource) + " requested=" + ctx->useFP16Mode.toString());
+                    string(precClass) + " source=" + string(precSource) + " mode=" + ctx->useFP16Mode.toString());
   }
 
   ~ComputeHandle() {
