@@ -270,11 +270,21 @@ static inline const char * vk_tile_candidate_reason(int path, const vk_tile_geom
 
     // The two paths diverge HERE, and the divergence is the point (cm1-b2).  The clauses below
     // the cm1 branch describe the SCALAR inner loop, which the COOPMAT path does not run:
-    // mul_mm.comp computes WNITER/WSUBN in both paths (:178-180), but only the `#else` branch
-    // USES WSUBN (:198-199) -- and the stock cm1 buckets carry WNITER == 0 while compiling and
-    // running every day.  So "wniter >= 1" (and the other divisibility clauses around it) are
-    // rules about SCALAR, not about cm1.  What cm1 needs is the array arithmetic the COOPMAT
-    // branch really performs: cms_per_row = WM / TM, cms_per_col = WN / TN, storestride =
+    // mul_mm.comp computes WNITER and WSUBN in BOTH paths (:178-180), but every USE of them is on
+    // the `#else` (scalar) side: WNITER at :280, :289, :338, :372, :442 and WSUBN at :341-344,
+    // :446.  The COOPMAT branch (:182-200) works from cms_per_row / cms_per_col / storestride
+    // instead.  And the stock cm1 buckets carry WNITER == 0 while compiling and running every
+    // day, so "wniter >= 1" (and the divisibility clauses around it) are rules about SCALAR, not
+    // about cm1.
+    //
+    // 🔴 FRAGILE BY CONSTRUCTION -- read this before changing the shader: WNITER == 0 is safe for
+    // cm1 ONLY because nothing on the COOPMAT side uses WSUBN or WNITER, so `WN / WNITER` (:180)
+    // is dead code there and the compiler drops it.  If upstream ever uses WSUBN or WNITER inside
+    // a COOPMAT branch, the "wniter >= 1" rule MUST come back for cm1 -- otherwise the next
+    // geometry class gets accepted here and divides by zero in the driver (measured, cm1-b).
+    //
+    // What cm1 DOES need is the array arithmetic the COOPMAT branch really performs:
+    // cms_per_row = WM / TM, cms_per_col = WN / TN, storestride =
     // WARP / TM, and the type declarations coopmat<..., TM, TN|TK, ...> (:187-192) -- all of
     // which want a non-zero fragment per warp, i.e. WM >= TM and WN >= TN.
     // The FRAGMENT SHAPE ITSELF (TM/TN == this device's cooperative-matrix shape) is a DEVICE
