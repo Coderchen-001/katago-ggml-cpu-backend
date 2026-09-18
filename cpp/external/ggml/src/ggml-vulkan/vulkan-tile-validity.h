@@ -187,24 +187,14 @@ static inline const char * vk_tune_row_family_reason(int src0_type, int src1_typ
         return "no tuned-row implementation for this (src0, src1) family "
                "(only f16xf16 and f16xf32 are wired)";
     }
-    if (path == VK_TILE_PATH_CM1) {
-        // OUR gap, and a MEASURED one (cm1-b, 2026-09-18).  The row path itself is wired: the
-        // `_cm1` modules are in the row shader table, the spec's TK comes from the device, and
-        // I6 carries the cm1 device conditions -- all three verified on this machine in compat
-        // mode (coopmat_support / coopmat_support_16x16x16_f16acc / subgroup_size_control /
-        // sg=32 are all true; coopmat_m/n/k = 16,16,16).  What is MISSING is the GEOMETRY rule:
-        // every geometry vk_tile_candidate_reason ACCEPTS for cm1 (the scalar-shaped one) makes
-        // the driver abort inside createComputePipeline with STATUS_INTEGER_DIVIDE_BY_ZERO
-        // (0xC0000094 -- measured on two different accepted geometries), while the geometry the
-        // cm1 buckets actually use (TM/TN = the coopmat fragment, BS = num_warps * wave) is
-        // REFUSED by that same table.  "Accepted" and "buildable" therefore do not overlap yet,
-        // and opening this gate would make a driver crash reachable from a cache file.  Next
-        // round: derive the cm1 geometry rules (tune-gaps.md G-A2/G-A3/G-A4) and open THIS gate
-        // in the same commit.
-        return "cm1 rows cannot be built yet: the cm1 GEOMETRY rules are not derived, and every "
-               "geometry the rule table accepts crashes the driver at pipeline creation "
-               "(G-A2/G-A3/G-A4; refusing beats a reachable crash)";
-    }
+    // cm1 was refused here until cm1-b2.  What justified the refusal was a MEASUREMENT:
+    // the geometry table accepted scalar-shaped rows for cm1, and the shader declares its
+    // coopmat types with the ROW's own TM/TN/TK (mul_mm.comp:187-192), so an accepted but
+    // unsupported fragment shape made the driver abort with STATUS_INTEGER_DIVIDE_BY_ZERO.
+    // The repair is in the two places the crash actually lived: vk_tile_candidate_reason now
+    // has a COOPMAT clause set for cm1 (the scalar inner-loop rules do NOT describe it -- the
+    // stock cm1 buckets carry wniter == 0 and compile), and I6 refuses a row whose fragment
+    // shape is not this device's cooperative-matrix shape.
     if (path != VK_TILE_PATH_SCALAR && path != VK_TILE_PATH_CM1 && path != VK_TILE_PATH_CM2) {
         return "unknown creation path";
     }
@@ -270,17 +260,42 @@ static inline const char * vk_tile_candidate_reason(int path, const vk_tile_geom
         return "zero dimension (BM/BN/WM/WN/WMITER/TM/TN must be > 0)";
     }
     const uint32_t num_warps = (g.BM / g.WM) * (g.BN / g.WN);
-    const uint32_t wniter = g.WM * g.WN / (wave * g.TM * g.TN * g.WMITER);
     if (g.BM % g.WM != 0)               return "BM % WM != 0";
     if (g.BN % g.WN != 0)               return "BN % WN != 0";
     if (g.WM % g.WMITER != 0)           return "WM % WMITER != 0";
+    if (g.BS != num_warps * wave)       return "BS != num_warps * wave (BS is derived, not free)";
+    if (g.BS > 1024)                    return "BS > 1024";
+    if (g.pad >= 0 && g.pad > 4)        return "PAD outside [0,4]";
+    if (g.reshape >= 0 && g.reshape != 0 && g.reshape != 1) return "RESHAPE not in {0,1}";
+
+    // The two paths diverge HERE, and the divergence is the point (cm1-b2).  The clauses below
+    // the cm1 branch describe the SCALAR inner loop, which the COOPMAT path does not run:
+    // mul_mm.comp computes WNITER/WSUBN in both paths (:178-180), but only the `#else` branch
+    // USES WSUBN (:198-199) -- and the stock cm1 buckets carry WNITER == 0 while compiling and
+    // running every day.  So "wniter >= 1" (and the other divisibility clauses around it) are
+    // rules about SCALAR, not about cm1.  What cm1 needs is the array arithmetic the COOPMAT
+    // branch really performs: cms_per_row = WM / TM, cms_per_col = WN / TN, storestride =
+    // WARP / TM, and the type declarations coopmat<..., TM, TN|TK, ...> (:187-192) -- all of
+    // which want a non-zero fragment per warp, i.e. WM >= TM and WN >= TN.
+    // The FRAGMENT SHAPE ITSELF (TM/TN == this device's cooperative-matrix shape) is a DEVICE
+    // property, so I6 refuses it, not this table: the table must stay answerable without a
+    // device (the shell parses rows with it, and the fingerprint carries no coopmat shape).
+    if (path == VK_TILE_PATH_CM1) {
+        if (g.BK != 16) {
+            return "cm1: BK != 16 (the f16 coopmat path; the row build pins spec id 3 to 16)";
+        }
+        if (g.WM / g.TM < 1 || g.WN / g.TN < 1) {
+            return "cm1: WM / TM or WN / TN is 0 (the shader's cms_per_row / cms_per_col)";
+        }
+        return nullptr;
+    }
+
+    const uint32_t wniter = g.WM * g.WN / (wave * g.TM * g.TN * g.WMITER);
     if ((g.WM / g.WMITER) % g.TM != 0)  return "(WM / WMITER) % TM != 0";
     if (wniter < 1)                       return "wniter < 1 (TM*TN*WMITER too large for WM*WN/wave)";
     if (g.WN % wniter != 0)               return "WN % wniter != 0";
     if ((g.WN / wniter) % g.TN != 0)      return "(WN / wniter) % TN != 0";
-    if (g.BS != num_warps * wave)         return "BS != num_warps * wave (BS is derived, not free)";
     if (g.TM * g.TN > g.WM * g.WN / wave) return "TM * TN > WM * WN / wave";
-    if (g.BS > 1024)                    return "BS > 1024";
     if (g.TM % 2 != 0)                  return "TM % 2 != 0";
     if (g.pad >= 0 && g.pad > 4)        return "PAD outside [0,4]";
     if (g.reshape >= 0 && g.reshape != 0 && g.reshape != 1) return "RESHAPE not in {0,1}";

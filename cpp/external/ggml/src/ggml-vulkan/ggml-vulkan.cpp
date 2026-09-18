@@ -20516,6 +20516,7 @@ static const vk_tuned_row_capability_class VK_TUNE_CAPABILITY_CLASSES[] = {
     { "path=scalar but this device has cooperative_matrix (the cm1 buckets own those objects)", false },
     { "path=cm1 but this device resolves matmuls through cm2, so the row's shader would not match the dispatch", false },
     { "path=cm1 but this device does not meet the cm1 conditions (cooperative_matrix, 16x16x16 f16acc, subgroup size control, subgroup in {32,64})", false },
+    { "path=cm1 but the row's fragment shape (TM/TN) is not this device's cooperative_matrix shape", false },
     { "path is neither scalar, cm1 nor cm2", true },
     { "this device uses 64-bit shader indexing; the B1 row path builds only the 32-bit variant", true },
     { "BLOCK_SIZE exceeds maxComputeWorkGroupInvocations", false },
@@ -20552,8 +20553,21 @@ static const char * ggml_vk_tuned_row_capability_reason(const vk_device & device
                    "would not match the dispatch";
         }
         if (!ggml_vk_device_cm1_ok(device)) {
+        // The FRAGMENT SHAPE is a device fact, and this is where it is judged -- not in the shared
+        // geometry table, which must stay answerable without a device (the shell parses rows with
+        // it, and the fingerprint carries no coopmat shape).  The shader declares
+        // coopmat<float16_t, gl_ScopeSubgroup, TM, TN|TK, ...> with the ROW's numbers
+        // (mul_mm.comp:187-192), so a row whose TM/TN is not this device's cooperative-matrix
+        // shape asks the driver for a type it does not implement -- measured 2026-09-18: an
+        // accepted 4x4 fragment made the driver abort with STATUS_INTEGER_DIVIDE_BY_ZERO inside
+        // createComputePipeline.  TK is not on the wire (the row build fills spec id 9 from the
+        // device), so there is nothing to check for it here.
             return "path=cm1 but this device does not meet the cm1 conditions (cooperative_matrix, "
                    "16x16x16 f16acc, subgroup size control, subgroup in {32,64})";
+        }
+        if (r.geom.TM != device->coopmat_m || r.geom.TN != device->coopmat_n) {
+            return "path=cm1 but the row's fragment shape (TM/TN) is not this device's "
+                   "cooperative_matrix shape";
         }
     } else {
         return "path is neither scalar, cm1 nor cm2";
