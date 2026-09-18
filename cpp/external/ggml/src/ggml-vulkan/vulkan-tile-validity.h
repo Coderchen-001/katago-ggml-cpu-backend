@@ -188,8 +188,14 @@ static inline const char * vk_tune_row_family_reason(int src0_type, int src1_typ
                "(only f16xf16 and f16xf32 are wired)";
     }
     if (path == VK_TILE_PATH_CM1) {
-        return "cm1 rows are not wired (no cm1 machine to measure on; refusing beats "
-               "installing an unmeasured geometry)";
+        // NOT a device verdict: this machine can run cm1 (GGML_VK_DISABLE_COOPMAT2=1 selects
+        // it), and what is missing is OUR row path -- the row shader table has no cm1 module,
+        // so a cm1 row would be built from the scalar SPIR-V.  That is a WRONG KERNEL, not a
+        // slow one (G-D1 in tune-gaps.md), and it is why this refusal is worth more than the
+        // install it prevents.
+        return "cm1 rows are not wired in the row path yet (the row shader table has no cm1 "
+               "module, so a cm1 row would be built from the scalar SPIR-V -- G-D1; refusing "
+               "beats installing a wrong kernel)";
     }
     if (path != VK_TILE_PATH_SCALAR && path != VK_TILE_PATH_CM2) {
         return "unknown creation path";

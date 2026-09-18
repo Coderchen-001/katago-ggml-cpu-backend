@@ -1027,6 +1027,11 @@ struct vk_device_struct {
     bool coopmat2;
     bool coopmat2_bf16_support {};
     bool coopmat2_decode_vector;
+    // (cm1-a / G-D3) Which path the matmul OBJECTS are loaded with: `coopmat2 ? CM2 :
+    // coopmat_support ? CM1 : SCALAR`.  It is a property of the OBJECT, not of the bucket -- one
+    // macro per device fills all six slots of a vk_matmul_pipeline in ggml_vk_load_shaders -- so
+    // it is judged once, there, and read by anyone who must name the family a dispatch used.
+    vk_tile_path matmul_path {};
 
     bool dot2_f16 {};
     bool ocp_fp4 {};
@@ -2798,11 +2803,14 @@ static void ggml_vk_t2_line(const std::string & msg) {
 //      relaxed.  R34 pins that this filter stays a REUSE and never grows a condition of its own.
 //   3. One line per distinct pair, capped, so a pathological shape space cannot flood stderr.
 //
-// ⚠️ The POSITIVE direction is not reachable on the hardware we have: a run's path is fixed per
-// device (coopmat2 => cm2, else scalar), so a non-empty `declared` set always sits on the path the
-// run uses -- measured: three precision variants each used exactly ONE family.  This judgment is
-// therefore SILENT BY CONSTRUCTION today.  It goes live the moment a graph uses two or more
-// DECLARABLE families: then a file declaring only one of them must be reported here.
+// ⚠️ The POSITIVE direction is not reachable on the hardware we have: a run's path is ONE device
+// fact -- the family its matmul objects were loaded with (`device->matmul_path`, judged once in
+// ggml_vk_get_device`) -- so a non-empty `declared` set always sits on the path the run uses
+// (measured: three precision variants each used exactly ONE family).  This judgment is therefore
+// SILENT BY CONSTRUCTION today.  It goes live the moment a graph uses two or more DECLARABLE
+// families: then a file declaring only one of them must be reported here.
+// The path is a PARAMETER of this helper and the call sites read that one field, so the label can
+// never disagree with the family the dispatch actually used.
 static void ggml_vk_tuned_row_note_used(ggml_backend_vk_context * ctx, ggml_type src0_type,
                                         ggml_type src1_type, int path) {
     if (ctx->coverage.declared.empty()) {
@@ -4808,6 +4816,17 @@ struct CompileTask {
 // value here without changing them (or vice versa) is red -- no 24-site macro rewrite needed for
 // the mechanical tie, and no silent divergence either way.
 enum vk_tile_kernel_family { VK_TILE_FAMILY_SCALAR = 0, VK_TILE_FAMILY_CM1 = 1, VK_TILE_FAMILY_CM2 = 2 };
+
+// The ONE path -> family mapping (cm1-a / G-D3).  It is a function, not a ternary at each site,
+// because the create flags and any reader of a row's path must agree: a row created with one
+// family's parameters and installed into another family's bucket is exactly the silent
+// divergence R27 exists to catch.  Both cooperative paths are named explicitly -- a path left to
+// the scalar fallback would be handed the scalar family, which is G-D3 written in one line.
+static inline vk_tile_kernel_family ggml_vk_tile_family_of_path(int path) {
+    if (path == VK_TILE_PATH_CM2) { return VK_TILE_FAMILY_CM2; }
+    if (path == VK_TILE_PATH_CM1) { return VK_TILE_FAMILY_CM1; }
+    return VK_TILE_FAMILY_SCALAR;   // VK_TILE_PATH_SCALAR; unknown paths are refused before this
+}
 
 struct vk_tile_kernel_create_flags {
     bool     disable_robustness;
@@ -7995,6 +8014,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
         descriptor_set_layout_create_info.setPNext(&dslbfci);
         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
 
+        // (cm1-a / G-D3) The family the matmul objects are about to be loaded with.  This ladder is
+        // judged HERE and nowhere else: one macro per device fills all six slots of each
+        // vk_matmul_pipeline below, so a reader that re-derives it -- or worse, guesses it from the
+        // branch a dispatch happens to sit in -- would be a second truth.  The coverage leg's path
+        // label reads this field, and I6 is what keeps an installed row's `path` equal to it.
+        device->matmul_path = device->coopmat2      ? VK_TILE_PATH_CM2
+                            : device->coopmat_support ? VK_TILE_PATH_CM1
+                            : VK_TILE_PATH_SCALAR;
         ggml_vk_load_shaders(device);
 
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
@@ -10199,8 +10226,9 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
 
     if (ctx->device->coopmat2) {
         // C5 coverage: everything in this branch dispatches on the CM2 path (the overrides below
-        // are scalar-only).  Recorded at the head, so every return below is covered.
-        ggml_vk_tuned_row_note_used(ctx, src0_type, src1_type, VK_TILE_PATH_CM2);
+        // are scalar-only).  Recorded at the head, so every return below is covered.  The path is
+        // READ from the device field, not spelled here (cm1-a): one label source, no branch truth.
+        ggml_vk_tuned_row_note_used(ctx, src0_type, src1_type, ctx->device->matmul_path);
         const uint32_t shader_core_count = ctx->device->shader_core_count;
         const uint32_t tiles_l = CEIL_DIV(m, mmp->a_l->wg_denoms[0]) * CEIL_DIV(n, mmp->a_l->wg_denoms[1]);
         const uint32_t tiles_m = CEIL_DIV(m, mmp->a_m->wg_denoms[0]) * CEIL_DIV(n, mmp->a_m->wg_denoms[1]);
@@ -10238,11 +10266,14 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         return aligned ? mmp->a_s : mmp->s;
     }
 
-    // Everything below resolves on the SCALAR path -- the cm2 branch above returned otherwise, and
-    // the KATAGO_VK_MM_TILE / custom-tile overrides that follow are scalar-only.  C5 coverage
-    // records it once per (family, path); a tuned-row hit above never reaches here and needs no
-    // record, because a row that matched came from the file and is therefore covered.
-    ggml_vk_tuned_row_note_used(ctx, src0_type, src1_type, VK_TILE_PATH_SCALAR);
+    // Everything below resolves on the NON-cm2 path: the cm2 branch above returned otherwise, and
+    // the KATAGO_VK_MM_TILE / custom-tile overrides that follow are scalar-only.  WHICH family
+    // that is comes from the DEVICE, not from this branch: on a device whose matmul objects are
+    // the cm1 ones (cooperative_matrix without cm2), the buckets resolved below ARE cm1, so
+    // spelling `scalar` here was a wrong label -- cm1-a fixed it by reading the one device field.
+    // C5 coverage records it once per (family, path); a tuned-row hit above never reaches here and
+    // needs no record, because a row that matched came from the file and is therefore covered.
+    ggml_vk_tuned_row_note_used(ctx, src0_type, src1_type, ctx->device->matmul_path);
 
     // KATAGO_VK_MM_TILE: force a specific tile for the scalar (non-coopmat2)
     // path. Probe tool for candidate-0 (mul_mm tile tuning); default off (env
@@ -20608,18 +20639,19 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
                                                vk_tile_wave_for(device->subgroup_size) };
             spec = ggml_vk_scalar_mm_spec(device, std::move(warptile), aligned_variant);
         }
-        // The THREE creation parameters live in one place (t3-shell-plan.md 6.9 item 8).  The cm1
-        // batch will flip kRequireFullSubgroups to true (G-D3: init's cm1 macro ends with
-        // `1, false, true`), and a second copy of these values below would be the copy nobody
-        // updates.  Values are unchanged by this batch.
-        // The create flags come from the ONE table (G-D14 / R1b-3).  The row targets the SCALAR
-        // family, so this yields today's values unchanged: disable_robustness=false,
-        // require_full_subgroups=false.  The required subgroup size goes through the ONE resolver
-        // rather than a local lookup, because this entry does NOT apply the init entry's
+        // The THREE creation parameters live in one place (t3-shell-plan.md 6.9 item 8), and the
+        // family they belong to is DERIVED from the row's own path -- never written here (cm1-a /
+        // G-D3).  Until cm1-a this site said VK_TILE_FAMILY_SCALAR, so a row whose path was cm2 was
+        // created with the SCALAR family's parameters while being installed into a bucket of
+        // another family: two truths about one pipeline, and nothing would have said so.
+        // The create flags come from the ONE table (G-D14 / R1b-3) and the family from the ONE
+        // mapping (ggml_vk_tile_family_of_path).  The required subgroup size goes through the ONE
+        // resolver rather than a local lookup, because this entry does NOT apply the init entry's
         // `0 => name lookup` fallback: resolving it here is what keeps a row and the bucket it
         // shadows on the same rule for every family (cm2 included, where the table says 0).
         const vk_tile_kernel_create_flags kCreateFlags =
-            ggml_vk_tile_create_flags_of(VK_TILE_FAMILY_SCALAR, /*callSiteReqSubgroups=*/0);
+            ggml_vk_tile_create_flags_of(ggml_vk_tile_family_of_path(r.path),
+                                         /*callSiteReqSubgroups=*/0);
         const bool kDisableRobustness      = kCreateFlags.disable_robustness;
         const bool kRequireFullSubgroups   = kCreateFlags.require_full_subgroups;
         const uint32_t kRequiredSubgroup   = ggml_vk_tile_effective_required_subgroup_size(kCreateFlags, sh.name, device->architecture);
