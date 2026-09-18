@@ -188,16 +188,24 @@ static inline const char * vk_tune_row_family_reason(int src0_type, int src1_typ
                "(only f16xf16 and f16xf32 are wired)";
     }
     if (path == VK_TILE_PATH_CM1) {
-        // NOT a device verdict: this machine can run cm1 (GGML_VK_DISABLE_COOPMAT2=1 selects
-        // it), and what is missing is OUR row path -- the row shader table has no cm1 module,
-        // so a cm1 row would be built from the scalar SPIR-V.  That is a WRONG KERNEL, not a
-        // slow one (G-D1 in tune-gaps.md), and it is why this refusal is worth more than the
-        // install it prevents.
-        return "cm1 rows are not wired in the row path yet (the row shader table has no cm1 "
-               "module, so a cm1 row would be built from the scalar SPIR-V -- G-D1; refusing "
-               "beats installing a wrong kernel)";
+        // OUR gap, and a MEASURED one (cm1-b, 2026-09-18).  The row path itself is wired: the
+        // `_cm1` modules are in the row shader table, the spec's TK comes from the device, and
+        // I6 carries the cm1 device conditions -- all three verified on this machine in compat
+        // mode (coopmat_support / coopmat_support_16x16x16_f16acc / subgroup_size_control /
+        // sg=32 are all true; coopmat_m/n/k = 16,16,16).  What is MISSING is the GEOMETRY rule:
+        // every geometry vk_tile_candidate_reason ACCEPTS for cm1 (the scalar-shaped one) makes
+        // the driver abort inside createComputePipeline with STATUS_INTEGER_DIVIDE_BY_ZERO
+        // (0xC0000094 -- measured on two different accepted geometries), while the geometry the
+        // cm1 buckets actually use (TM/TN = the coopmat fragment, BS = num_warps * wave) is
+        // REFUSED by that same table.  "Accepted" and "buildable" therefore do not overlap yet,
+        // and opening this gate would make a driver crash reachable from a cache file.  Next
+        // round: derive the cm1 geometry rules (tune-gaps.md G-A2/G-A3/G-A4) and open THIS gate
+        // in the same commit.
+        return "cm1 rows cannot be built yet: the cm1 GEOMETRY rules are not derived, and every "
+               "geometry the rule table accepts crashes the driver at pipeline creation "
+               "(G-A2/G-A3/G-A4; refusing beats a reachable crash)";
     }
-    if (path != VK_TILE_PATH_SCALAR && path != VK_TILE_PATH_CM2) {
+    if (path != VK_TILE_PATH_SCALAR && path != VK_TILE_PATH_CM1 && path != VK_TILE_PATH_CM2) {
         return "unknown creation path";
     }
     return nullptr;

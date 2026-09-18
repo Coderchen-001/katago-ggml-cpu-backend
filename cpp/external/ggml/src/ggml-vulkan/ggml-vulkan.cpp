@@ -20493,6 +20493,19 @@ static int ggml_vk_tuned_row_targets(const vk_device & device, int src0_type, in
 // The split is DATA (this table), not prose, so a new refusal has to choose a class here, and
 // an unclassified refusal is conservatively treated as OUR GAP (the safe direction: it can then
 // never be written down as a device verdict).
+// The cm1 DEVICE conditions, in ONE place (cm1-b / G-C1 + G-D4).  They are not invented here:
+// this is the device half of conv2d_use_cm1 (GV:6904-6908), which is what decides whether this
+// device takes the cm1 path at all.  conv2d_use_cm1's last condition (`s != CONV_SHAPE_128x128`)
+// is a conv SHAPE, not a device property, so it stays with that caller.  Anything that needs to
+// know "is cm1 a path this device takes" reads THIS, so a row, a bucket and a predicate cannot
+// disagree about it.
+static bool ggml_vk_device_cm1_ok(const vk_device & device) {
+    return !device->coopmat2 &&
+           device->coopmat_support && device->coopmat_support_16x16x16_f16acc &&
+           device->subgroup_size_control &&
+           (device->subgroup_size == 32 || device->subgroup_size == 64);
+}
+
 struct vk_tuned_row_capability_class {
     const char * reason;
     bool our_gap;
@@ -20501,7 +20514,9 @@ static const vk_tuned_row_capability_class VK_TUNE_CAPABILITY_CLASSES[] = {
     { "path=cm2 but this device does not resolve matmuls through cooperative_matrix2", false },
     { "path=scalar but this device resolves matmuls through cm2, so the row's shader would not match the dispatch", false },
     { "path=scalar but this device has cooperative_matrix (the cm1 buckets own those objects)", false },
-    { "path is neither scalar nor cm2", true },
+    { "path=cm1 but this device resolves matmuls through cm2, so the row's shader would not match the dispatch", false },
+    { "path=cm1 but this device does not meet the cm1 conditions (cooperative_matrix, 16x16x16 f16acc, subgroup size control, subgroup in {32,64})", false },
+    { "path is neither scalar, cm1 nor cm2", true },
     { "this device uses 64-bit shader indexing; the B1 row path builds only the 32-bit variant", true },
     { "BLOCK_SIZE exceeds maxComputeWorkGroupInvocations", false },
     { "geometry needs more shared memory than this device has", false },
@@ -20531,8 +20546,17 @@ static const char * ggml_vk_tuned_row_capability_reason(const vk_device & device
         if (device->coopmat_support) {
             return "path=scalar but this device has cooperative_matrix (the cm1 buckets own those objects)";
         }
+    } else if (r.path == VK_TILE_PATH_CM1) {
+        if (device->coopmat2) {
+            return "path=cm1 but this device resolves matmuls through cm2, so the row's shader "
+                   "would not match the dispatch";
+        }
+        if (!ggml_vk_device_cm1_ok(device)) {
+            return "path=cm1 but this device does not meet the cm1 conditions (cooperative_matrix, "
+                   "16x16x16 f16acc, subgroup size control, subgroup in {32,64})";
+        }
     } else {
-        return "path is neither scalar nor cm2";
+        return "path is neither scalar, cm1 nor cm2";
     }
     if (device->shader_64b_indexing) {
         return "this device uses 64-bit shader indexing; the B1 row path builds only the 32-bit variant";
@@ -20570,6 +20594,23 @@ static bool ggml_vk_tuned_row_shader_for(const vk_device & device, int src1_type
         }
         out = f16acc ? ggml_vk_tuned_row_shader { matmul_f16_f16acc_cm2_data, matmul_f16_f16acc_cm2_len, "matmul_f16_f16acc_cm2_tuned_row" }
                      : ggml_vk_tuned_row_shader { matmul_f16_cm2_data,        matmul_f16_cm2_len,        "matmul_f16_cm2_tuned_row" };
+        return true;
+#else
+        return false;
+#endif
+    }
+    if (path == VK_TILE_PATH_CM1) {
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+        // cm1 does NOT go through the dot2 selection below: ggml_vk_load_shaders' cm1 macro
+        // (GV:5552-5562) names the `_cm1` modules unconditionally, so a row that picked dot2
+        // here would be a DIFFERENT kernel than the bucket it shadows -- the two-truths failure
+        // this table exists to prevent.  Both src families and both accumulator variants exist;
+        // like the cm2 branch, this one returns false (a loud drop) when the build has no cm1.
+        out = f16_f16
+            ? (f16acc ? ggml_vk_tuned_row_shader { matmul_f16_f16acc_cm1_data, matmul_f16_f16acc_cm1_len, "matmul_f16_f16acc_cm1_tuned_row" }
+                      : ggml_vk_tuned_row_shader { matmul_f16_cm1_data,        matmul_f16_cm1_len,        "matmul_f16_cm1_tuned_row" })
+            : (f16acc ? ggml_vk_tuned_row_shader { matmul_f16_f32_f16acc_cm1_data, matmul_f16_f32_f16acc_cm1_len, "matmul_f16_f32_f16acc_cm1_tuned_row" }
+                      : ggml_vk_tuned_row_shader { matmul_f16_f32_cm1_data,        matmul_f16_f32_cm1_len,        "matmul_f16_f32_cm1_tuned_row" });
         return true;
 #else
         return false;
@@ -20639,11 +20680,16 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
             // WARP is the device's wave/subgroup size, NOT a constant (t3-shell-plan.md 6.9
             // R1b-2b): stock fills the scalar warptile's WARP field with
             // subgroup_size_8 = max(device->subgroup_size, 8) (GV:4735-4742, :4823-4825).  The row
-            // must put the SAME value in, or the row's `BS` would be validated against one wave and
-            // executed with another.  TK stays pinned at 1 (it is inert on the f16 path, see
-            // vk_tile_axis_class: TK/WARP are fill-ins, not sweep axes).
+            // must put the SAME value in, or the row's `BS` would be validated against one wave
+            // and executed with another.
+            // TK is the one field that differs by PATH (cm1-b / G-D2): the stock cm1 warptile
+            // carries device->coopmat_k (GV:5034-5042), the scalar path ignores spec id 9, and
+            // cm2 has no such field at all.  Pinning 1 for every path handed the cm1 shader a
+            // different constant than the bucket it shadows.  BK is 16 in BOTH stock warptiles,
+            // so it stays a literal.
             std::vector<uint32_t> warptile = { r.geom.BS, r.geom.BM, r.geom.BN, 16u, r.geom.WM, r.geom.WN,
-                                               r.geom.WMITER, r.geom.TM, r.geom.TN, 1u,
+                                               r.geom.WMITER, r.geom.TM, r.geom.TN,
+                                               (r.path == VK_TILE_PATH_CM1 ? device->coopmat_k : 1u),
                                                vk_tile_wave_for(device->subgroup_size) };
             spec = ggml_vk_scalar_mm_spec(device, std::move(warptile), aligned_variant);
         }
