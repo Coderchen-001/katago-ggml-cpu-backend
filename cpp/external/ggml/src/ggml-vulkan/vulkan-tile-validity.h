@@ -188,8 +188,9 @@ static inline const char * vk_tune_row_family_reason(int src0_type, int src1_typ
                "(only f16xf16 and f16xf32 are wired)";
     }
     // cm1 was refused here until cm1-b2.  What justified the refusal was a MEASUREMENT:
-    // the geometry table accepted scalar-shaped rows for cm1, and the shader declares its
-    // coopmat types with the ROW's own TM/TN/TK (mul_mm.comp:187-192), so an accepted but
+    // the geometry table accepted scalar-shaped rows for cm1, and the shader declares its coopmat
+    // types with the ROW's own TM/TN/TK (mul_mm.comp:272-277 -- cache_a/cache_b/sums, fed by the
+    // `for (...; i += TK)` k-loop at :312), so an accepted but
     // unsupported fragment shape made the driver abort with STATUS_INTEGER_DIVIDE_BY_ZERO.
     // The repair is in the two places the crash actually lived: vk_tile_candidate_reason now
     // has a COOPMAT clause set for cm1 (the scalar inner-loop rules do NOT describe it -- the
@@ -272,7 +273,7 @@ static inline const char * vk_tile_candidate_reason(int path, const vk_tile_geom
     // the cm1 branch describe the SCALAR inner loop, which the COOPMAT path does not run:
     // mul_mm.comp computes WNITER and WSUBN in BOTH paths (:178-180), but every USE of them is on
     // the `#else` (scalar) side: WNITER at :280, :289, :338, :372, :442 and WSUBN at :341-344,
-    // :446.  The COOPMAT branch (:182-200) works from cms_per_row / cms_per_col / storestride
+    // :446.  The COOPMAT branch (:182-192) works from cms_per_row / cms_per_col / storestride
     // instead.  And the stock cm1 buckets carry WNITER == 0 while compiling and running every
     // day, so "wniter >= 1" (and the divisibility clauses around it) are rules about SCALAR, not
     // about cm1.
@@ -280,12 +281,19 @@ static inline const char * vk_tile_candidate_reason(int path, const vk_tile_geom
     // 🔴 FRAGILE BY CONSTRUCTION -- read this before changing the shader: WNITER == 0 is safe for
     // cm1 ONLY because nothing on the COOPMAT side uses WSUBN or WNITER, so `WN / WNITER` (:180)
     // is dead code there and the compiler drops it.  If upstream ever uses WSUBN or WNITER inside
-    // a COOPMAT branch, the "wniter >= 1" rule MUST come back for cm1 -- otherwise the next
-    // geometry class gets accepted here and divides by zero in the driver (measured, cm1-b).
+    // a COOPMAT branch, the "wniter >= 1" rule MUST come back for cm1 -- and so must WMITER as a
+    // real axis: it reaches this path ONLY through WSUBM/WNITER, so cm1 currently enumerates an
+    // axis the COOPMAT shader never reads (every other WMITER use is on the `#else` side too).
+    // What backs the clause above is an INFERENCE plus a daily-running fact -- the stock cm1
+    // buckets carry wniter == 0 and compile and run, i.e. the backend drops the dead
+    // `WN / WNITER` -- NOT a measurement of this hazard: every cm1 row the old table ACCEPTED
+    // had wniter >= 1 (2 and 8 in the two crashing fixtures), so that division never executed.
+    // The cm1-b crash was a DIFFERENT clause: the fragment shape, now refused by I6 and pinned
+    // by the smoke leg A3k.
     //
     // What cm1 DOES need is the array arithmetic the COOPMAT branch really performs:
     // cms_per_row = WM / TM, cms_per_col = WN / TN, storestride =
-    // WARP / TM, and the type declarations coopmat<..., TM, TN|TK, ...> (:187-192) -- all of
+    // WARP / TM, and the type declarations coopmat<..., TM, TN|TK, ...> (:272-277) -- all of
     // which want a non-zero fragment per warp, i.e. WM >= TM and WN >= TN.
     // The FRAGMENT SHAPE ITSELF (TM/TN == this device's cooperative-matrix shape) is a DEVICE
     // property, so I6 refuses it, not this table: the table must stay answerable without a
