@@ -357,6 +357,54 @@ struct vk_tuned_row_table {
     }
 };
 
+// ---------------------------------------------------------------------------
+// C5 coverage leg (t3-shell-plan.md section 6.10; cache-identity-census.md section 5):
+// "the (family, path) the graph ACTUALLY used must be a subset of what the installed file
+// DECLARES".  The existing leg runs the other way (every declared row must be hit); this is its
+// complement, and the pair is what makes a cache honest in BOTH directions.
+//
+// Why it lives in the backend: the shell parses the file and validates each row against the rule
+// table for the path the FILE declares, but it never learns which path a dispatch took -- that is
+// decided by the branch that resolves the pipeline (ggml_vk_guess_matmul_pipeline).  Recording it
+// anywhere else would mean re-deriving the selection rule in a second place, which is the "two
+// truths" defect this project keeps paying for.
+//
+// The key is (family, path) -- NOT acc: within one run the accumulator is decided uniformly by
+// prec (measured: three precision variants each produced exactly one family), and changing it
+// changes the IDENTITY (KATAGO_VK_MMPREC_F32 is a POLICY knob; a useFP16 request lives in the mode
+// segment), so it addresses a different file.  IF acc ever becomes per-node inside one run, this
+// key must gain an acc dimension; the negative smoke leg pins the exact key text, so that cannot
+// happen silently.
+struct vk_tuned_coverage {
+    // Keys are "<family>|<path>".  std::map is used as a set so this file needs no new include.
+    std::map<std::string, bool> declared;     // filled by the install, before the first query
+    std::map<std::string, bool> used_logged;  // gaps already reported (one line per distinct pair)
+    int gaps = 0;                             // capped: a pathological shape space must not flood
+};
+
+static inline const char * ggml_vk_tile_path_name(int path) {
+    if (path == VK_TILE_PATH_CM2)    return "cm2";
+    if (path == VK_TILE_PATH_CM1)    return "cm1";
+    if (path == VK_TILE_PATH_SCALAR) return "scalar";
+    return "unknown";
+}
+
+// The ONE source for a family's name: the T2 family line and the coverage key are both built from
+// this, so the log and the key can never disagree about which family a dispatch belonged to.
+static inline const char * ggml_vk_matmul_family_name(ggml_type src0_type, ggml_type src1_type) {
+    if (src0_type == GGML_TYPE_F16  && src1_type == GGML_TYPE_F16) return "matmul_f16";
+    if (src0_type == GGML_TYPE_F16  && src1_type == GGML_TYPE_F32) return "matmul_f16_f32";
+    if (src0_type == GGML_TYPE_F32  && src1_type == GGML_TYPE_F32) return "matmul_f32";
+    if (src0_type == GGML_TYPE_F32  && src1_type == GGML_TYPE_F16) return "matmul_f32_f16";
+    if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_BF16) return "matmul_bf16";
+    return "other";
+}
+
+static inline std::string ggml_vk_coverage_key(ggml_type src0_type, ggml_type src1_type, int path) {
+    return std::string(ggml_vk_matmul_family_name(src0_type, src1_type))
+         + "|" + ggml_vk_tile_path_name(path);
+}
+
 struct vk_matmul_pipeline_struct {
     vk_pipeline l, m, s;
     vk_pipeline a_l, a_m, a_s;
@@ -2585,6 +2633,11 @@ struct ggml_backend_vk_context {
     // Installed by ggml_backend_vk_tune_install_rows(); empty in production today.
     vk_tuned_row_table tuned;
 
+    // C5: the coverage leg's bookkeeping -- what the installed file DECLARES and which
+    // (family, path) pairs were already reported as uncovered.  It sits next to the row table
+    // because it is the same feature's state, and per CONTEXT for the same reason the table is.
+    vk_tuned_coverage coverage;
+
     // T3 per-context ordinal, assigned once at construction (t3-shell-plan.md section
     // 9.1 R7).  Two contexts on the SAME device both report ctx->name == "Vulkan0", so
     // the install/query/frozen log lines would be indistinguishable -- and the T2
@@ -2727,6 +2780,55 @@ static void ggml_vk_t3_line(const std::string & msg) {
 }
 static void ggml_vk_t2_line(const std::string & msg) {
     ggml_vk_evidence_line("ggml_vulkan: [T2] " + msg);
+}
+
+// C5: record the (family, path) a dispatch really resolved to, and report it ONCE when the
+// installed rows do not cover it.  THREE guards, each load-bearing:
+//
+//   1. `declared` must be non-empty.  With no rows installed there is nothing to cover, and the
+//      default path has to stay SILENT: without this guard a run with no cache would print up to
+//      eight "coverage gap" lines and NOTHING would count them (every smoke counter is
+//      prefix-anchored), i.e. a green error.  Ordering: the install fills `declared` and by
+//      contract precedes the first query; this guard makes a violation HARMLESS (one missed
+//      record) instead of STICKY (a false gap that dedup would keep forever).
+//   2. Only pairs a file could EVER declare are compared -- the SAME predicate the installer uses
+//      (`vk_tune_row_family_reason`) plus its q8_1 refusal.  Without it, a family no row can cover
+//      (the mmq/q8_1 path) would report a gap forever: noise, and noise is how a check gets
+//      relaxed.  R34 pins that this filter stays a REUSE and never grows a condition of its own.
+//   3. One line per distinct pair, capped, so a pathological shape space cannot flood stderr.
+//
+// ⚠️ The POSITIVE direction is not reachable on the hardware we have: a run's path is fixed per
+// device (coopmat2 => cm2, else scalar), so a non-empty `declared` set always sits on the path the
+// run uses -- measured: three precision variants each used exactly ONE family.  This judgment is
+// therefore SILENT BY CONSTRUCTION today.  It goes live the moment a graph uses two or more
+// DECLARABLE families: then a file declaring only one of them must be reported here.
+static void ggml_vk_tuned_row_note_used(ggml_backend_vk_context * ctx, ggml_type src0_type,
+                                        ggml_type src1_type, int path) {
+    if (ctx->coverage.declared.empty()) {
+        return;                                                   // guard 1
+    }
+    if (vk_tune_row_family_reason((int) src0_type, (int) src1_type, path) != nullptr) {
+        return;                                                   // guard 2, reused predicate
+    }
+    if (src1_type == GGML_TYPE_Q8_1) {
+        return;                                                   // guard 2, the installer's I5
+    }
+    const std::string key = ggml_vk_coverage_key(src0_type, src1_type, path);
+    if (ctx->coverage.declared.find(key) != ctx->coverage.declared.end()) {
+        return;                                                   // covered -- nothing to say
+    }
+    if (ctx->coverage.used_logged.find(key) != ctx->coverage.used_logged.end()
+        || ctx->coverage.gaps >= 8) {
+        return;                                                   // guard 3
+    }
+    ctx->coverage.used_logged[key] = true;
+    ctx->coverage.gaps++;
+    std::string decl;
+    for (const auto & kv : ctx->coverage.declared) {
+        decl += (decl.empty() ? "" : ",") + kv.first;
+    }
+    ggml_vk_t3_line("coverage gap: " + key + " is used by this graph but the installed rows "
+                    "declare only {" + decl + "} (those shapes fall back to stock)");
 }
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -8639,12 +8741,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         if (ctx->t2.family_logged.find(key) == ctx->t2.family_logged.end() && ctx->t2.family_logged.size() < 8) {
             ctx->t2.family_logged[key] = true;
             const bool acc_f16 = ggml_vk_prefers_f16acc(ctx->device, prec);
-            const char* fam = "other";
-            if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F16) fam = "matmul_f16";
-            else if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) fam = "matmul_f16_f32";
-            else if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) fam = "matmul_f32";
-            else if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F16) fam = "matmul_f32_f16";
-            else if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_BF16) fam = "matmul_bf16";
+            const char* fam = ggml_vk_matmul_family_name(src0_type, src1_type);
             ggml_vk_t2_line("matmul family: src0=" + std::string(ggml_type_name(src0_type))
                             + " src1=" + ggml_type_name(src1_type)
                             + " prec=" + std::to_string((int) prec)
@@ -10089,6 +10186,9 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     const bool mm_s = is_q8_1 ? ctx->device->mul_mat_s_int[src0_type] : ctx->device->mul_mat_s[src0_type];
 
     if (ctx->device->coopmat2) {
+        // C5 coverage: everything in this branch dispatches on the CM2 path (the overrides below
+        // are scalar-only).  Recorded at the head, so every return below is covered.
+        ggml_vk_tuned_row_note_used(ctx, src0_type, src1_type, VK_TILE_PATH_CM2);
         const uint32_t shader_core_count = ctx->device->shader_core_count;
         const uint32_t tiles_l = CEIL_DIV(m, mmp->a_l->wg_denoms[0]) * CEIL_DIV(n, mmp->a_l->wg_denoms[1]);
         const uint32_t tiles_m = CEIL_DIV(m, mmp->a_m->wg_denoms[0]) * CEIL_DIV(n, mmp->a_m->wg_denoms[1]);
@@ -10125,6 +10225,12 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         }
         return aligned ? mmp->a_s : mmp->s;
     }
+
+    // Everything below resolves on the SCALAR path -- the cm2 branch above returned otherwise, and
+    // the KATAGO_VK_MM_TILE / custom-tile overrides that follow are scalar-only.  C5 coverage
+    // records it once per (family, path); a tuned-row hit above never reaches here and needs no
+    // record, because a row that matched came from the file and is therefore covered.
+    ggml_vk_tuned_row_note_used(ctx, src0_type, src1_type, VK_TILE_PATH_SCALAR);
 
     // KATAGO_VK_MM_TILE: force a specific tile for the scalar (non-coopmat2)
     // path. Probe tool for candidate-0 (mul_mm tile tuning); default off (env
@@ -20609,6 +20715,9 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
     // 2 variants x 2 accumulator targets = 4 per context -- one row is one geometry pair and
     // carries both align variants, not a family of geometries (t3-shell-plan.md 6.9).
     unsigned pipes_created = 0;
+    // C5: the (family, path) pairs this file really DECLARES -- i.e. the rows that installed.
+    // The SAME key function the used-side uses, so the two sets are comparable by construction.
+    std::map<std::string, bool> declared_keys;
     for (size_t i = 0; i < n_rows; i++) {
         const vk_tune_row_spec & r = rows[i];
 
@@ -20710,6 +20819,8 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
             }
             pending[targets[t].get()].push_back(row);
             installed_anywhere = true;
+            declared_keys[ggml_vk_coverage_key((ggml_type) r.src0_type, (ggml_type) r.src1_type,
+                                               r.path)] = true;
             targets_built++;
         }
         if (!installed_anywhere) {
@@ -20750,6 +20861,19 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
                     + " variant-failed=" + std::to_string(d_variant)
                     + " pipes=" + std::to_string(pipes_created)
                     + (declared == 0 ? " (empty set is the 1b-2b production form)" : ""));
+
+    // C5: announce the declared coverage ONCE per context, and ONLY when something installed --
+    // a file that installed nothing declares nothing, so the coverage leg stays silent for it
+    // (the used-side's "declared is non-empty" guard then suppresses every gap too).  Whole-set
+    // replacement, matching the row table's own contract.
+    if (!declared_keys.empty()) {
+        std::string decl;
+        for (const auto & kv : declared_keys) {
+            decl += (decl.empty() ? "" : ",") + kv.first;
+        }
+        ctx->coverage.declared = declared_keys;
+        ggml_vk_t3_line("coverage declared (" + ggml_vk_tune_ctx_tag(ctx) + "): " + decl);
+    }
 
     // A file that installs nothing at all is the "user set it and nothing happened" case
     // (lesson #46): per-row lines exist, but nobody greps counts to discover that the
