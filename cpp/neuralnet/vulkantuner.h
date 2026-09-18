@@ -97,15 +97,27 @@ namespace VulkanTuner {
     int deviceIdx = 0;
     std::string deviceName;
     std::string fingerprint;      // full device/driver fingerprint (cache header identity)
-    std::string deviceFile;       // sha256(fingerprint)[0:16].txt  (filename-safe, section 1)
+    // The cache lives TWO LEVELS down, and the PATH is a pure function of the key -- never a
+    // directory listing or a trial read, because that would trade routing for guessing (and could
+    // pick up another key's file):
+    //   <homeDataDir>/vulkan-tune/<device16>-mv<modelVer>-sha<model16>-m<mode16>/<S>x<Y>-mb<n>.txt
+    // The DIRECTORY holds what IDENTIFIES the cache (device, model, mode: stable across a sweep);
+    // the FILE holds the two segments a sweep varies, so `benchmark -threads 1,2,4` shows its
+    // buckets side by side instead of scattering them, and deleting one directory re-tunes exactly
+    // one (device, model, mode).  Version and policy are deliberately NOT in the path: they are
+    // the header's business, and putting them here would orphan every file on every bump.
+    std::string deviceFile;       // the FILE segment only: "<S>x<Y>-mb<n>.txt" (filename-safe)
     // The USER-FACING precision mode, as an identity string ("fp16=auto").  Its sha16 goes into
-    // the file NAME (one mode = one file, and a FUTURE dimension appends to this string without
+    // the directory NAME (one mode = one file, and a FUTURE dimension appends to this string without
     // lengthening the name); the raw string goes into the header, so a hand-renamed or
     // cross-machine-copied file is refuted by its own contents instead of being trusted because
     // its path looks right.  Produced by modeString() -- the ONE producer -- never spelled out
     // at a call site, or the name and the header could disagree.
     std::string modeString;
-    std::string cacheDir;         // <homeDataDir>/vulkan-tune
+    std::string cacheDir;         // <homeDataDir>/vulkan-tune/<device16>-mv<ver>-sha<model16>-m<mode16>
+                                  // Created at WRITE time, not when the decision is taken: "nothing
+                                  // decided => nothing written" has to include the directory, or a
+                                  // no-op run would still leave a new path behind (A30 asserts it).
     std::string cachePath;        // cacheDir + "/" + deviceFile (may not exist yet)
     bool cacheFileExists = false;
     // The rest of the cache's outer key (t1-schema.md section 4): the same device can hold

@@ -417,6 +417,56 @@ namespace VulkanTuner {
       return false;
     }
 
+    // ---- the KIND registry and the completeness gate (C4) --------------------------------
+    // A cache file is a statement about the WHOLE key, so it may only be written when every kind
+    // this identity can select for has a CONCLUSION in this decision: rows this process really
+    // installed, or a structural all-reject.  The alternative -- writing the kinds decided so far
+    // and merging the rest in later -- is exactly the read-modify-write the ruling forbids: it
+    // needs a partial write, a read-back, or a "keep the old rows" rule, and every one of those
+    // makes "the file exists" mean less than it says.
+    //
+    // The kind SET is a function of the IDENTITY, not of the run: KATAGO_VK_FA* is a POLICY knob,
+    // so toggling it changes the identity (POLICY is in the header) and one identity never
+    // alternates between "mm only" and "mm+fa".  What CAN differ is which kinds a single run
+    // concluded (a split `-tune`, or a later per-kind pass), and that is what this gate refuses.
+    //
+    // TODAY there is exactly one kind, and its conclusion predicate is `cacheEntryWritable`'s, so
+    // this gate is deliberately REDUNDANT: it lands before the second kind exists precisely so
+    // that adding one cannot be done without a rule here.  A kind with no arm below is an INTERNAL
+    // error and refuses the write loudly -- "treat it as concluded" is the one behaviour that
+    // would turn the whole rule into a decoration.
+    struct TuneKindSpec {
+      const char* name;
+    };
+    const TuneKindSpec TUNE_KINDS[] = {
+      { "mm" },   // matmul rows: the only kind this tuner can produce so far (FA adds a row)
+    };
+
+    // The name of the first declared kind that has NO conclusion, or nullptr when complete.
+    // `internal` separates "this measurement is partial" (a legitimate state, and the caller says
+    // so) from "this build has no rule for that kind" (a defect): both refuse the write.
+    const char* firstUnconcludedKind(const Decision & d, bool & internal) {
+      internal = false;
+      for (const TuneKindSpec & k : TUNE_KINDS) {
+        const string name(k.name);
+        if (name == "mm") {
+          if (!cacheEntryWritable(d)) {
+            return k.name;
+          }
+        }
+        else {
+          internal = true;
+          return k.name;
+        }
+      }
+      return nullptr;
+    }
+
+    bool allKindsConcluded(const Decision & d) {
+      bool internal = false;
+      return firstUnconcludedKind(d, internal) == nullptr;
+    }
+
     // The probe face belongs to the backend (KATAGO_VK_T2_PROBE, bit 8 = the tuned-row surface,
     // which includes its validator self-test).  The shell reads the SAME variable with the SAME
     // grammar -- `all` or a base-10 bitmask, see vk_t2_probe's comment -- so one env asks both
@@ -1097,6 +1147,36 @@ namespace VulkanTuner {
             "load as 'this key is already decided')";
       return false;
     }
+    if (!allKindsConcluded(d)) {
+      // The completeness gate (C4).  The message names the KIND, because "the file was not
+      // written" is not actionable on its own: a partial measurement is a legitimate state that
+      // the next run fixes, while a kind with no rule is a defect in this build.
+      bool internal = false;
+      const char* missing = firstUnconcludedKind(d, internal);
+      const string kindName = missing != nullptr ? missing : "?";
+      err = internal
+        ? ("internal: no conclusiveness rule for kind '" + kindName + "' (a declared kind with no "
+           "rule would make the completeness gate a decoration, so the write is refused)")
+        : ("the decision is incomplete: kind '" + kindName + "' has no conclusion (no rows and no "
+           "structural all-reject), and a cache file states the WHOLE key -- writing only the "
+           "kinds decided so far would silently drop the rest, so nothing is written");
+      return false;
+    }
+    // The per-key directory is created HERE and nowhere else, so that "nothing was decided =>
+    // nothing is written" covers the directory too (A30 asserts the whole key path is absent).
+    // The store ROOT is created when the decision is taken, so ONE level is enough -- which is
+    // exactly what MakeDir::make does: it throws when the parent is missing and returns quietly
+    // when the directory already exists.
+    const size_t lastSlash = d.cachePath.find_last_of("/\\");
+    if (lastSlash != string::npos && lastSlash > 0) {
+      try {
+        MakeDir::make(d.cachePath.substr(0, lastSlash));
+      }
+      catch (const std::exception& e) {
+        err = string("cannot create the cache directory: ") + e.what();
+        return false;
+      }
+    }
     // WRITE-PATH: cache
     try {
       return writeFileAtomic(d.cachePath, formatRowsFile(d), err);
@@ -1443,35 +1523,45 @@ namespace VulkanTuner {
           : d->fingerprint.substr(at + 6, (end == string::npos ? d->fingerprint.size() : end) - (at + 6));
       }
 
-      // ONE FILE = ONE KEY: the file name carries the whole outer key, so "re-tune" is a
-      // whole-file overwrite rather than a read-modify-write, and a `benchmark -threads
-      // 1,2,4` sweep keeps every bucket's rows instead of only the last one's.  The header
-      // still holds the same key as the AUTHORITY (a hand-renamed or cross-machine-copied
-      // file is caught there); the two cannot drift because both come from this Decision.
-      // The model NAME is deliberately absent from the name -- it can contain characters a
-      // filesystem dislikes, and it is redundant with the sha for routing.
+      // ONE FILE = ONE KEY, IN TWO LEVELS: the PATH is a pure function of the key.  Never a
+      // directory listing and never a trial read -- that would trade routing for guessing, and it
+      // could pick up another key's file.  The split follows LIFETIMES: the directory holds what
+      // IDENTIFIES the cache (device, model version+sha, mode), the file holds the two segments a
+      // sweep varies (S and mb), so `benchmark -threads 1,2,4` keeps its three buckets side by
+      // side instead of scattering them, and "re-tune" is still a whole-file overwrite rather than
+      // a read-modify-write.  Version and policy are deliberately NOT in the path: they are the
+      // header's business, and putting them here would orphan every file on every bump (and on
+      // every POLICY change, which today is every rebuild).
+      // The model NAME is deliberately absent -- it can contain characters a filesystem dislikes,
+      // and it is redundant with the sha for routing.
       // The MODE segment is a hash (not the readable string) for the same reason the model segment
-      // is a sha: the name stays a FIXED ~74 characters however many mode dimensions are added
-      // later, while the header keeps the readable value that can refute the name.
-      d->deviceFile = shortHash(d->fingerprint) + "-" + model.fileTag() + "-"
-                    + std::to_string(nnXLen) + "x" + std::to_string(nnYLen)
-                    + "-mb" + std::to_string(maxBatchSize)
-                    + "-m" + shortHash(d->modeString) + ".txt";
-      d->cacheDir = HomeData::getHomeDataDir(true, homeDataDirOverride) + "/vulkan-tune";
-      MakeDir::make(d->cacheDir);
+      // is a sha: the path keeps a FIXED shape however many mode dimensions are added later, while
+      // the header keeps the readable value that can refute it.
+      const string cacheRoot = HomeData::getHomeDataDir(true, homeDataDirOverride) + "/vulkan-tune";
+      // The ROOT is created here -- it is the STORE, not one cache entry, and the self-test below
+      // plants its probe in it.  The PER-KEY directory is created by the write path instead, so a
+      // run that concluded nothing leaves no new path behind at all.
+      MakeDir::make(cacheRoot);
+      d->cacheDir = cacheRoot + "/" + shortHash(d->fingerprint) + "-" + model.fileTag()
+                  + "-m" + shortHash(d->modeString);
+      d->deviceFile = std::to_string(nnXLen) + "x" + std::to_string(nnYLen)
+                    + "-mb" + std::to_string(maxBatchSize) + ".txt";
       d->cachePath = d->cacheDir + "/" + d->deviceFile;
       d->cacheFileExists = FileUtils::exists(d->cachePath);
       d->hasPipelineCacheBytes = pipelineCacheBytesBefore(d->pipelineCacheBytesBefore);
 
       // Step 3-4's self-check, once per process, under the backend's probe bit 8.  It runs HERE
-      // because it needs a real cache directory (to prove nothing was written into it) and the
-      // resolved policy; it is deliberately before the load decides anything, so its line always
-      // precedes the decision line in the log (order is what makes a two-line story readable).
+      // because it needs a REAL directory to prove nothing was written into it and the resolved
+      // policy; it is deliberately before the load decides anything, so its line always precedes
+      // the decision line in the log (order is what makes a two-line story readable).
+      // The directory it gets is the STORE ROOT, not the per-key one: the per-key directory is a
+      // write-path side effect now, and a self-test that created it would defeat exactly that
+      // (it would also make its own "nothing appeared" assertion partly self-fulfilling).
       if (t2ProbeBit8()) {
         static std::atomic<bool> selfTested {false};
         bool expected = false;
         if (selfTested.compare_exchange_strong(expected, true)) {
-          cacheWriteSelfTest(policy, d->cacheDir);
+          cacheWriteSelfTest(policy, cacheRoot);
         }
       }
 
