@@ -4608,6 +4608,56 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
     return supported;
 }
 
+// Shared memory for the COOPMAT (cm1) variant of mul_mm.comp.  This is a DIFFERENT layout from the
+// float load buffers ggml_vk_matmul_shmem_support models, so it does not call it -- every term is
+// read off the shader and cited where it is declared:
+//   BK             mul_mm.comp:113-115  `#if defined(DATA_A_F32) || defined(DATA_A_F16)` /
+//                                       `#define BK 32`.  The f16 (non-quant) variant has no
+//                                       constant_id=3 at all, so the row's BK field is DECORATIVE
+//                                       here and 32 is what got compiled.
+//   SHMEM_STRIDE   mul_mm.comp:135      `#define SHMEM_STRIDE (BK / 2 + SHMEM_STRIDE_PAD)`
+//   load buffers   mul_mm.comp:137-138  `shared FLOAT_TYPEV2 buf_a[BM * SHMEM_STRIDE]` and
+//                                       `buf_b[BN * SHMEM_STRIDE]`, FLOAT_TYPEV2 = 2*FLOAT_TYPE
+//   NUM_WARPS      mul_mm.comp:140      `#define NUM_WARPS (BLOCK_SIZE / WARP)` -- so the shader's
+//                                       own count is BS/wave, the same number the geometry table
+//                                       already pins through `BS == num_warps * wave`
+//   coopmat_stage  mul_mm.comp:143      `shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS]`,
+//                                       ACC_TYPE = f16acc ? float16_t : float
+//                                       (vulkan-shaders-gen.cpp:472)
+// APPLY_SLM_A_RESHAPE is deliberately NOT a term, and that is a checkable statement rather than an
+// omission: it changes a_shmem_index/a_shmem_stride (mul_mm_funcs.glsl:2-14), i.e. WHERE a row is
+// written, not the declared sizes above.
+//
+// WHY THIS CANNOT JUST EXTEND ggml_vk_matmul_shmem_support: that one derives its per-row slot from
+// warptile[3], which for the f16 family is the MMQ layout's 16 (warptile_mmq) and under-states this
+// layout by 40% (measured: the stock cm1 l bucket is 22528 bytes, that expression gives 12544).
+// The init path only LOOKS right because it passes *_warptile_mmq, where BK really is 32.
+//
+// SHMEM_STRIDE_PAD is spec id 12 (mul_mm.comp:122), whose shader default is 4 -- NOT the scalar
+// path's compile-time 1 (mul_mm.comp:132).  What reaches a cm1 pipeline is decided by
+// ggml_vk_scalar_mm_spec (:4884-4896) and is GLOBAL, never per row: the Intel-proprietary coopmat
+// case hardcodes 0 (:4886-4889), otherwise the KATAGO_VK_MM_TILE=custom: dev knob if it set one
+// (:4890-4894), and the shader default 4 if it did not.  Reading it here is what keeps this
+// estimate from disagreeing with the stride the pipeline was really built with.
+//
+// Precondition (the same one the I6 caller documents): the geometry already passed
+// vk_tile_candidate_reason, so BM/BN/WM/WN/BS are non-zero.  `wave` is never 0 by construction
+// (vk_tile_wave_for), so the division below cannot trap.
+static uint32_t ggml_vk_cm1_row_shmem(const vk_device & device, const vk_tile_geometry & g,
+                                      uint32_t wave, uint32_t acc_size) {
+    const uint32_t bk_eff = 32u;                       // mul_mm.comp:113-115
+    const uint32_t pad_eff = (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
+                              device->driver_id == vk::DriverId::eIntelProprietaryWindows)
+                                 ? 0u
+                                 : (mm_spec_pad >= 0 ? (uint32_t) mm_spec_pad : 4u);
+    const uint32_t stride = bk_eff / 2u + pad_eff;     // mul_mm.comp:135
+    const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
+    const uint32_t load_bufs = (g.BM + g.BN) * stride * 2u * type_size;   // mul_mm.comp:137-138
+    const uint32_t num_warps = g.BS / wave;                               // mul_mm.comp:140
+    const uint32_t stage = g.TM * g.TN * num_warps * acc_size;            // mul_mm.comp:143
+    return load_bufs + stage;
+}
+
 // Shmem usage for the q8_1 mmq shader (mul_mmq.comp), which uses
 // block_a_cache / block_b_cache layouts (see mul_mmq_shmem_types.glsl) rather
 // than the float load buffers checked by ggml_vk_matmul_shmem_support.
@@ -10102,13 +10152,26 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
     // Axis classification is a pure table; assert one ENUMERABLE, one DERIVED, one
     // PINNED and the scalar-vs-cm1 PAD difference, so a future edit to the table is
     // caught here instead of showing up as enumerator behaviour.
+    //
+    // cm1-c updated this: cm1's SPEC_PAD was ENUMERABLE here and is INERT now.  The reason is
+    // in vulkan-tile-validity.h's case body -- the row's PAD is wired to nothing on BOTH paths,
+    // so sweeping it would emit N identical rows.  Two executors of one truth is deliberate:
+    // the same claims are `static_assert`s next to the table (compile time, unskippable), and
+    // this one is the copy that a T2 probe line can SHOW.  That half was missing until now --
+    // this self-test printed `axis classes=FAILED` in every leg of the cm1-c smoke run and no
+    // check was reading it (the smoke's A3o check was added for exactly that).
     const bool axes_ok =
-        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_BM)       == VK_TILE_AXIS_ENUMERABLE &&
-        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_BS)       == VK_TILE_AXIS_DERIVED &&
-        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_WARP)     == VK_TILE_AXIS_PINNED &&
-        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_INERT &&
-        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_ENUMERABLE &&
-        vk_tile_axis_class(VK_TILE_PATH_CM2,    VK_TILE_AXIS_SMALLER)  == VK_TILE_AXIS_ENUMERABLE;
+        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_BM)         == VK_TILE_AXIS_ENUMERABLE &&
+        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_BS)         == VK_TILE_AXIS_DERIVED &&
+        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_WARP)       == VK_TILE_AXIS_PINNED &&
+        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_SPEC_PAD)   == VK_TILE_AXIS_INERT &&
+        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_WMITER)     == VK_TILE_AXIS_ENUMERABLE &&
+        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_SPEC_PAD)   == VK_TILE_AXIS_INERT &&
+        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_INERT &&
+        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_WMITER)     == VK_TILE_AXIS_INERT &&
+        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_BK)         == VK_TILE_AXIS_INERT &&
+        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_TM)         == VK_TILE_AXIS_ENUMERABLE &&
+        vk_tile_axis_class(VK_TILE_PATH_CM2,    VK_TILE_AXIS_SMALLER)    == VK_TILE_AXIS_ENUMERABLE;
 
     // Row matching rule (t3-shell-plan.md K1, sentinel semantics).  Pure function on
     // local rows: no ctx state is touched, so this cannot influence selection.
@@ -20579,11 +20642,34 @@ static const char * ggml_vk_tuned_row_capability_reason(const vk_device & device
         return "BLOCK_SIZE exceeds maxComputeWorkGroupInvocations";
     }
     if (r.path == VK_TILE_PATH_SCALAR) {
-        // The same check the init path runs before creating a warptile bucket.
+        // The same check the init path runs before creating a warptile bucket.  WARP comes from the
+        // device through vk_tile_wave_for, exactly as the init path fills warptile[10] from
+        // subgroup_size_8 (ggml-vulkan.cpp:4735-4742): hardcoding 32 here would be a second,
+        // silently device-independent truth about the same warptile.  (It is inert for a scalar
+        // row today -- I6 already refused `scalar` on a device with cooperative_matrix, which is
+        // what makes ggml_vk_matmul_shmem_support read `warps` at all -- but "inert today" is not
+        // a reason to leave two answers in the file.)
         const std::vector<uint32_t> warptile = { r.geom.BS, r.geom.BM, r.geom.BN, 16u,
                                                  r.geom.WM, r.geom.WN, r.geom.WMITER,
-                                                 r.geom.TM, r.geom.TN, 1u, 32u };
+                                                 r.geom.TM, r.geom.TN, 1u,
+                                                 vk_tile_wave_for(device->subgroup_size) };
         if (!ggml_vk_matmul_shmem_support(device, warptile, false, GGML_TYPE_F16)) {
+            return "geometry needs more shared memory than this device has";
+        }
+    } else if (r.path == VK_TILE_PATH_CM1) {
+        // cm1 runs the COOPMAT variant, which is not the layout ggml_vk_matmul_shmem_support
+        // describes (:4551-4609 models the float load buffers with the warptile's BK, a field the
+        // f16 COOPMAT shader does not read), so it gets its own estimate.  Until cm1-c nothing
+        // checked shared memory at all on this path.
+        //
+        // acc_size is the LARGEST accumulator this device will actually build for the row:
+        // CREATE_MM2 (:5565-5571) creates an f16acc AND an f32acc pipeline when the device supports
+        // them.  The refusal below is a DEVICE verdict (see VK_TUNE_CAPABILITY_CLASSES), so it must
+        // not be pessimistic about a variant this device does not create.
+        const uint32_t acc_size = device->coopmat_acc_f32_support ? (uint32_t) sizeof(float)
+                                                                 : (uint32_t) sizeof(ggml_fp16_t);
+        if (ggml_vk_cm1_row_shmem(device, r.geom, vk_tile_wave_for(device->subgroup_size),
+                                  acc_size) > device->properties.limits.maxComputeSharedMemorySize) {
             return "geometry needs more shared memory than this device has";
         }
     }

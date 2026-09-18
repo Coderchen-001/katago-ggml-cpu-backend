@@ -299,8 +299,30 @@ static inline const char * vk_tile_candidate_reason(int path, const vk_tile_geom
     // property, so I6 refuses it, not this table: the table must stay answerable without a
     // device (the shell parses rows with it, and the fingerprint carries no coopmat shape).
     if (path == VK_TILE_PATH_CM1) {
-        if (g.BK != 16) {
-            return "cm1: BK != 16 (the f16 coopmat path; the row build pins spec id 3 to 16)";
+        // BK on the wire is SYNTAX ONLY here: the f16 COOPMAT variant compiles `#define BK 32`
+        // (mul_mm.comp:113-115) and has no constant_id=3, so the row's BK is not read at all.
+        // Both spellings stay legal because {16,32} is what the wire and the stock cm1 warptiles
+        // actually use, and refusing 16 would refuse rows that are fine.  (cm2 is the opposite
+        // case: that spec really is {BLOCK_SIZE, BM, BN, BK, smaller}.)
+        if (g.BK != 16 && g.BK != 32) {
+            return "cm1: BK outside {16, 32} (wire syntax only: the f16 coopmat shader compiles "
+                   "#define BK 32 and does not read the row's BK)";
+        }
+        // PAD / RESHAPE are refused LOUDLY unless they name the value the shader will really run
+        // with, because a row carrying a DIFFERENT value would be a silent no-op: spec 12/13 are
+        // filled from the global mm_spec_pad / mm_spec_reshape (ggml-vulkan.cpp:2406-2407,
+        // :4890-4894) and the row's own fields have no reader anywhere -- which is why the axis
+        // table classifies both as INERT.  -1 ("unspecified") is legal, and 4 (PAD's shader
+        // default, mul_mm.comp:122) / 0 (APPLY_SLM_A_RESHAPE's, :123) are the effective values.
+        // 0 is NOT a synonym for "default" on PAD: it is the Intel-proprietary stride, 16+0
+        // instead of 16+4, i.e. a real (and different) layout.
+        if (g.pad >= 0 && g.pad != 4) {
+            return "cm1: PAD must be 4 (the value this shader runs with) or -1 (unspecified); the "
+                   "row's PAD is not wired to spec id 12, so any other value would silently do nothing";
+        }
+        if (g.reshape >= 0 && g.reshape != 0) {
+            return "cm1: RESHAPE must be 0 (the value this shader runs with) or -1 (unspecified); "
+                   "the row's RESHAPE is not wired to spec id 13, so any other value would silently do nothing";
         }
         if (g.WM / g.TM < 1 || g.WN / g.TN < 1) {
             return "cm1: WM / TM or WN / TN is 0 (the shader's cms_per_row / cms_per_col)";
@@ -384,15 +406,24 @@ static inline uint32_t vk_tile_row_align_for(int path, const vk_tile_geometry & 
 //   "DO NOT spec-ize" note -- lesson #41: a multi-level spec array made the Blackwell
 //   driver emit BM-dependent garbage).  That is a stronger statement than "measured
 //   inert": the earlier experiment could not have shown anything else.
-// cm1: as scalar, plus SHMEM_STRIDE_PAD / APPLY_SLM_A_RESHAPE are ENUMERABLE (they are
-//   spec-ized there) but UNMEASURED -- and the reason is OURS, not the hardware's: the cm1
-//   ROW path is not wired yet, so no cm1 row installs and nothing can be measured on it.
-//   Compat mode (GGML_VK_DISABLE_COOPMAT2=1) DOES select the cm1 path and runs, but it is a
-//   PROXY, not a native cm1 device (fa-tune-exec.md section 9 boundary 1), so its numbers are
-//   not a native device's numbers.  Calling the hardware absent would write our gap down as a
-//   device verdict -- the same sentence the family refusal used to carry (removed in cm1-a, G-D1).
+// cm1: as scalar, except that WMITER, SHMEM_STRIDE_PAD, APPLY_SLM_A_RESHAPE and BK are INERT
+//   (cm1-c).  The reason is NOT "this hardware cannot" and NOT "our build has not got there": it
+//   is that the ROW'S value never reaches the shader -- WMITER/WSUBM/WNITER are read only on the
+//   `#else` side of mul_mm.comp, and spec 12/13 are filled from the global mm_spec_pad /
+//   mm_spec_reshape rather than from the row (see the case bodies below for the line-level
+//   evidence).  The cm1 row path itself IS wired since cm1-b2 -- rows install and hit (smoke A3j)
+//   and a row whose fragment shape is not this device's cooperative-matrix shape is refused by I6
+//   -- so this is a statement about the shader and the spec builder, not about our progress.
+//   What stays ENUMERABLE on cm1 is exactly the geometry: BM/BN/WM/WN/TM/TN.
+//   The older text here said the opposite ("ENUMERABLE but UNMEASURED, and the reason is OURS: the
+//   cm1 ROW path is not wired yet"): true when it was written, stale since cm1-b2, and removed in
+//   cm1-c because a comment that describes a past build state is a comment that will be believed.
+//   Still true and still worth keeping: compat mode (GGML_VK_DISABLE_COOPMAT2=1) DOES select the
+//   cm1 path and runs, but it is a PROXY, not a native cm1 device (fa-tune-exec.md section 9
+//   boundary 1); it is the only way to exercise this path today, and its numbers must be labelled
+//   as such wherever they are quoted.
 // cm2: BM/BN/BK/BS/smaller are ENUMERABLE (BLOCK_SIZE is a real cm2 spec, not derived).
-static inline int vk_tile_axis_class(int path, int axis) {
+static inline constexpr int vk_tile_axis_class(int path, int axis) {
     if (path == VK_TILE_PATH_CM2) {
         switch (axis) {
             case VK_TILE_AXIS_BS:
@@ -419,10 +450,15 @@ static inline int vk_tile_axis_class(int path, int axis) {
         case VK_TILE_AXIS_BN:
         case VK_TILE_AXIS_WM:
         case VK_TILE_AXIS_WN:
-        case VK_TILE_AXIS_WMITER:
         case VK_TILE_AXIS_TM:
         case VK_TILE_AXIS_TN:
             return VK_TILE_AXIS_ENUMERABLE;
+        case VK_TILE_AXIS_WMITER:
+            // Scalar: ENUMERABLE.  cm1: INERT (cm1-c).  WMITER reaches mul_mm.comp's COOPMAT
+            // branch only through WSUBM/WNITER, and every USE of those is on the `#else` (scalar)
+            // side (see the long note in vk_tile_candidate_reason above) -- so on cm1 a WMITER
+            // sweep would produce N candidates that compile to the same pipeline.
+            return path == VK_TILE_PATH_CM1 ? VK_TILE_AXIS_INERT : VK_TILE_AXIS_ENUMERABLE;
         case VK_TILE_AXIS_BS:
             return VK_TILE_AXIS_DERIVED;
         case VK_TILE_AXIS_TK:
@@ -430,9 +466,26 @@ static inline int vk_tile_axis_class(int path, int axis) {
             return VK_TILE_AXIS_PINNED;
         case VK_TILE_AXIS_SPEC_PAD:
         case VK_TILE_AXIS_SPEC_RESHAPE:
-            return path == VK_TILE_PATH_CM1 ? VK_TILE_AXIS_ENUMERABLE : VK_TILE_AXIS_INERT;
+            // INERT on BOTH paths, but for two DIFFERENT reasons, stated separately because the
+            // cm1 case is the one that looks wrong at first glance:
+            //   scalar: not specs there at all (mul_mm.comp:124-133 -- they stay compile-time
+            //           consts, with the explicit "DO NOT spec-ize" note, lesson #41);
+            //   cm1:    they ARE specs (mul_mm.comp:121-123), but they are filled from the GLOBAL
+            //           mm_spec_pad/mm_spec_reshape (ggml-vulkan.cpp:2406-2407, consumed at
+            //           :4890-4894), never from the row -- and the row's own two fields have NO
+            //           reader anywhere (grep `geom.pad` / `geom.reshape` in ggml-vulkan.cpp: 0
+            //           hits, which is also why they are absent from the dedup key).  So sweeping
+            //           them would emit N identical rows: a silently empty axis, which is exactly
+            //           what INERT is for.  cm1-c made this explicit and made the predicate refuse
+            //           any row value that is not the effective one, instead of accepting it
+            //           quietly.  Wiring them per row is cm1-d's job (it needs the spec builder's
+            //           input surface to become per-row, plus a numerical bit-equality leg).
+            return VK_TILE_AXIS_INERT;
         case VK_TILE_AXIS_BK:
-            return VK_TILE_AXIS_INERT;   // f16 family: compile-time constant in the shader
+            // f16 family: compile-time constant in the shader.  Per path: on cm2 the spec really
+            // is {BLOCK_SIZE, BM, BN, BK, smaller}, so BK is live THERE -- this table is only ever
+            // asked about the scalar/cm1 family, which is why one answer is enough.
+            return VK_TILE_AXIS_INERT;
         default:
             return VK_TILE_AXIS_NOT_APPLICABLE;
     }
@@ -442,3 +495,33 @@ static inline int vk_tile_axis_class(int path, int axis) {
 static inline int vk_tile_axis_is_live(int path, int axis) {
     return vk_tile_axis_class(path, axis) == VK_TILE_AXIS_ENUMERABLE;
 }
+
+// cm1-c: the classification above is DATA with no device in it, so the compiler can check the whole
+// claim instead of a reader having to trust the comment -- and "this axis does nothing" is exactly
+// the kind of claim that rots silently.  Making vk_tile_axis_class() constexpr (it is a pure switch
+// over two ints) is what buys these three lines; nothing else about it changed.
+//
+// 1) cm1 must not sweep the four decorative axes.  Each has a line-level reason in the cases above:
+//    the row's value never reaches the shader, on either path.
+static_assert(vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_WMITER) == VK_TILE_AXIS_INERT &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_INERT &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_INERT &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BK) == VK_TILE_AXIS_INERT,
+              "cm1-c: WMITER / PAD / RESHAPE / BK must not be swept on cm1 -- sweeping them would "
+              "emit N identical rows (the shader does not read the row's value)");
+// 2) The other direction, so that INERT cannot spread over the real geometry by accident: what cm1
+//    may sweep is exactly the six geometry axes, and BS is DERIVED from them plus the wave.
+static_assert(vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BM) == VK_TILE_AXIS_ENUMERABLE &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BN) == VK_TILE_AXIS_ENUMERABLE &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_WM) == VK_TILE_AXIS_ENUMERABLE &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_WN) == VK_TILE_AXIS_ENUMERABLE &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_TM) == VK_TILE_AXIS_ENUMERABLE &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_TN) == VK_TILE_AXIS_ENUMERABLE &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BS) == VK_TILE_AXIS_DERIVED,
+              "cm1-c: the cm1 axis space is the geometry (BM/BN/WM/WN/TM/TN) plus a derived BS");
+// 3) WMITER is the one axis whose answer DIFFERS between the two warptile paths, so it is the one a
+//    refactor can collapse without noticing: scalar runs the `#else` side that reads WSUBM/WNITER.
+static_assert(vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_WMITER) == VK_TILE_AXIS_ENUMERABLE &&
+              vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_INERT,
+              "cm1-c: WMITER is a live scalar axis (the scalar inner loop reads WSUBM/WNITER) and a "
+              "dead cm1 one");
