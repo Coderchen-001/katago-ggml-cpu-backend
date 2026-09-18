@@ -380,6 +380,7 @@ struct vk_tuned_coverage {
     std::map<std::string, bool> declared;     // filled by the install, before the first query
     std::map<std::string, bool> used_logged;  // gaps already reported (one line per distinct pair)
     int gaps = 0;                             // capped: a pathological shape space must not flood
+    bool cap_reported = false;                // ...and REACHING the cap must say so, exactly once
 };
 
 static inline const char * ggml_vk_tile_path_name(int path) {
@@ -2817,9 +2818,20 @@ static void ggml_vk_tuned_row_note_used(ggml_backend_vk_context * ctx, ggml_type
     if (ctx->coverage.declared.find(key) != ctx->coverage.declared.end()) {
         return;                                                   // covered -- nothing to say
     }
-    if (ctx->coverage.used_logged.find(key) != ctx->coverage.used_logged.end()
-        || ctx->coverage.gaps >= 8) {
-        return;                                                   // guard 3
+    if (ctx->coverage.used_logged.find(key) != ctx->coverage.used_logged.end()) {
+        return;                                                   // this pair was already reported
+    }
+    if (ctx->coverage.gaps >= 8) {
+        // guard 3 (the cap).  It must NOT be silent: "many pairs are uncovered" is the MORE
+        // serious case, and a truncation that prints nothing is exactly the lossy-silent shape
+        // this project forbids (the R16 lesson).  One line, once, and it deliberately reuses the
+        // "coverage gap" literal so a grep for that still finds it.
+        if (!ctx->coverage.cap_reported) {
+            ctx->coverage.cap_reported = true;
+            ggml_vk_t3_line("coverage gap: (capped at 8 -- more used (family, path) pairs are "
+                            "uncovered than are listed; see the declared set above)");
+        }
+        return;
     }
     ctx->coverage.used_logged[key] = true;
     ctx->coverage.gaps++;
