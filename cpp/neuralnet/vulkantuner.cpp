@@ -430,10 +430,25 @@ namespace VulkanTuner {
     // also depends on the device, which is already in the fingerprint/name, so the pair
     // (device, policy) is fully covered.
     string policyFingerprint() {
+      // The DEV-SURFACE knobs: everything that can change what this tuner may select (or the
+      // computation it selects for), so a dev A/B run cannot silently reuse a cache measured
+      // under a different setting.  Added in one cut from the census tool, which is the ONE
+      // source for the list (t3-census-env.py; R30 keeps it a subset check, R13k pins the
+      // names): the alternative -- proving per knob that the field it gates is already carried
+      // by the device fingerprint -- needs statement-scoped extraction per knob, while adding
+      // it costs one line and can only cause an extra re-tune.  POLICY lives in the HEADER, so
+      // this list grows the header string and never the file name.
       static const char* const KNOBS[] = {
         "KATAGO_VK_FA", "KATAGO_VK_FA_TILE", "KATAGO_VK_FA_PRECISE", "KATAGO_VK_FA_NULL",
         "KATAGO_VK_RMS_SUBGROUP", "KATAGO_VK_M4_FUSION", "KATAGO_VK_MMPREC_F32",
         "GGML_VK_DISABLE_COOPMAT", "GGML_VK_DISABLE_COOPMAT2", "KATAGO_VK_MM_TILE",
+        "GGML_VK_DISABLE_BFLOAT16", "GGML_VK_DISABLE_COOPMAT2_DECODE_VECTOR", "GGML_VK_DISABLE_DOT2",
+        "GGML_VK_DISABLE_F16", "GGML_VK_DISABLE_FUSION", "GGML_VK_DISABLE_GRAPH_OPTIMIZE",
+        "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT", "GGML_VK_DISABLE_MMVQ", "GGML_VK_DISABLE_MULTI_ADD",
+        "GGML_VK_DISABLE_OCP_FP4", "GGML_VK_FORCE_MMVQ", "KATAGO_VK_CM2_BK",
+        "KATAGO_VK_CM2_BM", "KATAGO_VK_LAYOUTDBG_EDGE", "KATAGO_VK_LAYOUT_HINT",
+        "KATAGO_VK_NARROW_BARRIER", "KATAGO_VK_QKV_NOCONT", "KATAGO_VK_ROPE_DISABLE",
+        "KATAGO_VULKAN_LAYOUTDBG", "KATAGO_VULKAN_NOALLOC",
       };
       // NOTE: the build revision is truncated to 16 characters and that is NOT the lossy kind
       // of truncation the knob values below must avoid -- a SHA is a fixed-length prefix-free
