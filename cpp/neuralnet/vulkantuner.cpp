@@ -72,7 +72,9 @@ namespace VulkanTuner {
     // migration and none is needed: no production cache file existed before this (EXPORT was
     // the only writer and only tests asked for it).  A VERSION 1 file is refused loudly,
     // which is right for a file whose rows were not keyed to the name they live under.
-    const int SCHEMA_VERSION = 3;
+    const int SCHEMA_VERSION = 4;   // was 3: the REQUIRED header-key set changed (MODE added;
+                                    // VERSION/TUNER_VERSION promoted to required).  A file that
+                                    // does not declare the new set must not be read as if it did.
     // TUNER_VERSION = the ENUMERATOR's version: it changes when the way candidates are
     // enumerated/measured changes.  This cut adds header fields, not enumeration, so it stays
     // while SCHEMA_VERSION moves.
@@ -116,7 +118,13 @@ namespace VulkanTuner {
     //     note.  For ROWSET_HASH the tolerance goes further on IMPORT: the parsed rows are
     //     hashed live and the declared value is only a hint, since a human cannot compute it.
     const char* const REQUIRED_ANY_CHANNEL[] = { "POLICY", "BASELINE" };
-    const char* const REQUIRED_FOR_CACHE[] = { "MODEL", "BOARD", "MAXBATCH", "ROWSET_HASH", "CREATED" };
+    // VERSION / TUNER_VERSION are here to CLOSE the gap that NegativeReasonSpec used to
+    // self-document: a file omitting them was neither refused nor reported.  MODE is the
+    // user-facing precision request (Decision::modeString).  All three are name-routed exactly
+    // like MODEL/BOARD -- the file NAME already carries the key, so the header only has to
+    // confirm it: absence is refused on the cache channel and loudly NOTED on IMPORT.
+    const char* const REQUIRED_FOR_CACHE[] = { "MODEL", "BOARD", "MAXBATCH", "ROWSET_HASH", "CREATED",
+                                               "VERSION", "TUNER_VERSION", "MODE" };
 
 
     // Row-count cap.  ONE constant used by BOTH the writer and the parser (a cap that only
@@ -289,20 +297,20 @@ namespace VulkanTuner {
     //
     // WHERE `full-key-set` IS REDEEMED (a declared rule that nothing redeems is a comment in
     // disguise, and this struct carries no runtime weight at all): the LOADER's key comparisons --
-    // makeDecision()'s refusal chain (fingerprint, VERSION/TUNER_VERSION, POLICY, BASELINE, then
-    // the outer key item by item, then ROWSET_HASH on the cache channel) together with
+    // makeDecision()'s refusal chain (fingerprint, VERSION/TUNER_VERSION, POLICY, BASELINE, MODE,
+    // then the outer key item by item, then ROWSET_HASH on the cache channel) together with
     // parseRowsFile()'s required-key loop, which is fed by REQUIRED_ANY_CHANNEL/REQUIRED_FOR_CACHE.
     // Nothing mechanically ties the value to those lines: R17 pins the value AND pins that each
     // named comparison still exists somewhere in this file, and the behavioural half is the
     // smoke's refusal legs (S6, A5/A6, A14/A15/A16, A18, A31/A32).  Change either side and both
     // have to be revisited.
     //
-    // ⚠️ KNOWN GAP, deliberately left visible (2026-09-13, awaiting a ruling): the comparisons
-    // above are written as `file.foundVersion && file.version != SCHEMA_VERSION`, so a file that
-    // simply OMITS VERSION / TUNER_VERSION is neither refused nor REPORTED -- verified by hand:
-    // such a file loads with no `[not key-checked: ...]` note on either channel, while
-    // t1-schema.md section 1 lists both as required.  Adding them to REQUIRED_FOR_CACHE would fix
-    // both halves at once (cache refuses absence, IMPORT notes it) and is the recommended fix.
+    // ✅ GAP CLOSED (C2, 2026-09-18): VERSION / TUNER_VERSION are now IN REQUIRED_FOR_CACHE, which
+    // is the fix this note recommended -- absence is refused on the cache channel and reported as
+    // "[not key-checked: VERSION,TUNER_VERSION]" on IMPORT.  The comparisons below still keep their
+    // `found*` guard, and that is not redundant: they answer "is it the RIGHT version", while
+    // REQUIRED_FOR_CACHE answers "did it say at all".  Dropping the guard would make an absent key
+    // read as a mismatching one and would name the wrong cause in the refusal line.
     struct NegativeReasonSpec {
       const char* reason;
       const char* invalidation;
@@ -421,6 +429,15 @@ namespace VulkanTuner {
       }
       const unsigned long bits = (strcmp(v, "all") == 0) ? 0xFul : strtoul(v, nullptr, 10);
       return (bits & 8ul) != 0;
+    }
+
+    // The USER-FACING mode, as an identity string.  ONE producer: the file name's hash segment and
+    // the header's readable line both come from here, so they cannot drift.  Today the only
+    // dimension is the fp16 request; a FUTURE dimension appends "|k=v" and the file name does NOT
+    // get longer (the segment is a fixed-length sha16 either way).  Each value's spelling is
+    // enabled_t::toString(), i.e. the SAME one the backend prints in its `[prec] mode=` line.
+    string modeString(enabled_t useFP16Mode) {
+      return "fp16=" + useFP16Mode.toString();
     }
 
     // The policy fingerprint (t1-schema.md section 4): build revision + policy version + the
@@ -587,6 +604,8 @@ namespace VulkanTuner {
       string declaredRowSetHash;
       bool foundCreated = false;
       string created;
+      bool foundMode = false;
+      string mode;
       bool foundDeclaredRows = false;
       long declaredRows = -1;
       vector<vk_tune_row_spec> rows;
@@ -804,6 +823,13 @@ namespace VulkanTuner {
           out.foundModel = true;
           out.model = line.substr(6);
         }
+        else if (line.compare(0, 5, "MODE ") == 0) {
+          // AFTER the MODEL branch on purpose, and the trailing space is LOAD-BEARING: "MODE " is
+          // the only thing that separates this key from "MODEL ", so compare(0, 4, "MODE") would
+          // swallow MODEL lines.  The branch order is belt-and-braces on top of that.
+          out.foundMode = true;
+          out.mode = line.substr(5);
+        }
         else if (line.compare(0, 9, "MAXBATCH ") == 0) {
           out.foundMaxBatch = true;
           out.maxBatch = atoi(line.c_str() + 9);
@@ -872,18 +898,45 @@ namespace VulkanTuner {
               + to_string(out.rows.size()) + " ROW lines (truncated or hand-edited file?)";
         return false;
       }
-      // The ADVISORY set is built from the declared array, not from a hand-written list: the
-      // parser cannot drift from REQUIRED_FOR_CACHE, and R12 checks the array's contents.
+      // The ADVISORY set is built from the declared array, but WHICH FIELD each key is read from
+      // cannot come from that array, so the mapping is a table right here.  That mapping is the
+      // part that can drift (the previous comment claimed the parser "cannot drift", which was
+      // never true of this mapping), and the failure mode is nasty: a key in the array with no
+      // mapping is reported ABSENT for every file -- including the ones this tuner just wrote --
+      // so every cache load is refused with a message about missing header keys, i.e. the wrong
+      // cause.  An unmapped key therefore FAILS THE PARSE and says so.
+      struct RequiredKeyFound {
+        const char* key;
+        bool found;
+      };
+      const RequiredKeyFound requiredKeyFound[] = {
+        { "MODEL",         out.foundModel },
+        { "BOARD",         out.foundBoard },
+        { "MAXBATCH",      out.foundMaxBatch },
+        { "ROWSET_HASH",   out.foundRowSetHash },
+        { "CREATED",       out.foundCreated },
+        { "VERSION",       out.foundVersion },
+        { "TUNER_VERSION", out.foundTunerVersion },
+        { "MODE",          out.foundMode },
+      };
       for (const char* key : REQUIRED_FOR_CACHE) {
-        const string k(key);
+        bool mapped = false;
         bool found = false;
-        if (k == "MODEL") found = out.foundModel;
-        else if (k == "BOARD") found = out.foundBoard;
-        else if (k == "MAXBATCH") found = out.foundMaxBatch;
-        else if (k == "ROWSET_HASH") found = out.foundRowSetHash;
-        else if (k == "CREATED") found = out.foundCreated;
+        for (const RequiredKeyFound& rf : requiredKeyFound) {
+          if (string(rf.key) == key) {
+            mapped = true;
+            found = rf.found;
+            break;
+          }
+        }
+        if (!mapped) {
+          err = string("internal: REQUIRED_FOR_CACHE key '") + key + "' has no found-flag mapping"
+                " (a required key with no field to read is reported absent for every file, which"
+                " would refuse this tuner's own caches for the wrong reason)";
+          return false;
+        }
         if (!found) {
-          out.absentKeys.push_back(k);
+          out.absentKeys.push_back(string(key));
         }
       }
       return true;
@@ -903,6 +956,11 @@ namespace VulkanTuner {
       os << "MAXBATCH " << d.maxBatchSize << "\n";
       os << "ROWSET_HASH " << rowSetHash(d.rows) << "\n";
       os << "CREATED " << createdAtNow() << "\n";
+      // The mode is written as READABLE TEXT even though the NAME carries only its hash: the name
+      // routes, and this line is what refutes a hand-renamed or cross-machine-copied file.  It is
+      // one key holding the whole string (not one key per dimension), so a future mode dimension
+      // grows this VALUE and never the key set -- the comparison stays "entire value equal".
+      os << "MODE " << d.modeString << "\n";
       // One file = one key, so "this key has rows" and "this key was all-rejected" are
       // mutually exclusive statements.  The writer refuses to emit both; the reader still
       // copes with a hand-edited file containing both (rows win, loudly).  The remaining
@@ -1308,6 +1366,7 @@ namespace VulkanTuner {
     int nnXLen,
     int nnYLen,
     int maxBatchSize,
+    enabled_t useFP16Mode,
     const ModelIdentity& model,
     const TunePolicy& policy
   ) {
@@ -1340,6 +1399,10 @@ namespace VulkanTuner {
     d->maxBatchSize = maxBatchSize;
     d->modelIdentity = model.headerValue();
     d->policyFingerprint = policyFingerprint();
+    // The mode the backend actually received, turned into identity by its ONE producer.  Set HERE,
+    // next to the policy, because both are "what was asked for" and both are read by the load
+    // chain: from this point on, d->modeString is the only spelling of the mode in this process.
+    d->modeString = modeString(useFP16Mode);
     d->baselineVersion = std::to_string(TUNER_POLICY_VERSION);
     d->rowSource = "none";   // stays "none" unless a load actually produced rows
     d->tuneModeText = policy.modeText;
@@ -1387,9 +1450,13 @@ namespace VulkanTuner {
       // file is caught there); the two cannot drift because both come from this Decision.
       // The model NAME is deliberately absent from the name -- it can contain characters a
       // filesystem dislikes, and it is redundant with the sha for routing.
+      // The MODE segment is a hash (not the readable string) for the same reason the model segment
+      // is a sha: the name stays a FIXED ~74 characters however many mode dimensions are added
+      // later, while the header keeps the readable value that can refute the name.
       d->deviceFile = shortHash(d->fingerprint) + "-" + model.fileTag() + "-"
                     + std::to_string(nnXLen) + "x" + std::to_string(nnYLen)
-                    + "-mb" + std::to_string(maxBatchSize) + ".txt";
+                    + "-mb" + std::to_string(maxBatchSize)
+                    + "-m" + shortHash(d->modeString) + ".txt";
       d->cacheDir = HomeData::getHomeDataDir(true, homeDataDirOverride) + "/vulkan-tune";
       MakeDir::make(d->cacheDir);
       d->cachePath = d->cacheDir + "/" + d->deviceFile;
@@ -1521,6 +1588,17 @@ namespace VulkanTuner {
                               + " (a machine-written cache always carries them;"
                                 " KATAGO_VK_TUNE_IMPORT tolerates their absence for hand-written files)");
           d->note = string(loadKind) + " is missing " + missing + ", so the model dimension would not be verified";
+        }
+        else if (file.foundMode && file.mode != d->modeString) {
+          // The user-facing mode is part of the key even though the NAME already routes by it:
+          // this check is what turns "a file renamed to look like another mode's file" into a
+          // REFUSAL instead of an install of rows measured for a different precision.  It is
+          // guarded by foundMode so an IMPORTed hand-written fixture that never mentions MODE is
+          // still tolerated (and loudly noted) rather than refused as a mismatch -- the same
+          // split the channel-dependent required keys use.
+          d->cacheState = "rejected";
+          refuseLoad(loadKind, "mode mismatch (file=" + file.mode + " current=" + d->modeString + ")");
+          d->note = string(loadKind) + " was measured with another precision mode";
         }
         else {
           // Outer key, one item at a time so a refusal names WHICH item did not match.

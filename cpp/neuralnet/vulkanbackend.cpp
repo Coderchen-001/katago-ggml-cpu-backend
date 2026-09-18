@@ -2627,7 +2627,7 @@ struct ComputeHandle {
             effectiveDeviceIdx,
             VulkanTuner::makeDecision(
               backend, effectiveDeviceIdx, ctx->homeDataDirOverride,
-              ctx->nnXLen, ctx->nnYLen, maxBatchSize, modelKey, ctx->tunePolicy)
+              ctx->nnXLen, ctx->nnYLen, maxBatchSize, ctx->useFP16Mode, modelKey, ctx->tunePolicy)
           ).first;
         }
         tuneDecision = it->second;

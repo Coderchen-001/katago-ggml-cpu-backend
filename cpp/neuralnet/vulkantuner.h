@@ -26,6 +26,10 @@
 #include <string>
 #include <vector>
 
+#include "../core/commontypes.h"   // enabled_t: the USER-FACING precision request, carried as
+                                   // identity.  Its toString() is the SAME spelling the backend
+                                   // reports in its own `[prec] mode=` line, so "what the user
+                                   // asked for" has one name in the log and in the cache.
 #include "ggml-backend.h"
 #include "vulkan-tile-validity.h"
 
@@ -94,6 +98,13 @@ namespace VulkanTuner {
     std::string deviceName;
     std::string fingerprint;      // full device/driver fingerprint (cache header identity)
     std::string deviceFile;       // sha256(fingerprint)[0:16].txt  (filename-safe, section 1)
+    // The USER-FACING precision mode, as an identity string ("fp16=auto").  Its sha16 goes into
+    // the file NAME (one mode = one file, and a FUTURE dimension appends to this string without
+    // lengthening the name); the raw string goes into the header, so a hand-renamed or
+    // cross-machine-copied file is refuted by its own contents instead of being trusted because
+    // its path looks right.  Produced by modeString() -- the ONE producer -- never spelled out
+    // at a call site, or the name and the header could disagree.
+    std::string modeString;
     std::string cacheDir;         // <homeDataDir>/vulkan-tune
     std::string cachePath;        // cacheDir + "/" + deviceFile (may not exist yet)
     bool cacheFileExists = false;
@@ -190,6 +201,9 @@ namespace VulkanTuner {
     int nnXLen,
     int nnYLen,
     int maxBatchSize,
+    enabled_t useFP16Mode,        // the mode the BACKEND actually received (not the cfg text):
+                                  // F1 showed a False request rewrites the graph as GGML_PREC_F32,
+                                  // so this is a request that changes the computation.
     const ModelIdentity& model,
     const TunePolicy& policy
   );
