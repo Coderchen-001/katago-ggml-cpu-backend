@@ -344,7 +344,12 @@ static inline uint32_t vk_tile_row_align_for(int path, const vk_tile_geometry & 
 //   driver emit BM-dependent garbage).  That is a stronger statement than "measured
 //   inert": the earlier experiment could not have shown anything else.
 // cm1: as scalar, plus SHMEM_STRIDE_PAD / APPLY_SLM_A_RESHAPE are ENUMERABLE (they are
-//   spec-ized there) but unmeasured -- we have no cm1 machine.
+//   spec-ized there) but UNMEASURED -- and the reason is OURS, not the hardware's: the cm1
+//   ROW path is not wired yet, so no cm1 row installs and nothing can be measured on it.
+//   Compat mode (GGML_VK_DISABLE_COOPMAT2=1) DOES select the cm1 path and runs, but it is a
+//   PROXY, not a native cm1 device (fa-tune-exec.md section 9 boundary 1), so its numbers are
+//   not a native device's numbers.  Calling the hardware absent would write our gap down as a
+//   device verdict -- the same sentence the family refusal used to carry (removed in cm1-a, G-D1).
 // cm2: BM/BN/BK/BS/smaller are ENUMERABLE (BLOCK_SIZE is a real cm2 spec, not derived).
 static inline int vk_tile_axis_class(int path, int axis) {
     if (path == VK_TILE_PATH_CM2) {

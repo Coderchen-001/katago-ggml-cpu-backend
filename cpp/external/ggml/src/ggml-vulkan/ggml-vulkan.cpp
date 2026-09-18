@@ -2811,6 +2811,14 @@ static void ggml_vk_t2_line(const std::string & msg) {
 // families: then a file declaring only one of them must be reported here.
 // The path is a PARAMETER of this helper and the call sites read that one field, so the label can
 // never disagree with the family the dispatch actually used.
+//
+// CALLED ONLY ON A MISS.  A dispatch that found a tuned row returns before reaching here,
+// and that is not a hole -- a hit means the pair IS declared.  But it is sound only because
+// of the I6 invariant: every INSTALLED row's `path` equals the device's effective path
+// (ggml_vk_tuned_row_capability_reason refuses the rest), so a hit's (family, path) is in
+// `declared` by construction.  Relax I6 -- e.g. let rows install for a path this device does
+// not take -- and this leg's meaning changes with it, silently, because nothing else links
+// the two.
 static void ggml_vk_tuned_row_note_used(ggml_backend_vk_context * ctx, ggml_type src0_type,
                                         ggml_type src1_type, int path) {
     if (ctx->coverage.declared.empty()) {
