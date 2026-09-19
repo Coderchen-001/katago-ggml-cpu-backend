@@ -4991,6 +4991,37 @@ static uint32_t ggml_vk_tile_effective_required_subgroup_size(const vk_tile_kern
     return get_subgroup_size(shaderName, arch);        // 0 => resolve by name, as the init entry did
 }
 
+// How many pipelines ONE create call must produce for this device, and which index of the chain is
+// the 64-bit-indexing variant.  This is the ONE source for that rule (R37): the init-side create
+// lambda and the tuned-row build both take the count AND the per-index flag from here.
+//
+// Why it exists: the rule used to have two copies.  The init lambda built a next-chain when the
+// device exposes VK_EXT_shader_64bit_indexing (`device->shader_64b_indexing`), while the row build
+// created exactly one pipeline -- so on such a device EVERY tuned row was refused with an
+// our-gap reason ("the B1 row path builds only the 32-bit variant"), and the machine that decides
+// this project's absolute verdicts (the GTX 1660) could not measure a single row.  Measured
+// 2026-09-19: b4-logs-1660*, three legs x ten rows, all refused by that one sentence.
+//
+// The variants share ONE SPIR-V module; the only difference is the pipeline create flag
+// `vk::PipelineCreateFlagBits2::e64BitIndexingEXT`, which ggml_vk_create_pipeline_func applies when
+// `is_64b_indexing` is set, and ggml_vk_get_64b_indexing_pipeline walks the chain to find it -- so
+// nothing on the dispatch side had to change.  `count >= 1` always: "no variant" must not be
+// expressible, because a zero-length plan would make the reconciliation check pass vacuously.
+struct vk_tile_pipeline_plan {
+    uint32_t count;
+    bool     is_64b[2];
+};
+static vk_tile_pipeline_plan ggml_vk_tile_pipeline_plan_for(const vk_device & device) {
+#if defined(VK_EXT_shader_64bit_indexing)
+    if (device->shader_64b_indexing) {
+        return vk_tile_pipeline_plan { 2u, { false, true } };
+    }
+#else
+    GGML_UNUSED(device);
+#endif
+    return vk_tile_pipeline_plan { 1u, { false, false } };
+}
+
 static std::vector<uint32_t> ggml_vk_scalar_mm_spec(const vk_device & device, std::vector<uint32_t> spec, bool aligned,
                                                     int row_pad = -1, int row_reshape = -1) {
     spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
@@ -5307,13 +5338,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         vk_pipeline *ptr = &base_pipeline;
 
-        int num_pipelines = 1;
-#if defined(VK_EXT_shader_64bit_indexing)
-        if (device->shader_64b_indexing) {
-            num_pipelines = 2;
-        }
-#endif
-        for (int i = 0; i < num_pipelines; ++i, ptr = &(*ptr)->next) {
+        // ONE source for the variant count and for which index is the 64-bit one (R37); see the
+        // plan resolver above.  Until this batch the count was decided HERE and the row path
+        // decided the opposite, which is the whole reason a 64-bit-indexing device could not
+        // install a tuned row.
+        const vk_tile_pipeline_plan plan = ggml_vk_tile_pipeline_plan_for(device);
+        for (uint32_t i = 0; i < plan.count; ++i, ptr = &(*ptr)->next) {
             vk_pipeline &pipeline = *ptr;
             if (!pipeline) {
                 pipeline = std::make_shared<vk_pipeline_struct>();
@@ -5326,7 +5356,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 pipeline->align = align;
                 pipeline->initialized = true;
 #if defined(VK_EXT_shader_64bit_indexing)
-                pipeline->is_64b_indexing = (i == 1);
+                pipeline->is_64b_indexing = plan.is_64b[i];
 #endif
             }
 
@@ -20743,7 +20773,6 @@ static const vk_tuned_row_capability_class VK_TUNE_CAPABILITY_CLASSES[] = {
     { "path=cm1 but this device does not meet the cm1 conditions (cooperative_matrix, 16x16x16 f16acc, subgroup size control, subgroup in {32,64})", false },
     { "path=cm1 but the row's fragment shape (TM/TN) is not this device's cooperative_matrix shape", false },
     { "path is neither scalar, cm1 nor cm2", true },
-    { "this device uses 64-bit shader indexing; the B1 row path builds only the 32-bit variant", true },
     { "BLOCK_SIZE exceeds maxComputeWorkGroupInvocations", false },
     { "geometry needs more shared memory than this device has", false },
     { "path=cm1 with a PAD/RESHAPE override on the Intel-proprietary coopmat class, whose effective "
@@ -20811,9 +20840,6 @@ static const char * ggml_vk_tuned_row_capability_reason(const vk_device & device
         }
     } else {
         return "path is neither scalar, cm1 nor cm2";
-    }
-    if (device->shader_64b_indexing) {
-        return "this device uses 64-bit shader indexing; the B1 row path builds only the 32-bit variant";
     }
     if (r.geom.BS > device->properties.limits.maxComputeWorkGroupInvocations) {
         return "BLOCK_SIZE exceeds maxComputeWorkGroupInvocations";
@@ -20990,22 +21016,43 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
         const bool kDisableRobustness      = kCreateFlags.disable_robustness;
         const bool kRequireFullSubgroups   = kCreateFlags.require_full_subgroups;
         const uint32_t kRequiredSubgroup   = ggml_vk_tile_effective_required_subgroup_size(kCreateFlags, sh.name, device->architecture);
+        // The variant plan (R37), from the SAME resolver the init-side lambda uses.  Until this
+        // batch this entry created exactly one pipeline while stock created a next-chain, so on a
+        // device exposing VK_EXT_shader_64bit_indexing (the GTX 1660) every row died as our-gap and
+        // no row benefit could be measured on the machine that decides absolute verdicts.  The
+        // chain is what ggml_vk_get_64b_indexing_pipeline walks at dispatch time, so building it
+        // here is the whole fix; the refusal this replaces has been deleted with it.
+        const vk_tile_pipeline_plan plan = ggml_vk_tile_pipeline_plan_for(device);
         vk_pipeline built = std::make_shared<vk_pipeline_struct>();
-        built->name = aligned_variant ? (std::string(sh.name) + "_aligned") : std::string(sh.name);
-        built->parameter_count = 3;
-        built->push_constant_size = sizeof(vk_mat_mat_push_constants);
-        built->wg_denoms = wg_denoms;
-        // The ONE write of `align` on this path (there is no align argument in the create
-        // function -- ggml_vk_create_pipeline_func has no such parameter, unlike the init-side
-        // lambda).  Setting it here, with the other fields, is what keeps it a single write
-        // point; do not patch it after the create call.
-        built->align = aligned_variant ? vk_tile_row_align_for(r.path, r.geom) : 1;
-        built->initialized = true;
-        ggml_vk_create_pipeline_func(device, built, sh.spv_size, sh.spv_data, "main", 3, wg_denoms, spec,
-                                     kDisableRobustness, kRequireFullSubgroups, kRequiredSubgroup);
-        if (built == nullptr || !built->compiled) {
-            why = "the create path returned without a compiled pipeline";
-            return false;
+        for (uint32_t i = 0; i < plan.count; i++) {
+            vk_pipeline & pipe = (i == 0) ? built : built->next;
+            if (pipe == nullptr) {
+                pipe = std::make_shared<vk_pipeline_struct>();
+            }
+            // The twin carries a suffixed name so an evidence line can tell the variants apart
+            // (`..._tuned_row` vs `..._tuned_row_64b`).  The HEAD keeps the name it always had, so
+            // every existing line, leg and filter is unaffected -- and on a device whose plan is
+            // length 1 (all of them except the 1660 today) this loop is exactly what it replaced.
+            pipe->name = (aligned_variant ? (std::string(sh.name) + "_aligned") : std::string(sh.name))
+                       + (i == 1 ? "_64b" : "");
+            pipe->parameter_count = 3;
+            pipe->push_constant_size = sizeof(vk_mat_mat_push_constants);
+            pipe->wg_denoms = wg_denoms;
+            // The ONE write of `align` on this path (there is no align argument in the create
+            // function -- ggml_vk_create_pipeline_func has no such parameter, unlike the init-side
+            // lambda).  Setting it here, with the other fields, is what keeps it a single write
+            // point; do not patch it after the create call.
+            pipe->align = aligned_variant ? vk_tile_row_align_for(r.path, r.geom) : 1;
+#if defined(VK_EXT_shader_64bit_indexing)
+            pipe->is_64b_indexing = plan.is_64b[i];
+#endif
+            pipe->initialized = true;
+            ggml_vk_create_pipeline_func(device, pipe, sh.spv_size, sh.spv_data, "main", 3, wg_denoms, spec,
+                                         kDisableRobustness, kRequireFullSubgroups, kRequiredSubgroup);
+            if (pipe == nullptr || !pipe->compiled) {
+                why = "the create path returned without a compiled pipeline";
+                return false;
+            }
         }
         out = built;
     } catch (const std::exception & e) {
