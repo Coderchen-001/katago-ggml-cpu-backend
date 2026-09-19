@@ -316,17 +316,11 @@ static inline const char * vk_tile_candidate_reason(int path, const vk_tile_geom
         // default, mul_mm.comp:122) / 0 (APPLY_SLM_A_RESHAPE's, :123) are the effective values.
         // 0 is NOT a synonym for "default" on PAD: it is the Intel-proprietary stride, 16+0
         // instead of 16+4, i.e. a real (and different) layout.
-        if (g.pad >= 0 && g.pad != 4) {
-            return "cm1: PAD must be 4 (the effective value on the paths this device-independent "
-                   "table can see; the Intel-proprietary coopmat class runs 0 instead -- see "
-                   "ggml_vk_mm_spec_pad_eff) or -1 (unspecified); the "
-                   "row's PAD is not wired to spec id 12, so any other value would silently do nothing";
-        }
-        if (g.reshape >= 0 && g.reshape != 0) {
-            return "cm1: RESHAPE must be 0 (the effective value on the paths this table can see; that "
-                   "Intel-proprietary class runs true instead) or -1 (unspecified); "
-                   "the row's RESHAPE is not wired to spec id 13, so any other value would silently do nothing";
-        }
+        // cm1-d DELETED the PAD/RESHAPE normalization that stood here (it accepted only -1 and the
+        // then-effective 4/0 and refused everything else by name).  It was right while the row's
+        // values reached no spec -- any other value really was a silent no-op -- and it became wrong
+        // the moment they were wired: 0..4 for PAD and 0/1 for RESHAPE are now things the pipeline
+        // really runs with, so the generic range checks above are the whole rule again.
         if (g.WM / g.TM < 1 || g.WN / g.TN < 1) {
             return "cm1: WM / TM or WN / TN is 0 (the shader's cms_per_row / cms_per_col)";
         }
@@ -355,8 +349,14 @@ static inline uint64_t vk_tile_canonical_key(int path, const vk_tile_geometry & 
     if (path == VK_TILE_PATH_CM2 && g.smaller == 1 && (g.BN % 2) == 0) {
         bn_eff = g.BN / 2;
     }
-    const uint32_t parts[10] = {
+    // cm1-d: PAD and RESHAPE joined the key in the same batch that gave them a reader.  Until then
+    // they were absent for the honest reason the axis comment gave ("no reader anywhere"); with the
+    // row's values reaching spec 12/13, two rows that differ only in them are DIFFERENT pipelines,
+    // and a key that cannot say so would collapse them into one candidate.
+    const uint32_t parts[12] = {
         (uint32_t) path, g.BM, bn_eff, g.BK, g.WM, g.WN, g.WMITER, g.TM, g.TN, g.BS,
+        (uint32_t) (g.pad < 0 ? 0xFFFFFFFFu : (uint32_t) g.pad),
+        (uint32_t) (g.reshape < 0 ? 0xFFFFFFFFu : (uint32_t) g.reshape),
     };
     // Standard FNV-1a 64 (offset basis 0xCBF29CE484222325, prime 0x100000001B3), fed one BYTE at
     // a time in little-endian order -- the same wire protocol the shell's rowSetHash() uses, so
@@ -367,7 +367,7 @@ static inline uint64_t vk_tile_canonical_key(int path, const vk_tile_geometry & 
     // share a key) -- it must NOT be reused as the pipeline align (t3-shell-plan.md 6.9: the
     // align rule is per path and is derived from the stock buckets, not from this identity).
     uint64_t h = 14695981039346656037ull;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 12; i++) {
         const uint32_t v = parts[i];
         for (int b = 0; b < 4; b++) {
             h ^= (uint64_t) ((v >> (8 * b)) & 0xffu);
@@ -477,13 +477,20 @@ static inline constexpr int vk_tile_axis_class(int path, int axis) {
             //           mm_spec_pad/mm_spec_reshape (ggml-vulkan.cpp:2406-2407, consumed at
             //           :4890-4894), never from the row -- and the row's own two fields have NO
             //           reader anywhere (grep `geom.pad` / `geom.reshape` in ggml-vulkan.cpp: 0
-            //           hits, which is also why they are absent from the dedup key).  So sweeping
+            //           hits; cm1-d gave them a reader, added them to the dedup key and made them
+//           ENUMERABLE on cm1 -- the sentence that used to sit here said the opposite, which is
+//           exactly what a stale comment does).  So sweeping
             //           them would emit N identical rows: a silently empty axis, which is exactly
             //           what INERT is for.  cm1-c made this explicit and made the predicate refuse
             //           any row value that is not the effective one, instead of accepting it
             //           quietly.  Wiring them per row is cm1-d's job (it needs the spec builder's
             //           input surface to become per-row, plus a numerical bit-equality leg).
-            return VK_TILE_AXIS_INERT;
+            // cm1-d: cm1 = ENUMERABLE, scalar = INERT.  This is the flip the cm1-c note below
+            // predicted ("Wiring them per row is cm1-d's job"), and it is safe only because the
+            // wiring landed in the same batch: before it, sweeping these produced N identical rows.
+            // The scalar side stays INERT for its own reason -- there they are not specs at all
+            // (mul_mm.comp:124-133, lesson #41).
+            return path == VK_TILE_PATH_CM1 ? VK_TILE_AXIS_ENUMERABLE : VK_TILE_AXIS_INERT;
         case VK_TILE_AXIS_BK:
             // f16 family: compile-time constant in the shader.  Per path: on cm2 the spec really
             // is {BLOCK_SIZE, BM, BN, BK, smaller}, so BK is live THERE -- this table is only ever
@@ -507,19 +514,22 @@ static inline int vk_tile_axis_is_live(int path, int axis) {
 // 1) cm1 must not sweep the four decorative axes.  Each has a line-level reason in the cases above:
 //    the row's value never reaches the shader, on either path.
 static_assert(vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_WMITER) == VK_TILE_AXIS_INERT &&
-              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_INERT &&
-              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_INERT &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_ENUMERABLE &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BK) == VK_TILE_AXIS_INERT,
               "cm1-c: WMITER / PAD / RESHAPE / BK must not be swept on cm1 -- sweeping them would "
               "emit N identical rows (the shader does not read the row's value)");
 // 2) The other direction, so that INERT cannot spread over the real geometry by accident: what cm1
-//    may sweep is exactly the six geometry axes, and BS is DERIVED from them plus the wave.
+//    may sweep is the six geometry axes PLUS pad/reshape since cm1-d (eight), and BS is DERIVED from
+//    the geometry plus the wave.
 static_assert(vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BM) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BN) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_WM) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_WN) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_TM) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_TN) == VK_TILE_AXIS_ENUMERABLE &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_ENUMERABLE &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BS) == VK_TILE_AXIS_DERIVED,
               "cm1-c: the cm1 axis space is the geometry (BM/BN/WM/WN/TM/TN) plus a derived BS");
 // 3) WMITER is the one axis whose answer DIFFERS between the two warptile paths, so it is the one a

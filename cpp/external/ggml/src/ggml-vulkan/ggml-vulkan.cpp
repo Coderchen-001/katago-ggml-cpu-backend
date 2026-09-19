@@ -4651,7 +4651,14 @@ enum {
                                      //    I6's SCALAR estimate is the subject of G-C2c
     VK_MM_PAD_DEFAULT_PAIR    = 1,   // what a PAIR injects when only its sibling is set (:4971)
 };
-static int ggml_vk_mm_spec_pad_eff(const vk_device & device, int fallback) {
+static int ggml_vk_mm_spec_pad_eff(const vk_device & device, int fallback, int row_pad = -1) {
+    // cm1-d: the ROW's own value is the strongest source -- the row's pipeline is the pipeline.  It
+    // sits above the Intel hardcode on purpose, and the pairing rule that keeps that safe is a
+    // REFUSAL, not a precedence question: I6 refuses a row that carries an override on the
+    // Intel-proprietary coopmat class (that class is unmeasured -- G-C2d), so the two can never meet.
+    if (row_pad >= 0) {
+        return row_pad;
+    }
     if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
         device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
         return 0;
@@ -4665,6 +4672,25 @@ static int ggml_vk_mm_spec_pad_eff(const vk_device & device, int fallback) {
     return fallback;
 }
 
+// The same ONE-decision rule for APPLY_SLM_A_RESHAPE (constant_id = 13).  Same sources, same order:
+// the row's value, then the Intel-proprietary hardcode (true, and it travels WITH the pad 0 above),
+// then the probe knob, then the caller's shader default.  It is a separate function rather than a
+// second branch only because the two constants have different defaults and different types.
+static bool ggml_vk_mm_spec_reshape_eff(const vk_device & device, bool fallback,
+                                        int row_reshape = -1) {
+    if (row_reshape >= 0) {
+        return row_reshape != 0;
+    }
+    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
+        device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
+        return true;
+    }
+    if (mm_spec_reshape >= 0) {
+        return mm_spec_reshape != 0;
+    }
+    return fallback;
+}
+
 // Precondition (the same one the I6 caller documents): the geometry already passed
 // vk_tile_candidate_reason, so BM/BN/WM/WN/BS are non-zero.  `wave` is never 0 by construction
 // (vk_tile_wave_for), so the division below cannot trap.
@@ -4673,7 +4699,8 @@ static uint32_t ggml_vk_cm1_row_shmem(const vk_device & device, const vk_tile_ge
     const uint32_t bk_eff = 32u;                       // mul_mm.comp:113-115
     // The effective PAD: the ONE decision function, with THIS variant's shader default as the
     // fallback.  Never the row's `g.pad` -- that value reaches no spec at all (see the axis table).
-    const uint32_t pad_eff = (uint32_t) ggml_vk_mm_spec_pad_eff(device, VK_MM_PAD_DEFAULT_COOPMAT);
+    const uint32_t pad_eff = (uint32_t) ggml_vk_mm_spec_pad_eff(device, VK_MM_PAD_DEFAULT_COOPMAT,
+                                                                 g.pad);
     const uint32_t stride = bk_eff / 2u + pad_eff;     // mul_mm.comp:135
     const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
     const uint32_t load_bufs = (g.BM + g.BN) * stride * 2u * type_size;   // mul_mm.comp:137-138
@@ -4955,13 +4982,17 @@ static uint32_t ggml_vk_tile_effective_required_subgroup_size(const vk_tile_kern
     return get_subgroup_size(shaderName, arch);        // 0 => resolve by name, as the init entry did
 }
 
-static std::vector<uint32_t> ggml_vk_scalar_mm_spec(const vk_device & device, std::vector<uint32_t> spec, bool aligned) {
+static std::vector<uint32_t> ggml_vk_scalar_mm_spec(const vk_device & device, std::vector<uint32_t> spec, bool aligned,
+                                                    int row_pad = -1, int row_reshape = -1) {
     spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
+    // cm1-d: a ROW may pin 12/13 itself, so the pair is injected when the row says so as well.  The
+    // stock path passes -1/-1 and therefore takes exactly the branch it always took.
+    const bool row_pins_pair = row_pad >= 0 || row_reshape >= 0;
     if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
         device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
         spec.push_back(0u);  // constantID=12: SHMEM_STRIDE_PAD = 0
         spec.push_back(1u);  // constantID=13: APPLY_SLM_A_RESHAPE = true
-    } else if (mm_spec_pad >= 0 || mm_spec_reshape >= 0) {
+    } else if (mm_spec_pad >= 0 || mm_spec_reshape >= 0 || row_pins_pair) {
         // P2 probe knobs: inject 12/13 as a PAIR (position-mapped constantIDs, GG:3058).  The PAD
         // value comes from the ONE decision function (:4647-4666, ggml_vk_mm_spec_pad_eff),
         // with the PAIR's own fallback --
@@ -4970,8 +5001,8 @@ static std::vector<uint32_t> ggml_vk_scalar_mm_spec(const vk_device & device, st
         // PAD 1.  (The comment that used to sit here claimed this pair was "bit-identical to shader
         // defaults", which holds for the scalar variant only -- the same wrong assumption cm1c2
         // removed from the estimate.)  reshape's own default here is false, and unchanged.
-        spec.push_back((uint32_t) ggml_vk_mm_spec_pad_eff(device, VK_MM_PAD_DEFAULT_PAIR));
-        spec.push_back(mm_spec_reshape >= 0 ? (mm_spec_reshape ? 1u : 0u) : 0u);
+        spec.push_back((uint32_t) ggml_vk_mm_spec_pad_eff(device, VK_MM_PAD_DEFAULT_PAIR, row_pad));
+        spec.push_back(ggml_vk_mm_spec_reshape_eff(device, false, row_reshape) ? 1u : 0u);
     }
     return spec;
 }
@@ -5509,11 +5540,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 #endif
 
-    auto const &ggml_vk_mul_mm_spec = [&device](std::vector<uint32_t> spec, bool aligned) {
+    auto const &ggml_vk_mul_mm_spec = [&device](std::vector<uint32_t> spec, bool aligned,
+                                                int row_pad = -1, int row_reshape = -1) {
         // Forwarder: the rule lives in ggml_vk_scalar_mm_spec() (file scope) because the
         // tuned-row resolver needs the same rule; the name stays because the create macros
         // below spell it.
-        return ggml_vk_scalar_mm_spec(device, std::move(spec), aligned);
+        return ggml_vk_scalar_mm_spec(device, std::move(spec), aligned, row_pad, row_reshape);
     };
 
     const int mul_mat_id_param_count = 5;
@@ -10196,8 +10228,8 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
         vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_WARP)       == VK_TILE_AXIS_PINNED &&
         vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_SPEC_PAD)   == VK_TILE_AXIS_INERT &&
         vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_WMITER)     == VK_TILE_AXIS_ENUMERABLE &&
-        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_SPEC_PAD)   == VK_TILE_AXIS_INERT &&
-        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_INERT &&
+        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_SPEC_PAD)   == VK_TILE_AXIS_ENUMERABLE &&
+        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_ENUMERABLE &&
         vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_WMITER)     == VK_TILE_AXIS_INERT &&
         vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_BK)         == VK_TILE_AXIS_INERT &&
         vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_TM)         == VK_TILE_AXIS_ENUMERABLE &&
@@ -20614,6 +20646,10 @@ static const vk_tuned_row_capability_class VK_TUNE_CAPABILITY_CLASSES[] = {
     { "this device uses 64-bit shader indexing; the B1 row path builds only the 32-bit variant", true },
     { "BLOCK_SIZE exceeds maxComputeWorkGroupInvocations", false },
     { "geometry needs more shared memory than this device has", false },
+    { "path=cm1 with a PAD/RESHAPE override on the Intel-proprietary coopmat class, whose effective "
+      "values this build hardcodes (0/true) and whose layout has never been measured here", true },
+    { "two rows share (src0, src1, key_m, key_k) but differ in PAD/RESHAPE: the dispatch face cannot "
+      "tell them apart, so neither is installed", true },
 };
 static bool ggml_vk_tuned_row_capability_is_our_gap(const char * reason) {
     if (reason == nullptr) {
@@ -20661,6 +20697,17 @@ static const char * ggml_vk_tuned_row_capability_reason(const vk_device & device
         if (r.geom.TM != device->coopmat_m || r.geom.TN != device->coopmat_n) {
             return "path=cm1 but the row's fragment shape (TM/TN) is not this device's "
                    "cooperative_matrix shape";
+        }
+        // cm1-d: a row override beats the effective-value function's every other source, and on THIS
+        // class that would bypass a hardcode (pad 0 + reshape true) whose layout premise has never
+        // been measured (G-C2d).  Classified as OUR GAP on purpose: "we have not measured that
+        // class" is not a property of the device, so it must never be written down as one (G-D20).
+        if ((r.geom.pad >= 0 || r.geom.reshape >= 0) &&
+            device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
+            device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
+            return "path=cm1 with a PAD/RESHAPE override on the Intel-proprietary coopmat class, "
+                   "whose effective values this build hardcodes (0/true) and whose layout has never "
+                   "been measured here";
         }
     } else {
         return "path is neither scalar, cm1 nor cm2";
@@ -20821,7 +20868,11 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
                                                r.geom.WMITER, r.geom.TM, r.geom.TN,
                                                (r.path == VK_TILE_PATH_CM1 ? device->coopmat_k : 1u),
                                                vk_tile_wave_for(device->subgroup_size) };
-            spec = ggml_vk_scalar_mm_spec(device, std::move(warptile), aligned_variant);
+            // cm1-d: the row's pad/reshape reach spec 12/13 here and nowhere else.  -1 means "this
+        // row does not override", which is what keeps a row that says nothing bit-identical to the
+        // bucket and to the behaviour before this batch.
+        spec = ggml_vk_scalar_mm_spec(device, std::move(warptile), aligned_variant,
+                                      r.geom.pad, r.geom.reshape);
         }
         // The THREE creation parameters live in one place (t3-shell-plan.md 6.9 item 8), and the
         // family they belong to is DERIVED from the row's own path -- never written here (cm1-a /
@@ -20946,8 +20997,40 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
     // C5: the (family, path) pairs this file really DECLARES -- i.e. the rows that installed.
     // The SAME key function the used-side uses, so the two sets are comparable by construction.
     std::map<std::string, bool> declared_keys;
+    // cm1-d / item 7: the dispatch face has NO pad/reshape dimension -- vk_tuned_row_matches works
+    // on the exact (m, k) pair (GV:287-295) and the lookup returns one row -- so a set holding two
+    // rows with the same (family, key_m, key_k) and DIFFERENT (pad, reshape) is not a set: whichever
+    // landed first would shadow the other, and the shadowing would present itself as "there is only
+    // one row here".  The whole GROUP is refused rather than the later row, so the outcome can never
+    // be half-installed.  Exact duplicates are idempotent and stay legal.
+    struct vk_row_pin { int pad; int reshape; bool conflict; };
+    std::map<std::array<uint64_t, 4>, vk_row_pin> row_pins;
     for (size_t i = 0; i < n_rows; i++) {
         const vk_tune_row_spec & r = rows[i];
+        const std::array<uint64_t, 4> pk = { (uint64_t) r.src0_type, (uint64_t) r.src1_type,
+                                             (uint64_t) r.key_m, (uint64_t) r.key_k };
+        auto it = row_pins.find(pk);
+        if (it == row_pins.end()) {
+            row_pins.emplace(pk, vk_row_pin { r.geom.pad, r.geom.reshape, false });
+        } else if (it->second.pad != r.geom.pad || it->second.reshape != r.geom.reshape) {
+            it->second.conflict = true;
+        }
+    }
+    for (size_t i = 0; i < n_rows; i++) {
+        const vk_tune_row_spec & r = rows[i];
+        // The refusal belongs in THIS loop (its `continue` is what keeps the row out of `pending`).
+        // The first version of this check sat in a loop of its own, where `continue` skipped nothing:
+        // both rows were logged as dropped and then installed anyway -- measured by the A3p leg
+        // (2 installed, pipes=8, and a hit, i.e. the shadowing it exists to prevent).
+        const std::array<uint64_t, 4> pk = { (uint64_t) r.src0_type, (uint64_t) r.src1_type,
+                                             (uint64_t) r.key_m, (uint64_t) r.key_k };
+        const auto pit = row_pins.find(pk);
+        if (pit != row_pins.end() && pit->second.conflict) {
+            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, "unsupported (our gap)",
+                     "two rows share (src0, src1, key_m, key_k) but differ in PAD/RESHAPE: the "
+                     "dispatch face cannot tell them apart, so neither is installed");
+            continue;
+        }
 
         const char * why = vk_tile_candidate_reason(r.path, r.geom, vk_tile_wave_for(ctx->device->subgroup_size));
         if (why != nullptr) {
