@@ -422,8 +422,13 @@ struct vk_matmul_pipeline_struct {
     // We only check for unaligned variants since one of the unaligned pipelines must exist
     // while aligned pipelines are optional
     // NOTE (T2 close-out, invariant I1): this deliberately ignores tuned rows, so a
-    // tuned row must never be installed on an object whose stock buckets are absent
-    // -- see ggml_vk_tuned_row_check().  The mmq/q8_1 paths and the mul_mat_id acc
+    // tuned row must never be installed on an object that is_empty() calls empty
+    // -- see ggml_vk_tuned_row_check(), whose predicate is THIS function and NOT any
+    // particular bucket: `l` is not universal (Intel: l = coopmat_support; AMD
+    // proprietary: l = coopmat_support && !AmdProprietary -- runtime-tuner-spec.md:87)
+    // and aligned buckets are optional by the definition below.  That clause carries
+    // the measurement; this comment states the rule it must obey.
+    // The mmq/q8_1 paths and the mul_mat_id acc
     // selector use is_empty() to decide whether a (family, acc) exists at all (the
     // id path then asserts), so a tuned-only object would be misjudged as absent.
     bool is_empty() const {
@@ -10038,7 +10043,8 @@ static void ggml_vk_t2_log_tuned_row(ggml_backend_vk_context * ctx, const vk_mat
 //
 // `row` may be null for identity-only checks (the self-test uses that).  The checks are
 // stamped with the same I-numbers as the plan so a rejection is traceable:
-//   I1 stock buckets exist          -- is_empty() ignores tuned rows (see the struct)
+//   I1 the (family, acc) object is non-empty -- is_empty() is the selector's own test, so no
+//      particular bucket may be required (see the clause body)
 //   I2 the row targets the object this device resolves (uses the real resolver, so it
 //      cannot drift from the selector; measured: the 5080 always resolves .f16acc,
 //      which is exactly why the custom: probe is inert)
@@ -10052,15 +10058,57 @@ static void ggml_vk_t2_log_tuned_row(ggml_backend_vk_context * ctx, const vk_mat
 //      variant is deliberately NOT a rejection -- see ggml_vk_tuned_row_align_advice.
 //   I5 the row does not target the mmq/q8_1 path, whose shader has its own layout and
 //      where padded_n would start depending on the row's wg_denoms
+// The first non-null STOCK bucket of an object, or nullptr when the object is empty.
+//
+// NOTE (R5, 2026-09-20): the self-test used to read `->l` as the synonym of "this object has a
+// stock pipeline", and `l` is NOT universal -- the vendor bucket rules build it only where
+// coopmat_support holds (Intel: never; AMD proprietary: never -- runtime-tuner-spec.md:87).
+// Measured on an Intel Iris Xe, that made three probes print `G13 pick=FAILED [0100]`,
+// `I3(no unaligned)=ACCEPTED (BUG)` and `I4(oversize ALIGNED align, stock=0)=WRONG` on a device
+// whose `m` bucket was fine: the probe was wrong, not the device.  The probes only ever claim
+// NULL-NESS, so they must read null-ness of ANY bucket instead of the presence of one.
+static vk_pipeline ggml_vk_tuned_row_first_stock(const vk_matmul_pipeline & obj) {
+    if (obj == nullptr) {
+        return nullptr;
+    }
+    const vk_pipeline stock[6] = { obj->l, obj->m, obj->s, obj->a_l, obj->a_m, obj->a_s };
+    for (const vk_pipeline & p : stock) {
+        if (p != nullptr) {
+            return p;
+        }
+    }
+    return nullptr;
+}
+
 static const char * ggml_vk_tuned_row_check_impl(ggml_backend_vk_context * ctx, const vk_matmul_pipeline & target,
                                                  ggml_type src0_type, ggml_type src1_type,
                                                  const vk_tuned_row * row, bool live_resolver) {
-    // I1: the stock buckets must exist.  is_empty() ignores tuned rows, and the
-    // mmq/q8_1 paths plus the mul_mat_id acc selector use it to decide whether a
-    // (family, acc) exists at all (the id path then asserts) -- so a tuned-only
-    // object would be misjudged as absent.
-    if (target->l == nullptr || target->a_l == nullptr) {
-        return "I1: stock l/aligned_l bucket missing on this (family, acc)";
+    // I1: the (family, acc) object must be NON-EMPTY by the selector's own test.  is_empty()
+    // deliberately ignores tuned rows, and the mmq/q8_1 paths plus the mul_mat_id acc selector
+    // use it to decide whether a (family, acc) exists at all (the id path then asserts) -- so a
+    // tuned-only object would be misjudged as absent.
+    //
+    // NOTE (R5, 2026-09-20): the predicate is is_empty() ITSELF, not any particular bucket.
+    // This clause required `l` (and the aligned `a_l`) until this batch, which is strictly
+    // STRONGER than the reason it was written for, and unreachable-strong on exactly the devices
+    // the vendor bucket rules leave without `l`: Intel takes `l = coopmat_support` and AMD's
+    // proprietary driver takes `l = coopmat_support && !AmdProprietary`
+    // (runtime-tuner-spec.md:87), so both permanently lack it.  Measured on an Intel Iris Xe:
+    // every row was dropped with this very message while the object it aimed at had m/s present
+    // and carried 99.7% of that device's GEMM time.  The ALIGNED bucket is not required either:
+    // is_empty()'s own definition calls aligned pipelines optional, and an oversized aligned
+    // variant is advice (ggml_vk_tuned_row_align_advice), never a rejection.
+    //
+    // The hazard is a row installed on an object is_empty() calls empty: it would be COUNTED as
+    // installed and then never dispatched (the selector skips empty objects) -- a dead row that
+    // only the per-row HIT assertion could catch.  Conversely a non-empty object is reachable by
+    // construction, since the target came from the family resolver, so this predicate is exactly
+    // as strong as the reason and no stronger.
+    // If a fourth is_empty() use site ever appears (three today -- t1-switches.md, invariant I1),
+    // the REASON here may change: re-derive the predicate from that site instead of widening it
+    // by habit.
+    if (target == nullptr || target->is_empty()) {
+        return "I1: the (family, acc) object is empty (no stock l/m/s bucket)";
     }
     // I2: the row must target the object this device actually selects.  Using the real
     // resolver keeps this in sync with the selector by construction.  `live_resolver` is false
@@ -10166,12 +10214,28 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
     vk_matmul_pipeline empty_obj = std::make_shared<vk_matmul_pipeline_struct>();
     const char * reason_empty = ggml_vk_tuned_row_check(ctx, empty_obj, GGML_TYPE_F16, GGML_TYPE_F32);
 
+    // I1's POSITIVE twin (R5, 2026-09-20): an l-LESS but non-empty object must be ACCEPTED.
+    // is_empty() is `l == nullptr && m == nullptr && s == nullptr`, so an object with only `m` is
+    // non-empty and reachable by the selector -- and that is the measured shape on Intel
+    // (l = coopmat_support) and on AMD's proprietary driver, i.e. exactly the devices where every
+    // row used to be refused.  Synthetic on purpose: the clause reads pointer null-ness only
+    // (that IS the predicate), so a local object is a faithful input -- and being local is the
+    // point, because it makes "a predicate that demands `l`" print FAILED on EVERY device instead
+    // of only on hardware we happen to have.  The install-time entry is used (so I2 cannot fire):
+    // I2 compares against the resolver and would reject any synthetic object for the wrong reason.
+    vk_matmul_pipeline lless_obj = std::make_shared<vk_matmul_pipeline_struct>();
+    lless_obj->m = std::make_shared<vk_pipeline_struct>();         // non-empty by is_empty(); `l` stays null
+    vk_tuned_row lless_row;
+    lless_row.unaligned = std::make_shared<vk_pipeline_struct>();  // I3 needs one; align 0 vs stock align 0 keeps I4 out
+    const bool i1_lless_ok =
+        ggml_vk_tuned_row_check_install_time(lless_obj, GGML_TYPE_F16, GGML_TYPE_F16, lless_row) == nullptr;
+
     // A real object that the resolver does not return for this family => I2 must
     // reject (pick any non-null, non-resolved candidate).
     const char * reason_mismatch = nullptr;
     const char * family_name = "n/a";
     const vk_matmul_pipeline bf16_cand = ctx->device->pipeline_matmul_bf16;
-    if (bf16_cand != nullptr && bf16_cand->l != nullptr) {
+    if (ggml_vk_tuned_row_first_stock(bf16_cand) != nullptr) {
         reason_mismatch = ggml_vk_tuned_row_check(ctx, bf16_cand, GGML_TYPE_F16, GGML_TYPE_F32);
         family_name = "bf16";
     }
@@ -10179,15 +10243,26 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
     // I3/I4/I5 (2026-09-13 review): the row-level invariants, exercised on the real
     // f16/f16 object with local rows.  The pipelines referenced are stock ones, so the
     // test never creates anything; only null-ness and the align field are read.
+    //
+    // NOTE (R5, 2026-09-20): the gate is "the object has SOME stock bucket" and the probe pipeline
+    // is that bucket -- NOT `->l`.  Gating on `->l` skipped this whole block on a device that does
+    // not build `l` (Intel: l = coopmat_support) and then printed the SKIP as
+    // `I3(no unaligned)=ACCEPTED (BUG)` and `I4(...stock=0)=WRONG`: "did not measure" and
+    // "measured a bug" must never share a spelling, so an unrun block now prints n/a.
+    // The three probes go through the install-time entry, whose clauses are exactly I1/I3/I4/I5:
+    // they claim nothing about I2, and I2 would relabel a probe with the wrong clause on any
+    // device where the resolver happens to answer with the other acc variant.
     const vk_matmul_pipeline f16_obj = ctx->device->pipeline_matmul_f16.f16acc;
+    const vk_pipeline f16_probe = ggml_vk_tuned_row_first_stock(f16_obj);
     const char * reason_no_unaligned = nullptr;
     const char * reason_align = nullptr;
     uint32_t stock_align_dbg = 0;
     bool i4_aligned_ok = false;
-    if (f16_obj != nullptr && f16_obj->l != nullptr) {
+    const bool i3_i4_ran = (f16_probe != nullptr);
+    if (i3_i4_ran) {
         vk_tuned_row only_aligned_row;
-        only_aligned_row.aligned = f16_obj->l;         // no unaligned -> I3
-        reason_no_unaligned = ggml_vk_tuned_row_check(ctx, f16_obj, GGML_TYPE_F16, GGML_TYPE_F16, &only_aligned_row);
+        only_aligned_row.aligned = f16_probe;          // no unaligned -> I3
+        reason_no_unaligned = ggml_vk_tuned_row_check_install_time(f16_obj, GGML_TYPE_F16, GGML_TYPE_F16, only_aligned_row);
 
         // A row whose align exceeds every stock bucket's align -> I4.
         const vk_pipeline stock[6] = { f16_obj->l, f16_obj->m, f16_obj->s, f16_obj->a_l, f16_obj->a_m, f16_obj->a_s };
@@ -10200,15 +10275,15 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
         oversize->align = stock_align_dbg * 2 + 1;
         vk_tuned_row oversize_unaligned_row;
         oversize_unaligned_row.unaligned = oversize;
-        reason_align = ggml_vk_tuned_row_check(ctx, f16_obj, GGML_TYPE_F16, GGML_TYPE_F16, &oversize_unaligned_row);
+        reason_align = ggml_vk_tuned_row_check_install_time(f16_obj, GGML_TYPE_F16, GGML_TYPE_F16, oversize_unaligned_row);
 
         // ... whereas an oversized ALIGNED variant is accepted and only advises
         // (item 14b): a candidate-0-style geometry must not be stricter as a row than it
         // is through KATAGO_VK_MM_TILE=custom:.
         vk_tuned_row oversize_aligned_row;
-        oversize_aligned_row.unaligned = f16_obj->l;
+        oversize_aligned_row.unaligned = f16_probe;
         oversize_aligned_row.aligned = oversize;
-        const char * check_aligned = ggml_vk_tuned_row_check(ctx, f16_obj, GGML_TYPE_F16, GGML_TYPE_F16, &oversize_aligned_row);
+        const char * check_aligned = ggml_vk_tuned_row_check_install_time(f16_obj, GGML_TYPE_F16, GGML_TYPE_F16, oversize_aligned_row);
         const char * advice_aligned = ggml_vk_tuned_row_align_advice(f16_obj, &oversize_aligned_row);
         i4_aligned_ok = (check_aligned == nullptr && advice_aligned != nullptr);
     }
@@ -10262,17 +10337,26 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
     // G13 (t3-shell-plan.md section 1.4, the P1 rule).  Synthetic pipelines are enough:
     // only null-ness matters to the rule.  The unaligned pipeline is never obtained
     // here -- we compare pointers and null-ness, not dispatch anything.
+    //
+    // NOTE (R5, 2026-09-20): the probe object is synthetic AND deliberately l-less, because this
+    // probe used to take the real f16 object's `->l` as its "a stock pipeline" value.  On a device
+    // that does not build `l` (Intel: l = coopmat_support) both probe rows then held nullptr and
+    // the line read `G13 pick=FAILED [0100]` while the pick() rule it tests was fine -- the probe
+    // was wrong, not the device.  A local object also pins the rule to null-ness instead of to
+    // this device's bucket layout, and it makes "someone hard-codes `->l` again" a red leg even
+    // on a device that HAS `l`.
+    vk_matmul_pipeline g13_obj = std::make_shared<vk_matmul_pipeline_struct>();
+    g13_obj->m = std::make_shared<vk_pipeline_struct>();          // `l` stays null on purpose
+    const vk_pipeline g13_pipe = ggml_vk_tuned_row_first_stock(g13_obj);
     vk_tuned_row only_aligned;
-    only_aligned.aligned = ctx->device->pipeline_matmul_f16.f16acc != nullptr
-                         ? ctx->device->pipeline_matmul_f16.f16acc->l : nullptr;
+    only_aligned.aligned = g13_pipe;
     vk_tuned_row only_unaligned;
-    only_unaligned.unaligned = ctx->device->pipeline_matmul_f16.f16acc != nullptr
-                             ? ctx->device->pipeline_matmul_f16.f16acc->l : nullptr;
+    only_unaligned.unaligned = g13_pipe;
     const bool pick_aligned_from_aligned_only = ggml_vk_tuned_row_pick(only_aligned, true) != nullptr;
     const bool pick_unaligned_is_null         = ggml_vk_tuned_row_pick(only_aligned, false) == nullptr;  // the P1 assertion
     const bool pick_unaligned_ok              = ggml_vk_tuned_row_pick(only_unaligned, false) != nullptr;
     const bool pick_aligned_falls_back        = ggml_vk_tuned_row_pick(only_unaligned, true) != nullptr;
-    const bool g13_ok = pick_aligned_from_aligned_only && pick_unaligned_is_null
+    const bool g13_ok = g13_pipe != nullptr && pick_aligned_from_aligned_only && pick_unaligned_is_null
                      && pick_unaligned_ok && pick_aligned_falls_back;
 
     // Row-table contract (t3-shell-plan.md section 1.5): a local table, so the context's
@@ -10288,6 +10372,7 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
     ggml_vk_t2_line("tuned-row validator self-test: I1(no stock)="
                     + std::string(reason_empty != nullptr ? "rejected" : "ACCEPTED (BUG)")
                     + " [" + (reason_empty ? reason_empty : "-") + "]"
+                    + ", I1b(l-less non-empty object)=" + (i1_lless_ok ? "ok" : "FAILED")
                     + ", I2(wrong family " + family_name + ")="
                     + (reason_mismatch != nullptr ? "rejected" : "not exercised")
                     + " [" + (reason_mismatch ? reason_mismatch : "-") + "]"
@@ -10303,9 +10388,12 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
                     + (table_ok ? "ok" : "FAILED")
                     + " [" + std::to_string((int) install1) + std::to_string((int) lookup_before_freeze)
                     + std::to_string((int) !install2) + "]"
-                    + ", I3(no unaligned)=" + (reason_no_unaligned != nullptr ? "rejected" : "ACCEPTED (BUG)")
+                    + ", I3(no unaligned)="
+                    + (i3_i4_ran ? (reason_no_unaligned != nullptr ? "rejected" : "ACCEPTED (BUG)") : "n/a (no stock bucket)")
+                    + ", I4(oversize UNALIGNED align, stock=" + std::to_string(stock_align_dbg) + ")="
+                    + (i3_i4_ran ? (reason_align != nullptr ? "rejected" : "ACCEPTED (BUG)") : "n/a (no stock bucket)")
                     + ", I4(oversize ALIGNED align, stock=" + std::to_string(stock_align_dbg) + ")="
-                    + (i4_aligned_ok ? "accepted+advised" : "WRONG")
+                    + (i3_i4_ran ? (i4_aligned_ok ? "accepted+advised" : "WRONG") : "n/a (no stock bucket)")
                     + ", I5(q8_1 target)=" + (reason_q8_1 != nullptr ? "rejected" : "ACCEPTED (BUG)")
                     + ", axis classes=" + (axes_ok ? "ok" : "FAILED"));
 }
@@ -21070,8 +21158,11 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
             continue;
         }
 
-        // I1: a row must never be installed on an object whose stock buckets are absent
-        // (the mmq/q8_1 and mul_mat_id paths use is_empty() to decide existence at all).
+        // I1: a row must never be installed on an object that is_empty() calls empty (the
+        // mmq/q8_1 and mul_mat_id paths use is_empty() to decide existence at all).  The clause
+        // itself lives in ggml_vk_tuned_row_check_install_time below, so this loop's is_empty()
+        // skip and that clause are one test by construction -- and neither may demand a
+        // particular bucket (`l` is not universal; see the clause for the measurement).
         //
         // Counted per ROW, and only a row that landed NOWHERE is a drop -- that is what keeps
         // `installed + sum(dropped_*) == declared` true.  The two per-TARGET facts go into
