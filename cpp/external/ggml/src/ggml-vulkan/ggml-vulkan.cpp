@@ -4633,23 +4633,47 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
 // layout by 40% (measured: the stock cm1 l bucket is 22528 bytes, that expression gives 12544).
 // The init path only LOOKS right because it passes *_warptile_mmq, where BK really is 32.
 //
-// SHMEM_STRIDE_PAD is spec id 12 (mul_mm.comp:122), whose shader default is 4 -- NOT the scalar
-// path's compile-time 1 (mul_mm.comp:132).  What reaches a cm1 pipeline is decided by
-// ggml_vk_scalar_mm_spec (:4884-4896) and is GLOBAL, never per row: the Intel-proprietary coopmat
-// case hardcodes 0 (:4886-4889), otherwise the KATAGO_VK_MM_TILE=custom: dev knob if it set one
-// (:4890-4894), and the shader default 4 if it did not.  Reading it here is what keeps this
-// estimate from disagreeing with the stride the pipeline was really built with.
-//
+// SHMEM_STRIDE_PAD is spec id 12.  THREE things decide what a pipeline really runs with, and they
+// are not the same number -- which is why the decision is the function below and not a literal here:
+//   * the Intel-proprietary coopmat hardcode 0, together with APPLY_SLM_A_RESHAPE = true
+//     (:4959-4962, the Intel branch of ggml_vk_scalar_mm_spec);
+//   * the KATAGO_VK_MM_TILE=custom: probe knobs, injected as a PAIR (:4963-4973): when only
+//     `reshape` is set the injected PAD is 1, deliberately NOT the shader default;
+//   * the shader's OWN default, which is PER VARIANT: 4 on the COOPMAT branch (mul_mm.comp:122),
+//     1 on the scalar one (mul_mm.comp:132).
+// Before cm1c2 THIS function's body re-implemented the first two and assumed the COOPMAT default, so
+// with only the reshape knob set it computed stride 20 where the pipeline had 17: an OVER-refusal,
+// and "geometry needs more shared memory than this device has" is a writable DEVICE verdict
+// (VK_TUNE_CAPABILITY_CLASSES), i.e. exactly the direction that must not be guessed.
+enum {
+    VK_MM_PAD_DEFAULT_COOPMAT = 4,   // mul_mm.comp:122            -- the variant this file estimates
+    VK_MM_PAD_DEFAULT_SCALAR  = 1,   // mul_mm.comp:132            -- documented, not yet consumed:
+                                     //    I6's SCALAR estimate is the subject of G-C2c
+    VK_MM_PAD_DEFAULT_PAIR    = 1,   // what a PAIR injects when only its sibling is set (:4971)
+};
+static int ggml_vk_mm_spec_pad_eff(const vk_device & device, int fallback) {
+    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
+        device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
+        return 0;
+    }
+    if (mm_spec_pad >= 0) {
+        return mm_spec_pad;
+    }
+    if (mm_spec_reshape >= 0) {
+        return VK_MM_PAD_DEFAULT_PAIR;
+    }
+    return fallback;
+}
+
 // Precondition (the same one the I6 caller documents): the geometry already passed
 // vk_tile_candidate_reason, so BM/BN/WM/WN/BS are non-zero.  `wave` is never 0 by construction
 // (vk_tile_wave_for), so the division below cannot trap.
 static uint32_t ggml_vk_cm1_row_shmem(const vk_device & device, const vk_tile_geometry & g,
                                       uint32_t wave, uint32_t acc_size) {
     const uint32_t bk_eff = 32u;                       // mul_mm.comp:113-115
-    const uint32_t pad_eff = (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
-                              device->driver_id == vk::DriverId::eIntelProprietaryWindows)
-                                 ? 0u
-                                 : (mm_spec_pad >= 0 ? (uint32_t) mm_spec_pad : 4u);
+    // The effective PAD: the ONE decision function, with THIS variant's shader default as the
+    // fallback.  Never the row's `g.pad` -- that value reaches no spec at all (see the axis table).
+    const uint32_t pad_eff = (uint32_t) ggml_vk_mm_spec_pad_eff(device, VK_MM_PAD_DEFAULT_COOPMAT);
     const uint32_t stride = bk_eff / 2u + pad_eff;     // mul_mm.comp:135
     const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
     const uint32_t load_bufs = (g.BM + g.BN) * stride * 2u * type_size;   // mul_mm.comp:137-138
@@ -4938,9 +4962,15 @@ static std::vector<uint32_t> ggml_vk_scalar_mm_spec(const vk_device & device, st
         spec.push_back(0u);  // constantID=12: SHMEM_STRIDE_PAD = 0
         spec.push_back(1u);  // constantID=13: APPLY_SLM_A_RESHAPE = true
     } else if (mm_spec_pad >= 0 || mm_spec_reshape >= 0) {
-        // P2 probe knobs: inject 12/13 as a PAIR (position-mapped constantIDs,
-        // GG:3058), defaults 1/false = bit-identical to shader defaults.
-        spec.push_back(mm_spec_pad >= 0 ? (uint32_t)mm_spec_pad : 1u);
+        // P2 probe knobs: inject 12/13 as a PAIR (position-mapped constantIDs, GG:3058).  The PAD
+        // value comes from the ONE decision function (:4647-4666, ggml_vk_mm_spec_pad_eff),
+        // with the PAIR's own fallback --
+        // NOT the shader default.  The distinction is real for the COOPMAT variant, whose shader
+        // default is 4 (mul_mm.comp:122): with only `reshape` set, cm1 pipelines really do get
+        // PAD 1.  (The comment that used to sit here claimed this pair was "bit-identical to shader
+        // defaults", which holds for the scalar variant only -- the same wrong assumption cm1c2
+        // removed from the estimate.)  reshape's own default here is false, and unchanged.
+        spec.push_back((uint32_t) ggml_vk_mm_spec_pad_eff(device, VK_MM_PAD_DEFAULT_PAIR));
         spec.push_back(mm_spec_reshape >= 0 ? (mm_spec_reshape ? 1u : 0u) : 0u);
     }
     return spec;
