@@ -10236,7 +10236,15 @@ static void ggml_vk_tuned_row_selftest(ggml_backend_vk_context * ctx) {
         vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_ENUMERABLE &&
         vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_WMITER)     == VK_TILE_AXIS_INERT &&
         vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_BK)         == VK_TILE_AXIS_INERT &&
-        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_TM)         == VK_TILE_AXIS_ENUMERABLE &&
+        // F14 (G-C4): the fragment shape is the device's, so cm1 PINS it -- it must not be swept.
+        // This line is the visible twin of the two static_asserts in vulkan-tile-validity.h; the
+        // smoke's A3o reads this string, which is what makes "the table and this copy disagree" a
+        // red leg instead of a silent one.
+        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_TM)         == VK_TILE_AXIS_PINNED &&
+        vk_tile_axis_class(VK_TILE_PATH_CM1,    VK_TILE_AXIS_TN)         == VK_TILE_AXIS_PINNED &&
+        // ... and the same axis must stay live on the scalar path (F14's second half).
+        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_TM)         == VK_TILE_AXIS_ENUMERABLE &&
+        vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_TN)         == VK_TILE_AXIS_ENUMERABLE &&
         vk_tile_axis_class(VK_TILE_PATH_CM2,    VK_TILE_AXIS_SMALLER)    == VK_TILE_AXIS_ENUMERABLE;
 
     // Row matching rule (t3-shell-plan.md K1, sentinel semantics).  Pure function on

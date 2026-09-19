@@ -453,9 +453,25 @@ static inline constexpr int vk_tile_axis_class(int path, int axis) {
         case VK_TILE_AXIS_BN:
         case VK_TILE_AXIS_WM:
         case VK_TILE_AXIS_WN:
+            return VK_TILE_AXIS_ENUMERABLE;
         case VK_TILE_AXIS_TM:
         case VK_TILE_AXIS_TN:
-            return VK_TILE_AXIS_ENUMERABLE;
+            // F14 (G-C4): PINNED on cm1 -- not ENUMERABLE, and NOT INERT either.
+            //   * Not ENUMERABLE: the only value this device accepts is its own cooperative-matrix
+            //     shape (I6, ggml-vulkan.cpp:20701), so a sweep would emit rows that can only be
+            //     refused.  Those refusals are classified as DEVICE verdicts
+            //     (VK_TUNE_CAPABILITY_CLASSES: our_gap = false), and `structural-all-reject` is
+            //     writable exactly when every reason is a device property (vulkantuner.cpp:388 /
+            //     :405-407) -- so sweeping an axis WE chose to sweep could mint a durable "this
+            //     device cannot do cm1".  The plumbing that fills that flag from the install
+            //     accounting is what waits for B5/B6 (:1375), which is why this is closed at the
+            //     SOURCE now instead of relying on the write side to notice.
+            //   * Not INERT: INERT means "exists, but sweeping it does nothing" (see the cm2 note at
+            //     :440-443).  Here the value must be RIGHT; INERT would turn "fill the device's
+            //     shape" into "fill anything".
+            //   * The scalar path keeps both: its spec really carries constant_id 7/8 and no device
+            //     constrains them (pinned by the third static_assert below).
+            return path == VK_TILE_PATH_CM1 ? VK_TILE_AXIS_PINNED : VK_TILE_AXIS_ENUMERABLE;
         case VK_TILE_AXIS_WMITER:
             // Scalar: ENUMERABLE.  cm1: INERT (cm1-c).  WMITER reaches mul_mm.comp's COOPMAT
             // branch only through WSUBM/WNITER, and every USE of those is on the `#else` (scalar)
@@ -511,30 +527,49 @@ static inline int vk_tile_axis_is_live(int path, int axis) {
 // the kind of claim that rots silently.  Making vk_tile_axis_class() constexpr (it is a pure switch
 // over two ints) is what buys these three lines; nothing else about it changed.
 //
-// 1) cm1 must not sweep the four decorative axes.  Each has a line-level reason in the cases above:
-//    the row's value never reaches the shader, on either path.
+// 1) cm1's DECORATIVE axes must not be swept -- and the two kinds are named separately, because
+//    collapsing them into one word is exactly how this comment went stale: WMITER and BK never
+//    reach the shader on either path, while PAD and RESHAPE have really been wired since cm1-d
+//    (their row values DO reach spec 12/13, which is why they are ENUMERABLE).  The assert pins
+//    BOTH halves, so neither word can drift over the other again.
 static_assert(vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_WMITER) == VK_TILE_AXIS_INERT &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BK) == VK_TILE_AXIS_INERT,
-              "cm1-c: WMITER / PAD / RESHAPE / BK must not be swept on cm1 -- sweeping them would "
-              "emit N identical rows (the shader does not read the row's value)");
+              "cm1: WMITER / BK must not be swept on cm1 -- sweeping them would emit N identical "
+              "rows (the shader does not read the row's value on either path); PAD / RESHAPE ARE "
+              "swept, and since cm1-d the row's value really does reach spec 12/13");
 // 2) The other direction, so that INERT cannot spread over the real geometry by accident: what cm1
-//    may sweep is the six geometry axes PLUS pad/reshape since cm1-d (eight), and BS is DERIVED from
-//    the geometry plus the wave.
+//    may sweep is the four FREE geometry axes (BM/BN/WM/WN) PLUS pad/reshape since cm1-d -- six --
+//    and BS is DERIVED from the geometry plus the wave.  TM/TN left this set in F14: they are this
+//    device's fragment shape, so they are PINNED (case body above).  The value must be right, but
+//    sweeping it would only produce rows the device refuses, and those refusals are classed as
+//    DEVICE verdicts -- i.e. a sweep of OUR choosing could mint a durable device claim.
 static_assert(vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BM) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BN) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_WM) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_WN) == VK_TILE_AXIS_ENUMERABLE &&
-              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_TM) == VK_TILE_AXIS_ENUMERABLE &&
-              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_TN) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_SPEC_RESHAPE) == VK_TILE_AXIS_ENUMERABLE &&
-              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BS) == VK_TILE_AXIS_DERIVED,
-              "cm1-c: the cm1 axis space is the geometry (BM/BN/WM/WN/TM/TN) plus a derived BS");
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_BS) == VK_TILE_AXIS_DERIVED &&
+              // F14: and the two the device dictates are PINNED, not INERT -- the value they carry
+              // must be the device's, they simply may not be swept.  Without these two claims the
+              // `path ==` test in the case body could be dropped or the answer changed to INERT and
+              // nothing would redden (R35 checks that these claims EXIST; the compiler checks them).
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_TM) == VK_TILE_AXIS_PINNED &&
+              vk_tile_axis_class(VK_TILE_PATH_CM1, VK_TILE_AXIS_TN) == VK_TILE_AXIS_PINNED,
+              "cm1: the sweepable cm1 axis space is the free geometry (BM/BN/WM/WN) plus pad/reshape "
+              "since cm1-d (six), with BS derived and the fragment shape (TM/TN) pinned");
 // 3) WMITER is the one axis whose answer DIFFERS between the two warptile paths, so it is the one a
 //    refactor can collapse without noticing: scalar runs the `#else` side that reads WSUBM/WNITER.
 static_assert(vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_WMITER) == VK_TILE_AXIS_ENUMERABLE &&
               vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_SPEC_PAD) == VK_TILE_AXIS_INERT,
               "cm1-c: WMITER is a live scalar axis (the scalar inner loop reads WSUBM/WNITER) and a "
               "dead cm1 one");
+// 4) F14 added the SECOND axis whose answer differs per path: TM/TN are PINNED on cm1 (the device
+//    dictates them) but stay real, sweepable axes on scalar, whose spec carries constant_id 7/8 with
+//    no device constraint.  Without this line the `path ==` test in the case body could be dropped
+//    and would silently delete a scalar tuning axis -- the assert is what makes that a compile error.
+static_assert(vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_TM) == VK_TILE_AXIS_ENUMERABLE &&
+              vk_tile_axis_class(VK_TILE_PATH_SCALAR, VK_TILE_AXIS_TN) == VK_TILE_AXIS_ENUMERABLE,
+              "F14: TM/TN are pinned on cm1 but must stay sweepable on the scalar path");
