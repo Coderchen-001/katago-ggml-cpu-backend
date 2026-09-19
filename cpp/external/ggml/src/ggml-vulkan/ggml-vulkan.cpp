@@ -4633,14 +4633,16 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
 // layout by 40% (measured: the stock cm1 l bucket is 22528 bytes, that expression gives 12544).
 // The init path only LOOKS right because it passes *_warptile_mmq, where BK really is 32.
 //
-// SHMEM_STRIDE_PAD is spec id 12.  THREE things decide what a pipeline really runs with, and they
+// SHMEM_STRIDE_PAD is spec id 12.  FOUR things decide what a pipeline really runs with, and they
 // are not the same number -- which is why the decision is the function below and not a literal here:
 //   * the Intel-proprietary coopmat hardcode 0, together with APPLY_SLM_A_RESHAPE = true
 //     (:4959-4962, the Intel branch of ggml_vk_scalar_mm_spec);
 //   * the KATAGO_VK_MM_TILE=custom: probe knobs, injected as a PAIR (:4963-4973): when only
 //     `reshape` is set the injected PAD is 1, deliberately NOT the shader default;
 //   * the shader's OWN default, which is PER VARIANT: 4 on the COOPMAT branch (mul_mm.comp:122),
-//     1 on the scalar one (mul_mm.comp:132).
+//     1 on the scalar one (mul_mm.comp:132);
+//   * and -- since cm1-d -- the ROW's own value, which outranks all three (the row's pipeline is the
+//     pipeline).  It cannot meet the Intel hardcode above: I6 refuses that combination by name.
 // Before cm1c2 THIS function's body re-implemented the first two and assumed the COOPMAT default, so
 // with only the reshape knob set it computed stride 20 where the pipeline had 17: an OVER-refusal,
 // and "geometry needs more shared memory than this device has" is a writable DEVICE verdict
@@ -4698,7 +4700,9 @@ static uint32_t ggml_vk_cm1_row_shmem(const vk_device & device, const vk_tile_ge
                                       uint32_t wave, uint32_t acc_size) {
     const uint32_t bk_eff = 32u;                       // mul_mm.comp:113-115
     // The effective PAD: the ONE decision function, with THIS variant's shader default as the
-    // fallback.  Never the row's `g.pad` -- that value reaches no spec at all (see the axis table).
+    // fallback and the ROW's own value (cm1-d wired it) as its first source.  (This comment used to
+    // say the row's value "reaches no spec at all", which was true before the wiring and would now
+    // contradict the call below it.)
     const uint32_t pad_eff = (uint32_t) ggml_vk_mm_spec_pad_eff(device, VK_MM_PAD_DEFAULT_COOPMAT,
                                                                  g.pad);
     const uint32_t stride = bk_eff / 2u + pad_eff;     // mul_mm.comp:135
