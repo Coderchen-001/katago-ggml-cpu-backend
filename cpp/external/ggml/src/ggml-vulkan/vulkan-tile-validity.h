@@ -317,11 +317,14 @@ static inline const char * vk_tile_candidate_reason(int path, const vk_tile_geom
         // 0 is NOT a synonym for "default" on PAD: it is the Intel-proprietary stride, 16+0
         // instead of 16+4, i.e. a real (and different) layout.
         if (g.pad >= 0 && g.pad != 4) {
-            return "cm1: PAD must be 4 (the value this shader runs with) or -1 (unspecified); the "
+            return "cm1: PAD must be 4 (the effective value on the paths this device-independent "
+                   "table can see; the Intel-proprietary coopmat class runs 0 instead -- see "
+                   "ggml_vk_mm_spec_pad_eff) or -1 (unspecified); the "
                    "row's PAD is not wired to spec id 12, so any other value would silently do nothing";
         }
         if (g.reshape >= 0 && g.reshape != 0) {
-            return "cm1: RESHAPE must be 0 (the value this shader runs with) or -1 (unspecified); "
+            return "cm1: RESHAPE must be 0 (the effective value on the paths this table can see; that "
+                   "Intel-proprietary class runs true instead) or -1 (unspecified); "
                    "the row's RESHAPE is not wired to spec id 13, so any other value would silently do nothing";
         }
         if (g.WM / g.TM < 1 || g.WN / g.TN < 1) {
