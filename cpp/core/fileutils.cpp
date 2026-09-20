@@ -56,6 +56,9 @@ string FileUtils::readPathEnv(const char* name) {
   // _wgetenv, not getenv: the process environment is UTF-16 and getenv would narrow it to the ANSI
   // code page, which is what made one path mean two different files (r6).  The NAME is ASCII by
   // construction, so widening it is a byte-to-wchar copy and needs no conversion table.
+  // ANTI-OPTIMIZATION (r6): do NOT keep the pointer _wgetenv returns.  That buffer is owned by the
+  // C runtime, is not safe to hold across threads, and any later _putenv/setenv may invalidate it
+  // -- copy it into a std::wstring in the same statement, as below, and convert from the copy.
   std::wstring wname;
   for (const char* c = name; *c != '\0'; c++) {
     wname.push_back((wchar_t)(unsigned char)*c);

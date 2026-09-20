@@ -1430,10 +1430,44 @@ namespace VulkanTuner {
       }
     }
 
+    // SECOND probe, deliberately a DIFFERENT path (r6): the one above exists to prove the write
+    // GATE refuses to write -- its entire verdict is "still absent", so reusing its path for an
+    // encoding test would dismantle that assertion.  This one proves the ENCODING path can really
+    // publish: written through the real atomic writer, then read back, then removed.  The name is
+    // NON-ASCII on purpose, because that is exactly where the ANSI-open / UTF-8-rename split used
+    // to break (write succeeded, rename could not see the file, tmp litter left behind).  The name
+    // carries the pid so two NN server threads cannot collide, and nothing here persists: a
+    // self-test must not leave state behind or read as a decision.
+#if defined(_WIN32)
+    const long encProbePid = (long) _getpid();
+#else
+    const long encProbePid = (long) getpid();
+#endif
+    const string encProbePath = cacheDir + "/self-test-" + to_string(encProbePid) + "-写入.txt";
+    bool encWrote = false, encReadBack = false, encRemoved = false;
+    {
+      string encErr;
+      const string encContent = "VERSION 4\nROWS 0\n";
+      // WRITE-PATH: self-test
+      // The third disk-write path, and deliberately the only UNGATED one: its subject is the
+      // ENCODING of a path, so routing it through the gated cache writer would prove nothing (a
+      // refusal there is the FIRST probe's subject).  It is removed again just below, so it cannot
+      // leave state behind; the structural half (exactly one tag, one call site, inside this
+      // function) is pinned by guardrail R16, the runtime half by the smoke's A33 pair.
+      encWrote = writeFileAtomic(encProbePath, encContent, encErr);
+      if(encWrote) {
+        string back;
+        encReadBack = readWholeFile(encProbePath, back, encErr) && back == encContent;
+        encRemoved = FileUtils::tryRemoveFile(encProbePath);
+      }
+    }
+
     const bool absent = !FileUtils::exists(probePath);    logLine("cache write self-test: " + to_string(declared) + " outcome(s) declared, "
             + to_string(refused) + " refused by the state gate, " + to_string(allowed)
-            + " state-writable; probe file " + (absent ? "absent" : "PRESENT") + " ["
-            + ((ok && absent) ? "ok" : "FAIL") + "]"
+            + " state-writable; probe file " + (absent ? "absent" : "PRESENT")
+            + "; encoding probe (non-ASCII name) written+read-back+removed ["
+            + ((encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
+            + " [" + ((ok && absent && encWrote && encReadBack && encRemoved) ? "ok" : "FAIL") + "]"
             + (ok ? "" : " first problem: " + firstBad));
   }
 
