@@ -21049,7 +21049,18 @@ static bool ggml_vk_tuned_row_build(vk_device & device, const vk_tune_row_spec &
             pipe->initialized = true;
             ggml_vk_create_pipeline_func(device, pipe, sh.spv_size, sh.spv_data, "main", 3, wg_denoms, spec,
                                          kDisableRobustness, kRequireFullSubgroups, kRequiredSubgroup);
-            if (pipe == nullptr || !pipe->compiled) {
+            // Any failure inside this chain DROPS the row (loud `build-failed`), deliberately NOT
+            // symmetric with the ALIGNED variant -- which the caller keeps, warning instead: with
+            // shader_64b_indexing set, supports_op SKIPS the maxStorageBufferRange check, so falling
+            // back to the 32-bit-only head can be silently WRONG for a large tensor, not merely
+            // slower (G-D24).
+            //
+            // The null test that used to sit here was dead: `pipe` was bound a few lines above to the
+            // head or to a fresh make_shared, so only the compiled flag could fail.  (The reason is
+            // that assignment -- NOT "because it is a reference": a reference to a shared_ptr can
+            // perfectly well hold null, which is exactly what built->next does before this loop
+            // creates the twin.)
+            if (!pipe->compiled) {
                 why = "the create path returned without a compiled pipeline";
                 return false;
             }
@@ -21136,10 +21147,24 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
     // Resolve first, write once: the table install is a whole-set replacement per
     // (family, acc) object, so a partially resolved set must not reach it.
     std::map<const vk_matmul_pipeline_struct *, std::vector<vk_tuned_row>> pending;
-    // lambda (the resident-pipeline count, t1-schema.md section 1 "pipeline cache growth"):
-    // pipelines this install created, reported as `pipes=` below.  Per row the ceiling is
-    // 2 variants x 2 accumulator targets = 4 per context -- one row is one geometry pair and
-    // carries both align variants, not a family of geometries (t3-shell-plan.md 6.9).
+    // the SUCCESSFUL BUILD CALLS this install made, reported as `pipes=` below -- see
+    // t1-schema.md section 1 "pipeline cache growth".  Per row the ceiling is
+    // 2 variants x 2 accumulator targets = 4 -- one row is one geometry pair and carries both align
+    // variants, not a family of geometries (t3-shell-plan.md 6.9).
+    //
+    // NOTE (i64b, 2026-09-19): this counts CALLS, not pipelines, and it is deliberately left that way
+    // -- it is insensitive to the device's variant plan.  One call builds that device's whole variant
+    // chain, so the PIPELINE count is `pipes x plan.count` (the plan lives in
+    // ggml_vk_tile_pipeline_plan_for; on a device exposing VK_EXT_shader_64bit_indexing one call
+    // creates two pipelines, i.e. 4 calls = 8 pipelines -- measured on the 1660).  Do not read
+    // `pipes=` as a pipeline count, and do not "fix" it by calling the resolver here: R37 pins the
+    // resolver to exactly two call sites, and a third one would either turn that check red or, worse,
+    // get the constant relaxed.
+    // "Rejected rows are not free" (G-D12): the build happens BEFORE the install-time clauses
+    // (I1/I3/I4/I5 -- see ggml_vk_tuned_row_check_install_time below), so a row refused there has
+    // already paid its compiles and touched the pipeline cache.  Bucket 3 (`unsupported`) therefore
+    // holds BOTH free refusals (family / capability: they precede the build) and paid ones
+    // (I3/I4/I5: they follow it), and a candidate budget must not assume "only the winner compiles".
     unsigned pipes_created = 0;
     // C5: the (family, path) pairs this file really DECLARES -- i.e. the rows that installed.
     // The SAME key function the used-side uses, so the two sets are comparable by construction.
