@@ -1,10 +1,26 @@
 #ifndef CORE_FILEUTILS_H_
 #define CORE_FILEUTILS_H_
 
+#include <cstdio>
+
 #include "../core/global.h"
 
 namespace FileUtils {
   bool exists(const std::string& path);
+
+  // Open a C FILE* on a UTF-8 path through the SAME conversion every other function here uses
+  // (ghc::filesystem's u8path).  Exists because the tuner's atomic writer needs a FILE* -- for the
+  // fflush + fsync durability an ofstream cannot give -- while still agreeing with
+  // tryRename/tryRemoveFile about what the path names.  Opening with the ANSI fopen while renaming
+  // through this module was the r6 defect: on a non-ASCII path the write succeeded and the rename
+  // could not see the file.  Returns nullptr on failure; the caller fclose()s it.
+  std::FILE* tryFopen(const std::string& filename, const char* mode);
+
+  // Read a PATH-VALUED environment variable as UTF-8, and the ONE place that does so (r6).  On
+  // Windows MSVC's getenv narrows the UTF-16 process environment to the ANSI code page, so a
+  // non-ASCII path arrives as ANSI bytes that every consumer here would then read as UTF-8: one
+  // string, two different files, depending on which layer looks at it.  Empty when unset or empty.
+  std::string readPathEnv(const char* name);
 
   // Returns whether good() is true on the fstream after attempting to call open on it.
   bool tryOpen(std::ifstream& in, const char* filename, std::ios_base::openmode mode = std::ios_base::in);

@@ -1,5 +1,7 @@
 #include "../core/fileutils.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -24,6 +26,54 @@ bool FileUtils::exists(const string& path) {
   catch(const gfs::filesystem_error&) {
     return false;
   }
+}
+
+FILE* FileUtils::tryFopen(const string& filename, const char* mode) {
+  try {
+    const gfs::path p(gfs::u8path(filename));
+#if defined(_WIN32)
+    // ghc::filesystem's native value_type is wchar_t on Windows, so p.c_str() IS the wide path
+    // that the same conversion produced -- there is no hand-rolled UTF-8-to-UTF-16 step here.
+    std::wstring wmode;
+    for (const char* c = mode; c != nullptr && *c != '\0'; c++) {
+      wmode.push_back((wchar_t)(unsigned char)*c);
+    }
+    return ::_wfopen(p.c_str(), wmode.c_str());
+#else
+    return std::fopen(p.c_str(), mode);
+#endif
+  }
+  catch(const gfs::filesystem_error&) {
+    return nullptr;
+  }
+}
+
+string FileUtils::readPathEnv(const char* name) {
+  if (name == nullptr || name[0] == '\0') {
+    return string();
+  }
+#if defined(_WIN32)
+  // _wgetenv, not getenv: the process environment is UTF-16 and getenv would narrow it to the ANSI
+  // code page, which is what made one path mean two different files (r6).  The NAME is ASCII by
+  // construction, so widening it is a byte-to-wchar copy and needs no conversion table.
+  std::wstring wname;
+  for (const char* c = name; *c != '\0'; c++) {
+    wname.push_back((wchar_t)(unsigned char)*c);
+  }
+  const wchar_t* wv = ::_wgetenv(wname.c_str());
+  if (wv == nullptr || wv[0] == L'\0') {
+    return string();
+  }
+  try {
+    return gfs::path(std::wstring(wv)).u8string();
+  }
+  catch(const gfs::filesystem_error&) {
+    return string();
+  }
+#else
+  const char* v = std::getenv(name);
+  return (v == nullptr || v[0] == '\0') ? string() : string(v);
+#endif
 }
 
 bool FileUtils::tryOpen(ifstream& in, const char* filename, std::ios_base::openmode mode) {

@@ -612,8 +612,11 @@ namespace VulkanTuner {
     // The "after" half of the accounting can only be read at the next startup, so it is
     // not reported here -- reporting a same-run number as "after" would be fiction.
     bool pipelineCacheBytesBefore(size_t& out) {
-      const char* path = getenv("GGML_VK_PIPELINE_CACHE");
-      if (path == nullptr || path[0] == '\0') {
+      // ONE reader for path-valued env vars (r6, FileUtils::readPathEnv): getenv here would narrow
+      // a non-ASCII path to the ANSI code page and this function would then quietly report
+      // "unknown" for a cache file that exists.
+      const string path = FileUtils::readPathEnv("GGML_VK_PIPELINE_CACHE");
+      if (path.empty()) {
         return false;
       }
       ifstream in;
@@ -711,12 +714,7 @@ namespace VulkanTuner {
 #endif
       const string tmp = path + ".tmp." + std::to_string(pid) + "."
                        + std::to_string(tmp_seq.fetch_add(1u));
-      FILE* f = nullptr;
-#if defined(_WIN32)
-      fopen_s(&f, tmp.c_str(), "wb");
-#else
-      f = fopen(tmp.c_str(), "wb");
-#endif
+      FILE* f = FileUtils::tryFopen(tmp, "wb");
       if (f == nullptr) {
         err = "cannot open " + tmp + " for writing";
         return false;
@@ -1450,8 +1448,12 @@ namespace VulkanTuner {
     const ModelIdentity& model,
     const TunePolicy& policy
   ) {
-    const char* importEnv = getenv("KATAGO_VK_TUNE_IMPORT");
-    const char* exportEnv = getenv("KATAGO_VK_TUNE_EXPORT");
+    // Path-valued env vars are read through the ONE reader (r6, FileUtils::readPathEnv) so that a
+    // non-ASCII path is UTF-8 here and means the same file to every layer below.  The callers test
+    // `.empty()`, which is what `!= nullptr && [0] != '\0'` used to express: unset and empty both
+    // mean "not given".
+    const string importEnv = FileUtils::readPathEnv("KATAGO_VK_TUNE_IMPORT");
+    const string exportEnv = FileUtils::readPathEnv("KATAGO_VK_TUNE_EXPORT");
     // KATAGO_VK_TUNE_RETUNE=1: ignore whatever is on disk (rows AND the negative entry) and
     // decide again.  It is the operator's "I do not trust this file" switch, and it is
     // deliberately about the whole file rather than about the rows or the negative marker:
@@ -1571,8 +1573,8 @@ namespace VulkanTuner {
       const char* loadPath = nullptr;
       const char* loadKind = nullptr;
       bool fromImport = false;
-      if (importEnv != nullptr && importEnv[0] != '\0') {
-        loadPath = importEnv;
+      if (!importEnv.empty()) {
+        loadPath = importEnv.c_str();
         loadKind = "KATAGO_VK_TUNE_IMPORT";
         fromImport = true;
       }
@@ -1784,7 +1786,7 @@ namespace VulkanTuner {
       // EXPORT writes exactly what a cache file would contain, through the same writer, so
       // the format's round trip is exercised on every run that asks for it (and so a failed
       // write is loud rather than a missing file nobody notices).
-      if (exportEnv != nullptr && exportEnv[0] != '\0') {
+      if (!exportEnv.empty()) {
         const string content = formatRowsFile(*d);
         const string path = exportEnv;
         string err;
