@@ -154,6 +154,12 @@ struct vk_tune_install_result {
     unsigned installed;
     unsigned dropped_illegal;
     unsigned dropped_unsupported;
+    // G-D20: the subset of `dropped_unsupported` whose reason names OUR implementation gap.  The
+    // class table lives in ggml-vulkan.cpp and decides by the reason STRING; a reason it does not
+    // know counts here too (the fail-closed direction, like the loader's unknown-outcome rule).
+    // Same shape as `partial` above: it describes a member of the equality without entering it,
+    // so `installed + sum(dropped_*) == declared` stays exactly what it was.
+    unsigned dropped_unsupported_our_gap;
     unsigned dropped_build_failed;
     unsigned partial;          // subset of `installed` (see above)
     unsigned variant_failed;   // (row, target) build failures (see above)
@@ -180,10 +186,18 @@ enum vk_tune_src_type {
 // static reason naming the missing piece.  `path` is only checked for existence here;
 // whether this DEVICE can use that path is capability (I6), which is the backend's to
 // answer at install time -- the shell must not guess it from the fingerprint.
+// ONE authority for "is this (src0, src1) family wired at all".  This predicate and the backend's
+// object lookup (ggml_vk_tuned_row_targets) used to answer that question with two complementary
+// spellings; adding a family to one and not the other made the other's zero-return unreachable --
+// a branch no input could reach.  The OBJECT mapping stays in the backend (it needs the device),
+// so this owns the SET only, and the backend derives its early-out from it.
+static inline bool vk_tune_row_family_wired(int src0_type, int src1_type) {
+    return src0_type == VK_TUNE_SRC_F16
+        && (src1_type == VK_TUNE_SRC_F16 || src1_type == VK_TUNE_SRC_F32);
+}
+
 static inline const char * vk_tune_row_family_reason(int src0_type, int src1_type, int path) {
-    const int f16_f16 = (src0_type == VK_TUNE_SRC_F16 && src1_type == VK_TUNE_SRC_F16);
-    const int f16_f32 = (src0_type == VK_TUNE_SRC_F16 && src1_type == VK_TUNE_SRC_F32);
-    if (!f16_f16 && !f16_f32) {
+    if (!vk_tune_row_family_wired(src0_type, src1_type)) {
         return "no tuned-row implementation for this (src0, src1) family "
                "(only f16xf16 and f16xf32 are wired)";
     }
@@ -197,7 +211,11 @@ static inline const char * vk_tune_row_family_reason(int src0_type, int src1_typ
     // stock cm1 buckets carry wniter == 0 and compile), and I6 refuses a row whose fragment
     // shape is not this device's cooperative-matrix shape.
     if (path != VK_TILE_PATH_SCALAR && path != VK_TILE_PATH_CM1 && path != VK_TILE_PATH_CM2) {
-        return "unknown creation path";
+        // ONE spelling for ONE condition (G-D26).  ggml_vk_tuned_row_capability_reason answers this
+        // same question with the SAME string, and its class lives in VK_TUNE_CAPABILITY_CLASSES.
+        // Two spellings made that table row unreachable: the install loop asks THIS function first,
+        // so the capability function never saw an unknown path -- a class row no reason could match.
+        return "path is neither scalar, cm1 nor cm2";
     }
     return nullptr;
 }

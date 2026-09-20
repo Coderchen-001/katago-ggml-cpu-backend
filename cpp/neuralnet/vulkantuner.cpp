@@ -1881,6 +1881,10 @@ namespace VulkanTuner {
       decision->install.installed = std::min(decision->install.installed, installed.installed);
       decision->install.dropped_illegal = std::max(decision->install.dropped_illegal, installed.dropped_illegal);
       decision->install.dropped_unsupported = std::max(decision->install.dropped_unsupported, installed.dropped_unsupported);
+      // Same direction as every other drop count: one context whose refusal came from our gap
+      // disqualifies the device-only claim for the whole key.
+      decision->install.dropped_unsupported_our_gap = std::max(decision->install.dropped_unsupported_our_gap,
+                                                               installed.dropped_unsupported_our_gap);
       decision->install.dropped_build_failed = std::max(decision->install.dropped_build_failed, installed.dropped_build_failed);
       // The two per-target fields are inside no equality (they describe one row twice), so
       // the conservative direction for them is the maximum: a partial install or a failed

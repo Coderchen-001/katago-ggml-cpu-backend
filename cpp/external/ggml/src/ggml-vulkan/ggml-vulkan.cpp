@@ -20725,6 +20725,13 @@ static_assert(VK_TUNE_SRC_F16 == (int) GGML_TYPE_F16, "vulkan-tile-validity.h tr
 static int ggml_vk_tuned_row_targets(const vk_device & device, int src0_type, int src1_type, vk_matmul_pipeline out[2]) {
     out[0] = nullptr;
     out[1] = nullptr;
+    // The family SET is not this function's to decide: vk_tune_row_family_wired() owns it (the
+    // install loop asks the family predicate first).  Reading it here keeps the two answers from
+    // drifting apart, and it makes the caller's `n_targets == 0` branch unreachable by construction
+    // for every pair the family clause already accepted.
+    if (!vk_tune_row_family_wired(src0_type, src1_type)) {
+        return 0;
+    }
     if (src0_type == (int) GGML_TYPE_F16 && src1_type == (int) GGML_TYPE_F16) {
         out[0] = device->pipeline_matmul_f16.f16acc;
         out[1] = device->pipeline_matmul_f16.f32acc;
@@ -20779,6 +20786,33 @@ static const vk_tuned_row_capability_class VK_TUNE_CAPABILITY_CLASSES[] = {
       "values this build hardcodes (0/true) and whose layout has never been measured here", true },
     { "two rows share (src0, src1, key_m, key_k) but differ in PAD/RESHAPE: the dispatch face cannot "
       "tell them apart, so neither is installed", true },
+    // --- W1: the install path's WHOLE refusal vocabulary, so that no reason is left to the
+    // fail-closed default by accident.  Classifying the DEVICE ones below as our gap would silently
+    // switch the negative verdict off (allRejectReasonsAreDevice would never become true), so each
+    // entry carries the reason for its class.
+    // The family predicate (vk_tune_row_family_reason, vulkan-tile-validity.h).  OUR GAP: only
+    // f16xf16 and f16xf32 are wired at all.
+    { "no tuned-row implementation for this (src0, src1) family (only f16xf16 and f16xf32 are wired)", true },
+    // The install path's own literal.  DEVICE: the stock init created no bucket for this
+    // (family, acc) on THIS device -- a property of the device, not of our build.
+    { "the device has no stock (family, acc) buckets for this row", false },
+    // The install-time clauses (the body in ggml_vk_tuned_row_check_impl; check_install_time is the
+    // wrapper that passes live_resolver = false, which is why I2 is NOT in this table).  I1 is the
+    // selector's own emptiness test (is_empty() itself) = DEVICE, and its premise is checkable: a
+    // bucket set can also be emptied by POLICY, and every knob that can do that is in KNOBS[]
+    // (vulkantuner.cpp:508-519), whose values are recorded in the fingerprint, which lives in the
+    // file HEADER -- so a file written under one bucket set is never read under another.  I3/I4/I5
+    // are properties of the ROW and of our pipeline set = OUR GAP.
+    { "I1: the (family, acc) object is empty (no stock l/m/s bucket)", false },
+    { "I3: row has no unaligned pipeline (the aligned variant alone is unsafe)", true },
+    { "I4: row's unaligned pipeline align exceeds the stock buckets' align", true },
+    { "I5: rows must not target the mmq/q8_1 path", true },
+    // The fail-safe for a RESIDUAL asymmetry: vk_tune_row_family_wired() owns the family SET, but
+    // the object mapping still enumerates pairs one by one, so "the predicate accepts it and no pair
+    // is wired" stays possible for a future edit.  OUR GAP on purpose: our two lists disagreeing is
+    // never a device property, and it must not fall through to the DEVICE verdict that follows it.
+    { "family predicate accepts this (src0, src1) but no object pair is wired for it: "
+      "the two lists disagree", true },
 };
 static bool ggml_vk_tuned_row_capability_is_our_gap(const char * reason) {
     if (reason == nullptr) {
@@ -21133,11 +21167,22 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
     // failure (one of the two accumulator variants) is loud and counted in `variant_failed`,
     // but it is NOT a row drop -- the row is still installed on the other variant, so adding
     // it to `dropped_*` would push installed + dropped past declared (section 6.8 B1-fix-1).
-    const auto drop_row = [&](size_t index, vk_tune_row_drop kind, const std::string & kind_name,
-                              const std::string & why, bool counts_as_row_drop = true) {
+    // The CLASS and the LABEL are derived here, never passed in: a call site that hand-writes
+    // either one is the second truth this batch removes (five of the six sites did, and one of them
+    // had already drifted from the table).  The classifier fails closed -- an unclassified reason is
+    // our gap -- so the label can never claim a device property the table does not carry.
+    const auto drop_row = [&](size_t index, vk_tune_row_drop kind, const std::string & why,
+                              bool counts_as_row_drop = true) {
+        const bool unsup_our_gap = (kind == VK_TUNE_ROW_DROP_UNSUPPORTED)
+                                && ggml_vk_tuned_row_capability_is_our_gap(why.c_str());
+        const char * kind_name = (kind == VK_TUNE_ROW_DROP_ILLEGAL)     ? "illegal"
+                               : (kind == VK_TUNE_ROW_DROP_UNSUPPORTED) ? (unsup_our_gap ? "unsupported (our gap)"
+                                                                                       : "unsupported")
+                                                                        : "variant-failed";
         if (result != nullptr && counts_as_row_drop) {
             if (kind == VK_TUNE_ROW_DROP_ILLEGAL)          { result->dropped_illegal++; }
-            else if (kind == VK_TUNE_ROW_DROP_UNSUPPORTED) { result->dropped_unsupported++; }
+            else if (kind == VK_TUNE_ROW_DROP_UNSUPPORTED) { result->dropped_unsupported++;
+                                                             if (unsup_our_gap) { result->dropped_unsupported_our_gap++; } }
             else                                           { result->dropped_build_failed++; }
         }
         ggml_vk_t3_line("row dropped (" + ggml_vk_tune_ctx_tag(ctx) + "): index="
@@ -21198,7 +21243,7 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
                                              (uint64_t) r.key_m, (uint64_t) r.key_k };
         const auto pit = row_pins.find(pk);
         if (pit != row_pins.end() && pit->second.conflict) {
-            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, "unsupported (our gap)",
+            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED,
                      "two rows share (src0, src1, key_m, key_k) but differ in PAD/RESHAPE: the "
                      "dispatch face cannot tell them apart, so neither is installed");
             continue;
@@ -21206,27 +21251,34 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
 
         const char * why = vk_tile_candidate_reason(r.path, r.geom, vk_tile_wave_for(ctx->device->subgroup_size));
         if (why != nullptr) {
-            drop_row(i, VK_TUNE_ROW_DROP_ILLEGAL, "illegal", why);
+            drop_row(i, VK_TUNE_ROW_DROP_ILLEGAL, why);
             continue;
         }
         why = vk_tune_row_family_reason(r.src0_type, r.src1_type, r.path);
         if (why != nullptr) {
-            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, "unsupported", why);
+            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, why);
             continue;
         }
         why = ggml_vk_tuned_row_capability_reason(ctx->device, r);
         if (why != nullptr) {
             // G-D20: "our build has not implemented it" must not be recorded as a device verdict,
             // so the loud line (and, once the write side exists, the outcome) carries the class.
-            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED,
-                     ggml_vk_tuned_row_capability_is_our_gap(why) ? "unsupported (our gap)" : "unsupported", why);
+            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, why);
             continue;
         }
 
         vk_matmul_pipeline targets[2];
         const int n_targets = ggml_vk_tuned_row_targets(ctx->device, r.src0_type, r.src1_type, targets);
         if (n_targets == 0) {
-            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, "unsupported", "no (family, acc) object for this src0/src1 pair");
+            // Unreachable by construction since vk_tune_row_family_wired(): the family clause above
+            // owns the same set, and this function now derives its early-out from that predicate.
+            // Kept as the fail-safe for the RESIDUAL asymmetry (the object mapping still enumerates
+            // pairs one by one) and classified OUR GAP by the table, because "our two lists
+            // disagree" is not a device property -- without this clause such an edit would fall
+            // through to the DEVICE verdict at the end of the loop.
+            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED,
+                     "family predicate accepts this (src0, src1) but no object pair is wired for it: "
+                     "the two lists disagree");
             continue;
         }
 
@@ -21262,7 +21314,7 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
                 if (result != nullptr) {
                     result->variant_failed++;
                 }
-                drop_row(i, VK_TUNE_ROW_DROP_BUILD_FAILED, "variant-failed", build_why, /*counts_as_row_drop=*/false);
+                drop_row(i, VK_TUNE_ROW_DROP_BUILD_FAILED, build_why, /*counts_as_row_drop=*/false);
                 continue;
             }
             pipes_created++;
@@ -21294,7 +21346,7 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
             // make this very install impossible -- see ggml_vk_tuned_row_check_install_time.
             if (const char * clause = ggml_vk_tuned_row_check_install_time(targets[t], (ggml_type) r.src0_type,
                                                                           (ggml_type) r.src1_type, row)) {
-                drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, "unsupported", clause);
+                drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, clause);
                 continue;
             }
             // Advice (loud, not a rejection): an aligned variant whose align exceeds every stock
@@ -21310,7 +21362,7 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
             targets_built++;
         }
         if (!installed_anywhere) {
-            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED, "unsupported",
+            drop_row(i, VK_TUNE_ROW_DROP_UNSUPPORTED,
                      "the device has no stock (family, acc) buckets for this row");
             continue;
         }
@@ -21336,6 +21388,9 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
     const unsigned d_build   = (result != nullptr) ? result->dropped_build_failed : 0;
     const unsigned d_partial = (result != nullptr) ? result->partial : 0;
     const unsigned d_variant = (result != nullptr) ? result->variant_failed : 0;
+    // The our-gap SUB-SLICE of `unsupported`: printed after the equality's parentheses, next to the
+    // other field that describes a member of it without entering it.
+    const unsigned d_unsup_gap = (result != nullptr) ? result->dropped_unsupported_our_gap : 0;
     // Row-level counts first (they are the equality: installed + dropped_* == declared), then
     // the two per-target fields, which describe one row twice and are NOT part of it.
     ggml_vk_t3_line("install (" + ggml_vk_tune_ctx_tag(ctx) + "): "
@@ -21345,6 +21400,7 @@ bool ggml_backend_vk_tune_install_rows(ggml_backend_t backend, const vk_tune_row
                     + " build-failed=" + std::to_string(d_build) + ")"
                     + " partial=" + std::to_string(d_partial)
                     + " variant-failed=" + std::to_string(d_variant)
+                    + " unsupported-our-gap=" + std::to_string(d_unsup_gap)
                     + " pipes=" + std::to_string(pipes_created)
                     + (declared == 0 ? " (empty set is the 1b-2b production form)" : ""));
 
