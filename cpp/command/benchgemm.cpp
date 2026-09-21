@@ -101,6 +101,8 @@ namespace {
                            // pattern); 2 = src1 is [1,tokens] (per-position mask, the [1,S,N]
                            // pattern). The graph has 393 ADD/MUL nodes and most are broadcasts, which
                            // are DIFFERENT kernels from the same-shape elementwise ones.
+    int alignBytes = 0;    // start the mul_mat operands at this byte offset inside their buffers
+                           // (see the -align note at the A/B tensor creation below).
   };
 
   bool getInt64(const vector<string>& args, const string& key, int64_t& out) {
@@ -344,6 +346,7 @@ namespace {
     getBool(args, "-cpu-ref", a.cpuRef);
     getBool(args, "-strided", a.strided);
     getInt(args, "-bcast", a.bcast);
+    getInt(args, "-align", a.alignBytes);
     if(a.strided && a.cpuRef) {
       cerr << "benchgemm: -cpu-ref ignored with -strided (non-contiguous readback is not supported)" << endl;
       a.cpuRef = false;
@@ -390,6 +393,32 @@ namespace {
     if(a.verbose)
       cerr << "benchgemm: backend=" << (devName ? devName : "?") << endl;
 
+#if defined(USE_CPUGGML_BACKEND)
+    // Optional -threads: this is what makes the ISA-tier comparison honest. The earlier flat result
+    // for mul_mat was measured at ggml's default 4 threads with 50 nodes sharing one B; the tier
+    // effect is largest at T=1 (whole graph: 1.59x at T=1 vs 1.40x at T=8). In a
+    // GGML_CPU_ALL_VARIANTS build the setter lives in the variant dll and is not linkable, so it is
+    // resolved through the backend registry -- the same path the backend itself uses.
+    {
+      int benchThreads = 0;
+      getInt(args, "-threads", benchThreads);
+      if(benchThreads > 0) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        typedef void (*bench_set_n_threads_t)(ggml_backend_t, int);
+        bench_set_n_threads_t setN = reg != NULL
+          ? (bench_set_n_threads_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads")
+          : NULL;
+        if(setN != NULL) {
+          setN(backend, benchThreads);
+          if(a.verbose)
+            cerr << "benchgemm: threads=" << benchThreads << endl;
+        }
+        else
+          cerr << "benchgemm: -threads requested but the backend exposes no setter" << endl;
+      }
+    }
+#endif
+
     for(size_t i = 0; i + 1 < args.size(); i++) {
       if(args[i] == "-op")
         a.op = args[i+1];
@@ -431,15 +460,39 @@ namespace {
       // three times wider than ne0 needs.
       BBase = ggml_new_tensor_2d(ctx, bType, K * 3, Ndim);
       B = ggml_view_2d(ctx, BBase, K, Ndim, (size_t)K * 3 * (bType == GGML_TYPE_F16 ? 2 : 4), 0);
+    } else if(a.alignBytes > 0) {
+      const size_t elemB = (bType == GGML_TYPE_F16) ? 2 : 4;
+      if(a.alignBytes % (int)elemB != 0) {
+        cerr << "benchgemm: -align must be a multiple of the activation element size" << endl;
+        return 1;
+      }
+      BBase = ggml_new_tensor_2d(ctx, bType, K + (int64_t)(a.alignBytes / elemB), Ndim);
+      B = ggml_view_2d(ctx, BBase, K, Ndim, (size_t)K * elemB, (size_t)a.alignBytes);
     } else {
       B = ggml_new_tensor_2d(ctx, bType, K, Ndim);
       BBase = B;
     }
     // A_i per node; R_i = mul_mat dst returned by ggml_mul_mat (must be kept:
     // the bit-equal probe reads R[0], and R[] tensors are what the graph writes)
+    // -align <bytes>: shift both operands inside their buffers. GGML_MEM_ALIGN is 16 and the
+    // AVX-512 f16 load is 32 bytes wide, so a 16/48-byte offset makes every such load cross a
+    // 64-byte cache line -- the mechanism the assess counters point at (76 vs 1 misaligned loads
+    // per 1000 instructions in ggml_vec_dot_f16, IPC 2.0 vs 3.1).
     vector<ggml_tensor*> A(a.N), R(a.N);
-    for(int i = 0; i < a.N; i++)
-      A[i] = ggml_new_tensor_2d(ctx, aType, K, M);
+    if(a.alignBytes > 0) {
+      const size_t elemA = (aType == GGML_TYPE_F16) ? 2 : 1;
+      if(a.alignBytes % (int)elemA != 0) {
+        cerr << "benchgemm: -align must be a multiple of the weight element size" << endl;
+        return 1;
+      }
+      for(int i = 0; i < a.N; i++) {
+        ggml_tensor* base = ggml_new_tensor_2d(ctx, aType, K + (int64_t)(a.alignBytes / elemA), M);
+        A[i] = ggml_view_2d(ctx, base, K, M, (size_t)K * elemA, (size_t)a.alignBytes);
+      }
+    } else {
+      for(int i = 0; i < a.N; i++)
+        A[i] = ggml_new_tensor_2d(ctx, aType, K, M);
+    }
 
     ggml_cgraph* graph = ggml_new_graph_custom(ctx, (size_t)(a.N + 16), false);
     for(int i = 0; i < a.N; i++) {
@@ -483,7 +536,9 @@ namespace {
       for(int i = 1; i < a.N; i++)
         ggml_backend_tensor_copy(A[0], A[i]);
 
-      const size_t bElems = (size_t)(a.strided ? 3 : 1) * (size_t)K * (size_t)Ndim;
+      // Fill the WHOLE base (strided base is 3x wide, -align base is wider too): uninitialized
+      // floats could be denormals/NaN and a denormal penalty would pollute the timing.
+      const size_t bElems = (size_t)ggml_nelements(BBase);
       vector<uint8_t> bData(bElems * (bType == GGML_TYPE_F16 ? 2 : 4));
       if(bType == GGML_TYPE_F16) {
         uint16_t* p = (uint16_t*)bData.data();
