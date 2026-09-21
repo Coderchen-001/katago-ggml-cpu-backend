@@ -24,6 +24,7 @@ std::vector<std::string> Setup::getBackendPrefixes() {
   prefixes.push_back("eigen");
   prefixes.push_back("onnx");
   prefixes.push_back("vulkan");
+  prefixes.push_back("cpuggml");
   prefixes.push_back("dummybackend");
   return prefixes;
 }
@@ -98,6 +99,8 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
   string backendPrefix = "onnx";
   #elif defined(USE_VULKAN_BACKEND)
   string backendPrefix = "vulkan";
+  #elif defined(USE_CPUGGML_BACKEND)
+  string backendPrefix = "cpuggml";
   #else
   string backendPrefix = "dummybackend";
   #endif
@@ -165,7 +168,7 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
     //ROCm defaults to NHWC inputs like CUDA: its compute layout is NHWC in the default FP16 path
     //(transformers always, convnets on the archs where NHWC is faster), and unlike cuDNN, MIOpen
     //cannot consume mismatched input/compute layouts for free - it costs a device transpose.
-    bool inputsUseNHWC = backendPrefix == "opencl" || backendPrefix == "trt" || backendPrefix == "metal" || backendPrefix == "onnx" || backendPrefix == "vulkan" ? false : true;
+    bool inputsUseNHWC = backendPrefix == "opencl" || backendPrefix == "trt" || backendPrefix == "metal" || backendPrefix == "onnx" || backendPrefix == "vulkan" || backendPrefix == "cpuggml" ? false : true;
     if(cfg.contains(backendPrefix+"InputsUseNHWC"+idxStr))
       inputsUseNHWC = cfg.getBool(backendPrefix+"InputsUseNHWC"+idxStr);
     else if(cfg.contains("inputsUseNHWC"+idxStr))

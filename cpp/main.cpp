@@ -280,6 +280,8 @@ string Version::getKataGoVersionFullInfo() {
   out << "Using ONNX Runtime backend" << endl;
 #elif defined(USE_VULKAN_BACKEND)
   out << "Using Vulkan backend (ggml-vulkan)" << endl;
+#elif defined(USE_CPUGGML_BACKEND)
+  out << "Using CPU backend (ggml-cpu)" << endl;
 #else
   out << "Using dummy backend" << endl;
 #endif
@@ -322,6 +324,8 @@ string Version::getGitRevisionWithBackend() {
   s += "-onnx";
 #elif defined(USE_VULKAN_BACKEND)
   s += "-vulkan";
+#elif defined(USE_CPUGGML_BACKEND)
+  s += "-cpuggml";
 #else
   s += "-dummy";
 #endif

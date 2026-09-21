@@ -52,7 +52,9 @@
 
 #include "../external/ggml/include/ggml.h"
 #include "../external/ggml/include/ggml-backend.h"
+#ifdef USE_VULKAN_BACKEND
 #include "../external/ggml/include/ggml-vulkan.h"
+#endif
 #include "../external/ggml/include/ggml-alloc.h"
 
 #include <cmath>
@@ -90,6 +92,15 @@ namespace {
     int dtype = 0;         // 0 = f16 x f32 (trunk, production); 1 = f16 x f16 (attention); 2 = q8f32 (Q1b: Q8_0 x F32 -> mmq)
     bool cpuRef = false;   // compare vs CPU reference (bit-equal probe; f16f32/f16f16 only)
     bool verbose = false;
+    string op = "matmul";  // "matmul" = the original path; otherwise a single-op benchmark (see benchOneOp)
+    bool strided = false;  // feed NON-CONTIGUOUS (permuted-view) inputs: the real graph has 100+ such
+                           // nodes (CONT/VIEW/PERMUTE/FA/ADD/SUB/CONCAT consumers), which clean 2D
+                           // benchmarks cannot reproduce -- and that is the one class left in the
+                           // ISA-tier investigation after every contiguous op came out flat.
+    int bcast = 0;         // 0 = same shape; 1 = src1 is [rows,1] (per-channel bias, the [C,1,1,1]
+                           // pattern); 2 = src1 is [1,tokens] (per-position mask, the [1,S,N]
+                           // pattern). The graph has 393 ADD/MUL nodes and most are broadcasts, which
+                           // are DIFFERENT kernels from the same-shape elementwise ones.
   };
 
   bool getInt64(const vector<string>& args, const string& key, int64_t& out) {
@@ -143,6 +154,183 @@ namespace {
     }
   }
 
+  // ---------------- single-op benchmark (ISA-tier attribution) ----------------
+  // Why this mode exists: on a 9800X3D the AVX-512 ggml-cpu tier ("cascadelake", what the loader
+  // picks by feature score) is 22-40% SLOWER than the AVX2 tiers on transformer models, while the
+  // classic conv net is unaffected. Measured eliminations before writing this:
+  //   * not mul_mat        -- this file, all shapes tried, flat across tiers (incl. attention-like
+  //                           m=361 k=64 and m=64 k=361),
+  //   * not flash-attn     -- KATAGO_VK_FA=0 keeps (grows) the gap,
+  //   * not the RMS fusion -- GGML_CPU_DISABLE_FUSION=1 leaves it unchanged,
+  //   * not frequency/power-- mean %ProcessorPerformance 109 in BOTH tiers, 8 samples each,
+  //   * not softmax/attention-dominated -- the extra time scales LINEARLY with board area
+  //                           (19.2 / 40.3 / 89.7 ms at 9x9 / 13x13 / 19x19), not with S^2.
+  // What is left is the family of element-wise / reduction / layout kernels, which is what this
+  // mode measures one at a time. Shapes come from -M (ne0) and -batch (ne1 = batch*361); -n is the
+  // number of identical nodes per graph, and the reported rate is elements/s (not GFLOPS).
+  int benchOneOp(ggml_backend_t backend, const char* devName, const BenchArgs& a, const string& op) {
+    const int64_t rows   = a.M > 0 ? a.M : 384;
+    const int64_t tokens = a.batch > 0 ? a.batch * 361 : 361;
+    const int64_t elems  = rows * tokens;
+
+    const bool twoInput = (op == "add" || op == "mul" || op == "swiglu");
+    const bool wantRms  = (op == "rmsnorm");
+    const bool wantCont = (op == "cont");
+    const bool wantMask = (op == "softmaxext");
+    const bool inF16    = (op == "cast_f32");
+    if(op != "silu" && op != "gelu" && op != "swiglu" && op != "rmsnorm" && op != "softmax" &&
+       op != "add" && op != "mul" && op != "cont" && op != "cast_f16" && op != "cast_f32" &&
+       op != "softmaxext" && op != "scale") {
+      cerr << "benchgemm: unknown -op \"" << op << "\" (matmul|silu|gelu|swiglu|rmsnorm|softmax|softmaxext|cast_f16|cast_f32|scale|add|mul|cont)" << endl;
+      return 1;
+    }
+
+    // A node count above 16 would just multiply memory traffic here (each node owns its inputs),
+    // and the point is per-node cost, not occupancy.
+    const int nNodes = (a.N > 0 && a.N <= 16) ? a.N : 8;
+
+    // +2 tensors per node when -strided (a base plus its permuted view), and the mask/rms helpers.
+    const size_t ctxSize = ggml_tensor_overhead() * (size_t)(4 * nNodes + 32) +
+                           ggml_graph_overhead_custom((size_t)(nNodes + 16), false) + 2048;
+    struct ggml_init_params iparams = {
+      /*.mem_size   =*/ ctxSize,
+      /*.mem_buffer =*/ nullptr,
+      /*.no_alloc   =*/ true,
+    };
+    ggml_context* ctx = ggml_init(iparams);
+    if(ctx == nullptr) { cerr << "benchgemm: ggml_init failed" << endl; return 1; }
+
+    vector<ggml_tensor*> X(nNodes), Y(nNodes), Out(nNodes), XBase(nNodes), YBase(nNodes);
+    ggml_tensor* W = nullptr;
+    ggml_tensor* Mask = nullptr;
+    const int64_t yRows   = (a.bcast == 1) ? 1 : rows;
+    const int64_t yTokens = (a.bcast == 2) ? 1 : tokens;
+    const int64_t yElems  = yRows * yTokens;
+    if(a.bcast != 0 && !(op == "add" || op == "mul")) {
+      cerr << "benchgemm: -bcast is only meaningful for -op add|mul (swiglu/others do not broadcast)" << endl;
+      return 1;
+    }
+    if(wantRms)
+      W = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, 1);
+    if(wantMask)
+      Mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, tokens);
+    for(int i = 0; i < nNodes; i++) {
+      if(a.strided) {
+        // ROW-CONTIGUOUS with a 3x gap between rows: nb[0] stays sizeof(elem) (so ADD/MUL/unary are
+        // legal -- they assert nb00 == sizeof(src0_t) / is_contiguous_rows), but ggml_is_contiguous
+        // is false. This is the strided shape the real graph actually feeds: the builder's
+        // QKV_NOCONT path hands downstream a window whose row stride is 3*OC*4 while ne0 = OC.
+        // (A full transpose is NOT a legal input for these ops -- ggml asserts -- which is why the
+        // graph carries 90 CONT nodes; that is a different, already-flat case.)
+        XBase[i] = ggml_new_tensor_2d(ctx, inF16 ? GGML_TYPE_F16 : GGML_TYPE_F32, rows * 3, tokens);
+        X[i] = ggml_view_2d(ctx, XBase[i], rows, tokens,
+                            (size_t)rows * 3 * (inF16 ? sizeof(ggml_fp16_t) : sizeof(float)), 0);
+        if(twoInput) {
+          if(a.bcast != 0) {
+            Y[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, yRows, yTokens);
+            YBase[i] = Y[i];
+          } else {
+            YBase[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows * 3, tokens);
+            Y[i] = ggml_view_2d(ctx, YBase[i], rows, tokens, (size_t)rows * 3 * sizeof(float), 0);
+          }
+        }
+      } else {
+        X[i] = ggml_new_tensor_2d(ctx, inF16 ? GGML_TYPE_F16 : GGML_TYPE_F32, rows, tokens);
+        XBase[i] = X[i];
+        if(twoInput) {
+          Y[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, yRows, yTokens);
+          YBase[i] = Y[i];
+        }
+      }
+    }
+    ggml_cgraph* graph = ggml_new_graph_custom(ctx, (size_t)(nNodes + 16), false);
+    for(int i = 0; i < nNodes; i++) {
+      if(op == "silu")          Out[i] = ggml_silu(ctx, X[i]);
+      else if(op == "gelu")     Out[i] = ggml_gelu(ctx, X[i]);
+      else if(op == "swiglu")   Out[i] = ggml_swiglu_split(ctx, X[i], Y[i]);
+      else if(op == "rmsnorm")  Out[i] = ggml_mul(ctx, ggml_rms_norm(ctx, X[i], 1e-5f), W);
+      else if(op == "softmax")  Out[i] = ggml_soft_max(ctx, X[i]);
+      else if(op == "softmaxext") Out[i] = ggml_soft_max_ext(ctx, X[i], Mask, 1.0f, 0.0f);
+      else if(op == "cast_f16") Out[i] = ggml_cast(ctx, X[i], GGML_TYPE_F16);
+      else if(op == "cast_f32") Out[i] = ggml_cast(ctx, X[i], GGML_TYPE_F32);
+      else if(op == "scale")    Out[i] = ggml_scale(ctx, X[i], 0.5f);
+      else if(op == "add")      Out[i] = ggml_add(ctx, X[i], Y[i]);
+      else if(op == "mul")      Out[i] = ggml_mul(ctx, X[i], Y[i]);
+      else if(op == "cont")     Out[i] = ggml_cont(ctx, ggml_transpose(ctx, X[i]));
+      ggml_build_forward_expand(graph, Out[i]);
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if(buf == nullptr) { cerr << "benchgemm: alloc failed" << endl; return 1; }
+
+    {
+      // Fill the WHOLE base, not just the viewed window: uninitialized floats can be denormals/NaN
+      // and a denormal penalty would silently pollute the timing.
+      vector<float> data((size_t)(a.strided ? 3 * elems : elems));
+      uint64_t rngState = 99991 + (uint64_t)a.seed * 1000003;
+      for(int i = 0; i < nNodes; i++) {
+        for(size_t k = 0; k < data.size(); k++) {
+          rngState ^= rngState << 13; rngState ^= rngState >> 7; rngState ^= rngState << 17;
+          data[k] = ((float)(rngState & 0xFFFF) / 32767.5f) - 1.0f;
+        }
+        ggml_backend_tensor_set(XBase[i], data.data(), 0, data.size() * sizeof(float));
+        if(twoInput)
+          ggml_backend_tensor_set(YBase[i], data.data(), 0, (size_t)yElems * sizeof(float));
+      }
+      if(inF16) {
+        vector<ggml_fp16_t> h((size_t)elems);
+        for(size_t k = 0; k < h.size(); k++)
+          h[k] = ggml_fp32_to_fp16(data[k]);
+        for(int i = 0; i < nNodes; i++)
+          ggml_backend_tensor_set(XBase[i], h.data(), 0, h.size() * sizeof(ggml_fp16_t));
+      }
+      if(wantRms) {
+        vector<float> w((size_t)rows, 1.0f);
+        ggml_backend_tensor_set(W, w.data(), 0, w.size() * sizeof(float));
+      }
+      if(wantMask) {
+        vector<float> m((size_t)elems, 0.0f);
+        ggml_backend_tensor_set(Mask, m.data(), 0, m.size() * sizeof(float));
+      }
+    }
+
+    auto nowMs = []() { return std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0; };
+    for(int w = 0; w < a.warmup; w++) {
+      ggml_backend_graph_compute(backend, graph);
+      ggml_backend_synchronize(backend);
+    }
+    vector<double> totalsMs;
+    for(int t = 0; t < a.iterations; t++) {
+      const double t0 = nowMs();
+      ggml_backend_graph_compute(backend, graph);
+      ggml_backend_synchronize(backend);
+      totalsMs.push_back(nowMs() - t0);
+    }
+    sort(totalsMs.begin(), totalsMs.end());
+    const double medTotal = totalsMs[totalsMs.size() / 2];
+    const double perNodeUs = medTotal * 1000.0 / (double)nNodes;
+    const double spread = (totalsMs.back() - totalsMs.front()) / medTotal * 100.0;
+    const double melemPerSec = ((double)elems / (perNodeUs / 1e6)) / 1e6;
+    const string gitHead = BENCHGEMM_GIT_REVISION;
+
+    cout << (devName ? devName : "?") << ","
+         << "op=" << op << ",rows=" << rows << ",tokens=" << tokens << ",batch=" << a.batch << ","
+         << op << ",(opbench" << (a.strided ? ";rowstrided" : "") << ";bcast=" << a.bcast << "),"
+         << fixed << setprecision(3) << perNodeUs << ","
+         << setprecision(2) << melemPerSec << ","
+         << setprecision(2) << spread << ",-,-,-,"
+         << nNodes << "," << a.iterations << "," << a.seed << ","
+         << gitHead << endl;
+    if(a.verbose)
+      cerr << "benchgemm: op=" << op << " per_node=" << perNodeUs << " us  " << melemPerSec
+           << " Melem/s  spread=" << spread << "%" << endl;
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return 0;
+  }
+
   // ---------------- main bench ----------------
   int benchGemmMain(const vector<string>& args) {
     BenchArgs a;
@@ -154,6 +342,12 @@ namespace {
     getInt(args, "-warmup", a.warmup);
     getInt(args, "-seed", a.seed);
     getBool(args, "-cpu-ref", a.cpuRef);
+    getBool(args, "-strided", a.strided);
+    getInt(args, "-bcast", a.bcast);
+    if(a.strided && a.cpuRef) {
+      cerr << "benchgemm: -cpu-ref ignored with -strided (non-contiguous readback is not supported)" << endl;
+      a.cpuRef = false;
+    }
     getBool(args, "-verbose", a.verbose);
     for(size_t i = 0; i < args.size(); i++) {
       if(args[i] == "-dtype" && i + 1 < args.size()) {
@@ -174,14 +368,37 @@ namespace {
     const int64_t Ndim = a.batch * 361;   // KataGo N = batch * board cells
 
     // ---- init backend ----
+    // Backend-agnostic since the CPU backend exists: on the CPU the same mul_mat shapes run
+    // through ggml-cpu, which is what makes this command usable for the f16-vs-q8 kernel
+    // question without a GPU. ggml_backend_load_all() is a no-op in a static build and loads
+    // the highest-scoring ISA variant dll in a GGML_CPU_ALL_VARIANTS build.
+#if defined(USE_CPUGGML_BACKEND)
+    ggml_backend_load_all();
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
+    if(backend == nullptr) {
+      cerr << "benchgemm: no ggml CPU backend available" << endl;
+      return 1;
+    }
+#else
     ggml_backend_t backend = ggml_backend_vk_init(0);
     if(backend == nullptr) {
       cerr << "benchgemm: ggml_backend_vk_init(0) failed" << endl;
       return 1;
     }
+#endif
     const char* devName = ggml_backend_name(backend);
     if(a.verbose)
       cerr << "benchgemm: backend=" << (devName ? devName : "?") << endl;
+
+    for(size_t i = 0; i + 1 < args.size(); i++) {
+      if(args[i] == "-op")
+        a.op = args[i+1];
+    }
+    if(a.op != "matmul") {
+      const int rc = benchOneOp(backend, devName, a, a.op);
+      ggml_backend_free(backend);
+      return rc;
+    }
 
     // ---- context + N identical mul_mat nodes ----
     // A = weights; B = activations. dtype 2 (q8f32, Q1b): A=Q8_0 -> quantize_y
@@ -196,7 +413,7 @@ namespace {
       return 1;
     }
     // A: [K, M] ; B: [K, N] ; D: [M, N]  (ggml mul_mat layout)
-    size_t ctxSize = ggml_tensor_overhead() * (size_t)(3 * a.N + 8) + ggml_graph_overhead_custom((size_t)(a.N + 16), false) + 1024;
+    size_t ctxSize = ggml_tensor_overhead() * (size_t)(3 * a.N + 16) + ggml_graph_overhead_custom((size_t)(a.N + 16), false) + 2048;
     struct ggml_init_params iparams = {
       /*.mem_size   =*/ ctxSize,
       /*.mem_buffer =*/ nullptr,
@@ -205,8 +422,19 @@ namespace {
     ggml_context* ctx = ggml_init(iparams);
     if(ctx == nullptr) { cerr << "benchgemm: ggml_init failed" << endl; return 1; }
 
-    // B shared across nodes (K x N)
-    ggml_tensor* B = ggml_new_tensor_2d(ctx, bType, K, Ndim);
+    // B shared across nodes (K x N); with -strided it is a permuted view, i.e. a non-contiguous
+    // src1, which is what the real graph feeds mul_mat in several places.
+    ggml_tensor* BBase = nullptr;
+    ggml_tensor* B = nullptr;
+    if(a.strided) {
+      // Row-strided (3x gap), i.e. what the QKV_NOCONT window looks like: nb[0] == elem size, nb[1]
+      // three times wider than ne0 needs.
+      BBase = ggml_new_tensor_2d(ctx, bType, K * 3, Ndim);
+      B = ggml_view_2d(ctx, BBase, K, Ndim, (size_t)K * 3 * (bType == GGML_TYPE_F16 ? 2 : 4), 0);
+    } else {
+      B = ggml_new_tensor_2d(ctx, bType, K, Ndim);
+      BBase = B;
+    }
     // A_i per node; R_i = mul_mat dst returned by ggml_mul_mat (must be kept:
     // the bit-equal probe reads R[0], and R[] tensors are what the graph writes)
     vector<ggml_tensor*> A(a.N), R(a.N);
@@ -255,15 +483,16 @@ namespace {
       for(int i = 1; i < a.N; i++)
         ggml_backend_tensor_copy(A[0], A[i]);
 
-      vector<uint8_t> bData((size_t)(K * Ndim) * (bType == GGML_TYPE_F16 ? 2 : 4));
+      const size_t bElems = (size_t)(a.strided ? 3 : 1) * (size_t)K * (size_t)Ndim;
+      vector<uint8_t> bData(bElems * (bType == GGML_TYPE_F16 ? 2 : 4));
       if(bType == GGML_TYPE_F16) {
         uint16_t* p = (uint16_t*)bData.data();
-        for(size_t i = 0; i < K * Ndim; i++) p[i] = ggml_fp32_to_fp16(rnd());
+        for(size_t i = 0; i < bElems; i++) p[i] = ggml_fp32_to_fp16(rnd());
       } else {
         float* p = (float*)bData.data();
-        for(size_t i = 0; i < K * Ndim; i++) p[i] = rnd();
+        for(size_t i = 0; i < bElems; i++) p[i] = rnd();
       }
-      ggml_backend_tensor_set(B, bData.data(), 0, bData.size());
+      ggml_backend_tensor_set(BBase, bData.data(), 0, bData.size());
     }
 
     // ---- CPU reference (D4; f16f32/f16f16 only - q8f32 forced cpuRef=false above) ----

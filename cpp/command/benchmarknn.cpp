@@ -135,6 +135,10 @@ int MainCmds::benchmarknn(const vector<string>& args) {
   const int expectedConcurrentEvals = maxBatchSize;
   const bool disableFP16 = false;
 
+  // Every other command does this before building an evaluator; without it a backend that only
+  // registers itself when its library is loaded (the ggml CPU variant dlls) has no device yet.
+  Setup::initializeSession(cfg);
+
   NNEvaluator* nnEval = NULL;
   try {
     nnEval = Setup::initializeNNEvaluator(

@@ -582,7 +582,7 @@ endif()
 set(BUILD_DISTRIBUTED 0 CACHE BOOL "Build with http support for contributing to distributed training")
 set(USE_BACKEND CACHE STRING "Neural net backend")
 string(TOUPPER "${USE_BACKEND}" USE_BACKEND)
-set_property(CACHE USE_BACKEND PROPERTY STRINGS "" CUDA TENSORRT OPENCL EIGEN METAL ONNX ROCM VULKAN)
+set_property(CACHE USE_BACKEND PROPERTY STRINGS "" CUDA TENSORRT OPENCL EIGEN METAL ONNX ROCM VULKAN CPUGGML)
 
 set(USE_TCMALLOC 0 CACHE BOOL "Use TCMalloc")
 set(NO_GIT_REVISION 0 CACHE BOOL "Disable embedding the git revision into the compiled exe")
@@ -853,7 +853,15 @@ elseif(USE_BACKEND STREQUAL "VULKAN")
   message(STATUS "-DUSE_BACKEND=VULKAN, using the ggml Vulkan backend.")
   set(NEURALNET_BACKEND_SOURCES
     neuralnet/vulkanbackend.cpp
+    neuralnet/onnxtoggml.cpp
     neuralnet/vulkantuner.cpp
+    )
+# --------------------------- CPUGGML backend (ggml-cpu) ---------------------------
+elseif(USE_BACKEND STREQUAL "CPUGGML")
+  message(STATUS "-DUSE_BACKEND=CPUGGML, using the ggml CPU backend.")
+  set(NEURALNET_BACKEND_SOURCES
+    neuralnet/cpubackend.cpp
+    neuralnet/onnxtoggml.cpp
     )
 # --------------------------- ROCM backend (AMD GPU / HIP + MIOpen) ---------------------------
 elseif(USE_BACKEND STREQUAL "ROCM")
@@ -1672,6 +1680,78 @@ elseif(USE_BACKEND STREQUAL "EIGEN")
       message(STATUS "Found Eigen3 at ${EIGEN3_INCLUDE_DIRS}")
     endif()
   endif()
+elseif(USE_BACKEND STREQUAL "CPUGGML")
+  target_compile_definitions(katago PRIVATE USE_CPUGGML_BACKEND)
+
+  # ggml is vendored at a pinned commit under external/ggml (see Compiling.md). Two build
+  # shapes, and the difference is not cosmetic:
+  #
+  #   CPU_GGML_VARIANTS=ON (default, the release shape)
+  #     One ggml-cpu-<tag>.dll per ISA tier plus ggml.dll/ggml-base.dll. ggml_backend_load_all()
+  #     picks the highest-scoring variant by cpuid at startup. The tiers are listed explicitly in
+  #     external/ggml/src/CMakeLists.txt, and each variant resets GGML_NATIVE and every ISA flag
+  #     before turning on only its own -- so ANY machine can build the full set, and the build
+  #     machine does not decide what the artifacts are allowed to run on.
+  #
+  #   CPU_GGML_VARIANTS=OFF (control/debug arm)
+  #     One static binary whose ISA flags are named here. GGML_NATIVE must stay OFF: FindSIMD's
+  #     probe RUNS a test binary (so it reports the build machine's tier) and it never probes
+  #     VNNI at all -- which is exactly the flag a Q8 measurement depends on. GGML_NATIVE is also
+  #     incompatible with GGML_BACKEND_DL by construction (ggml-cpu/CMakeLists.txt:371-375).
+  option(CPU_GGML_VARIANTS "KataGo: ship the ggml-cpu ISA variant dll set (runtime cpuid selection)" ON)
+  option(CPU_GGML_OPENMP   "KataGo: build ggml-cpu against OpenMP instead of its own threadpool" OFF)
+  option(CPU_GGML_ICELAKE  "KataGo: static arm targets AVX-512 + VNNI + VBMI (the icelake tier)" OFF)
+
+  # Build-time guard, in OUR file on purpose (no vendored edit): ggml's per-variant feature-scoring
+  # target is protected from LTO with -fno-lto, which MSVC ignores, and LTO is a GLOBAL setting
+  # (external/ggml/src/CMakeLists.txt:58-62). With LTCG a score function can get arch-specific
+  # instructions inlined into it and SIGILL on an older CPU before the score check even runs --
+  # the exact failure the upstream comment warns about. We never enable LTO here; fail loudly
+  # instead of shipping a landmine if someone does.
+  if(CPU_GGML_VARIANTS AND GGML_LTO)
+    message(FATAL_ERROR
+      "CPUGGML: GGML_LTO=ON is not supported together with CPU_GGML_VARIANTS=ON. "
+      "ggml guards its CPU feature-scoring target with -fno-lto (a GCC/Clang flag that MSVC "
+      "ignores; the MSVC equivalent /GL- is absent upstream), so LTCG could inline AVX-512 code "
+      "into the score function and crash with SIGILL on CPUs that lack it. Leave GGML_LTO=OFF.")
+  endif()
+
+  set(GGML_CPU ON)
+  set(GGML_OPENMP ${CPU_GGML_OPENMP})
+  set(GGML_BUILD_TESTS OFF)
+  set(GGML_BUILD_EXAMPLES OFF)
+  set(GGML_NATIVE OFF)
+  if(CPU_GGML_VARIANTS)
+    set(BUILD_SHARED_LIBS ON)
+    set(GGML_BACKEND_DL ON)
+    set(GGML_CPU_ALL_VARIANTS ON)
+    # ggml's own CMakeLists defaults CMAKE_RUNTIME_OUTPUT_DIRECTORY to <build>/bin when it is
+    # empty (external/ggml/CMakeLists.txt:61-62), but ggml_backend_load_all() only searches the
+    # EXECUTABLE directory and the cwd -- so the variant dlls and ggml.dll/ggml-base.dll must land
+    # next to katago.exe, not in a sibling bin/. Setting this here (before add_subdirectory) makes
+    # ggml keep the value; the multi-config generator then appends the config name, which is the
+    # same <build>/<config> directory katago.exe already uses.
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+  else()
+    set(BUILD_SHARED_LIBS OFF)
+    set(GGML_BACKEND_DL OFF)
+    set(GGML_CPU_ALL_VARIANTS OFF)
+    if(CPU_GGML_ICELAKE)
+      set(GGML_AVX512 ON)
+      set(GGML_AVX512_VBMI ON)
+      set(GGML_AVX512_VNNI ON)
+    endif()
+  endif()
+  add_subdirectory(external/ggml)
+
+  if(CPU_GGML_VARIANTS)
+    # ggml-cpu is a MODULE library in this shape: it is found by name at runtime, never linked.
+    target_link_libraries(katago ggml ggml-base)
+  else()
+    target_link_libraries(katago ggml ggml-base ggml-cpu)
+  endif()
 elseif(USE_BACKEND STREQUAL "VULKAN")
   target_compile_definitions(katago PRIVATE USE_VULKAN_BACKEND)
 
@@ -1768,7 +1848,7 @@ endif()
 # and link our own protobuf. Serialized bytes are not ABI contact, so our
 # protobuf never meets the one TensorRT links into nvonnxparser, or whichever
 # one lives inside the ONNX Runtime library.
-if(USE_BACKEND STREQUAL "TENSORRT" OR USE_BACKEND STREQUAL "ONNX" OR USE_BACKEND STREQUAL "VULKAN")
+if(USE_BACKEND STREQUAL "TENSORRT" OR USE_BACKEND STREQUAL "ONNX" OR USE_BACKEND STREQUAL "VULKAN" OR USE_BACKEND STREQUAL "CPUGGML")
   # Static by default for ONNX only, and deliberately so - do not unify this with the TensorRT
   # case, which would change how Windows TensorRT builds resolve protobuf. A from-source ONNX
   # Runtime bundles a static protobuf, which module-mode FindProtobuf would otherwise take for a
@@ -1781,7 +1861,7 @@ if(USE_BACKEND STREQUAL "TENSORRT" OR USE_BACKEND STREQUAL "ONNX" OR USE_BACKEND
   # Override with -DProtobuf_USE_STATIC_LIBS=FALSE. Only module-mode FindProtobuf honors it: a
   # config-mode protobuf, as from a vcpkg toolchain or protobuf 22 and up with its abseil
   # dependencies, ignores the variable entirely.
-  if((USE_BACKEND STREQUAL "ONNX" OR USE_BACKEND STREQUAL "VULKAN") AND NOT DEFINED Protobuf_USE_STATIC_LIBS)
+  if((USE_BACKEND STREQUAL "ONNX" OR USE_BACKEND STREQUAL "VULKAN" OR USE_BACKEND STREQUAL "CPUGGML") AND NOT DEFINED Protobuf_USE_STATIC_LIBS)
     set(Protobuf_USE_STATIC_LIBS TRUE)
   endif()
   find_package(Protobuf REQUIRED)
