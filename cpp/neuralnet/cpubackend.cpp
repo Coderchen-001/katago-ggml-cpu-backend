@@ -38,6 +38,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <fstream>
+#include <map>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -535,6 +537,12 @@ struct ThreadPoolConfig {
   int numHandles;          // N (numNNServerThreadsPerModel), for per-handle mask slicing
   string source;           // "default" | "env" | "cfg" | "env+cfg"
 
+  // poll stays at ggml's own default of 50 ON PURPOSE. It was measured in the production context
+  // (`benchmark -v 100 -t 6`, 3 interleaved rounds) at 53.65 -> 53.92 visits/s = +0.5%, i.e. inside
+  // the noise, so there is no evidence to justify changing a default. The +3.4% once attributed to
+  // poll=0 came from a different machine and a different harness (alderlake, `benchmarknn`
+  // back-to-back forwards, vsDefault 0.963-0.968 in p1-logs/p1-b10-alderlake.summary.csv) -- do not
+  // re-import it here. Kept as a knob (KATAGO_CPU_POLL) and covered by the bit-equality gate.
   ThreadPoolConfig() : poll(50), prio(GGML_SCHED_PRIO_NORMAL), strictCpu(false), useMask(false), numHandles(1) {
     memset(mask, 0, sizeof(mask));
     source = "default";
@@ -734,19 +742,40 @@ static ThreadPoolConfig resolveThreadPoolConfig(ConfigParser& cfg, int threadsPe
     strictExplicit = true;
     envOver();
   }
-  // KATAGO_CPU_AFFINITY=1 with no explicit mask: pin one pool to the lowest math cores, which is
-  // the "structural partition" the design asks for and is what makes the per-handle slicing below
-  // testable with a single env var. OFF by default: pinning changes how the OS schedules the search
-  // threads too, so it stays a measured decision, not a silent default.
+  // Affinity with no explicit mask: pin the pool to one CPU per PHYSICAL core (the "structural
+  // partition"). ON BY DEFAULT since 2026-09-22, because it was measured, not assumed:
+  //   production context `benchmark -v 100 -t 6` (9800X3D, L2 build, 3 interleaved rounds)
+  //   53.92 -> 61.12 visits/s = +13.9%; reproduced on 2026-09-22 morning at +14.4%; and it is
+  //   +13.7~14.5% at N=1/2/4 handles, so it is a topology effect (one thread per physical core,
+  //   no SMT sibling contention), not a fit to this machine.
+  // It is a SCHEDULING-ONLY change and therefore bit-identical, which was proven rather than
+  // argued: `kata-raw-nn` over all 8 symmetries on two positions is byte-identical across
+  // poll=0/50/100 x mask on/off/soft, while a non-LLAMAFILE control build differs (so the
+  // instrument is demonstrably not blind). See p0-bitequal.ps1 and the design doc's P0 section.
+  // Failure mode is graceful: ggml discards SetThreadAffinityMask's result (ggml-cpu.c:2526-2528)
+  // and the Linux path only warns, so a confined (cgroup/Job-restricted) or odd-topology machine
+  // degrades to the unpinned behaviour instead of failing or computing a different answer.
+  // KATAGO_CPU_AFFINITY=0 opts out; an explicit mask/range (cfg or env) always wins.
   env = getenv("KATAGO_CPU_AFFINITY");
-  if(!tpc.useMask && env != NULL && env[0] == '1' && env[1] == '\0') {
+  const bool affinityOff = (env != NULL && env[0] == '0' && env[1] == '\0');
+  if(!tpc.useMask && !affinityOff) {
     // One CPU per PHYSICAL core, not the lowest N logical CPUs: on this machine logical CPUs 0 and
     // 1 are the two SMT threads of core 0, so the naive mask would put half the pool on one core.
     const int n = getNumMathCores();
-    buildAutoMask(tpc.mask, n);
-    tpc.useMask = true;
-    envOver();
-    tpc.source += "(auto-mask=one-cpu-per-core, " + std::to_string(maskPopcount(tpc.mask)) + " cpus)";
+    if(threadsPerHandle > n) {
+      // An explicit T above the math-core count is the user's own partitioning call. The
+      // one-CPU-per-core mask cannot cover it and forcing it would pin two workers to one CPU,
+      // which is exactly what the explicit-mask guard below refuses to do. Stay unpinned, loudly.
+      tpc.source += "(auto-mask=skipped: T=" + std::to_string(threadsPerHandle) +
+                    " > math cores=" + std::to_string(n) + ")";
+    }
+    else {
+      buildAutoMask(tpc.mask, n);
+      tpc.useMask = true;
+      if(env != NULL && env[0] == '1' && env[1] == '\0')
+        envOver();
+      tpc.source += "(auto-mask=one-cpu-per-core, " + std::to_string(maskPopcount(tpc.mask)) + " cpus)";
+    }
   }
   // A mask that is not also strict is a soft hint (every worker still sees every masked CPU), which
   // is NOT a partition. Default to strict when a mask was requested and nobody said otherwise.
@@ -763,6 +792,45 @@ static ThreadPoolConfig resolveThreadPoolConfig(ConfigParser& cfg, int threadsPe
   return tpc;
 }
 
+// Trunk layout for transformer models: NHWC (channel-last) vs NCHW.
+//
+// This is a GRAPH-CONSTRUCTION choice, not a kernel one: the shared ONNX emitter's
+// buildParams.transformerNHWC decides it, and onnxmodelbuilder.cpp:1199-1204 places the single
+// NCHW<->NHWC conversion at the trunk boundary, so the CPU backend's own inputs/outputs stay NCHW
+// (inputsUseNHWC is untouched) while only the block-stack internals go channel-last. The ONNX
+// backend (onnxbackend.cpp:246) and TensorRT (trtbackend.cpp:152) already default it to TRUE, with
+// the comment "NHWC is markedly faster for transformer trunks".
+//
+// Why it matters here, from OUR OWN production graph rather than from that comment
+// (variant-ab-logs/graphdump-cascadelake.log, b10c384, batch 6, 1665 nodes): the NCHW trunk emits
+// 96 PERMUTE and 90 CONT nodes, and every one of those 90 CONT is the materialization of a
+// PERMUTE -- i.e. pure layout traffic inside the 17% elementwise+copy slice of the profile. In
+// NHWC the attention head split becomes a free reshape. (T9's "MUL_MAT+ADD fusion" was checked in
+// the same dump and does not exist: 133 MUL_MAT nodes are consumed only by RESHAPE/VIEW.)
+//
+// The default stays NCHW (false) until MEASURED, because unlike the affinity default this is NOT
+// bit-equal in class: it changes operand strides and op order, so it needs the bit gate and, if it
+// fails that, a margin run plus a check on an AVX2 tier (the per-op cost it removes is not
+// ISA-neutral). The knob ships in this build so BOTH arms can be measured with ONE binary; flipping
+// the default is a separate, evidence-backed step. KATAGO_CPU_NHWC overrides cpuggmlTransformerNHWC.
+static bool resolveTransformerNHWC(ConfigParser& cfg, std::string& source) {
+  bool nhwc = false;
+  source = "default";
+  if(cfg.contains("cpuggmlTransformerNHWC")) {
+    nhwc = cfg.getBool("cpuggmlTransformerNHWC");
+    source = "cfg";
+  }
+  const char* env = getenv("KATAGO_CPU_NHWC");
+  if(env != NULL && env[0] != '\0') {
+    if((env[0] != '0' && env[0] != '1') || env[1] != '\0')
+      throw StringError("CPU backend: KATAGO_CPU_NHWC must be 0 or 1, got \"" + string(env) + "\"");
+    nhwc = (env[0] == '1');
+    source = cfg.contains("cpuggmlTransformerNHWC") ? "env+cfg" : "env";
+  }
+  source += nhwc ? "(nhwc)" : "(nchw)";
+  return nhwc;
+}
+
 struct ComputeContext {
   int nnXLen;
   int nnYLen;
@@ -776,6 +844,11 @@ struct ComputeContext {
 
   // Pool knobs (poll/prio/cpumask/strict), same lifetime and source discipline as the thread count.
   ThreadPoolConfig tpc;
+
+  // Trunk layout for the internally built ONNX graph (see resolveTransformerNHWC). Assigned right
+  // after construction, like tpc, so the ConfigParser stays owned by createComputeContext.
+  bool transformerNHWC = false;
+  std::string transformerNHWCSource = "default(nchw)";
 
   ComputeContext(int xLen, int yLen, enabled_t fp16Mode, int threadsPerHandle, const std::string& threadsSource)
     : nnXLen(xLen), nnYLen(yLen), useFP16Mode(fp16Mode),
@@ -832,6 +905,7 @@ ComputeContext* NeuralNet::createComputeContext(
   // f32 accumulation (the precision class below).
   ComputeContext* ctx = new ComputeContext(nnXLen, nnYLen, useFP16Mode, threadsPerHandle, threadsSource);
   ctx->tpc = resolveThreadPoolConfig(cfg, threadsPerHandle);
+  ctx->transformerNHWC = resolveTransformerNHWC(cfg, ctx->transformerNHWCSource);
   // N of the (N,T) budget. Not derivable from gpuIdxs: nneval sorts AND DEDUPLICATES it before
   // createComputeContext (nneval.cpp:136-138), so on this backend it always arrives as {0}. The
   // config key is the same one Setup used to build the server threads, so read it here.
@@ -845,7 +919,9 @@ ComputeContext* NeuralNet::createComputeContext(
                   " source=" + threadsSource + ", handles=" + Global::intToString(ctx->tpc.numHandles) +
                   ", poll=" + Global::intToString(ctx->tpc.poll) +
                   ", prio=" + Global::intToString(ctx->tpc.prio) +
-                  ", poolConfig=" + ctx->tpc.source + ")");
+                  ", poolConfig=" + ctx->tpc.source +
+                  ", nhwc=" + Global::boolToString(ctx->transformerNHWC) +
+                  "[" + ctx->transformerNHWCSource + "])");
     logger->write("CPU backend: topology physical=" + Global::intToString(topo.physicalCores) +
                   " [" + topo.physicalSource + "], math=" + Global::intToString(topo.mathCores) +
                   " [" + topo.mathSource + "], logical=" + Global::intToString(topo.logicalCores));
@@ -1164,13 +1240,24 @@ struct ComputeHandle {
     if(loadedModel->isExternalOnnx) {
       onnxBytesPtr = &loadedModel->externalOnnx.serializedModel;
       sharedProto = loadedModel->modelProto;
+      // An external .onnx carries its trunk layout in its own metadata (META_TRANSFORMER_NHWC), so
+      // the knob cannot override it. Same limitation the ONNX/TensorRT backends report -- but say
+      // so instead of silently ignoring the setting, because a sweep would otherwise read the
+      // layout off the log and attribute nothing to a flag that never took effect.
+      if(logger != NULL && loadedModel->externalOnnx.buildParams.transformerNHWC != ctx->transformerNHWC)
+        logger->write("CPU backend: WARNING - external .onnx is baked with transformerNHWC=" +
+                      Global::boolToString(loadedModel->externalOnnx.buildParams.transformerNHWC) +
+                      ", which the CPU backend's nhwc setting (" +
+                      Global::boolToString(ctx->transformerNHWC) + ") cannot change; using the file's layout");
     }
     else {
       OnnxModelBuilder::BuildParams buildParams;
       buildParams.nnXLen = ctx->nnXLen;
       buildParams.nnYLen = ctx->nnYLen;
       buildParams.requireExactNNLen = false;
-      buildParams.transformerNHWC = false;
+      // Trunk layout. Only meaningful for the internally built graph; see resolveTransformerNHWC
+      // for the measurements this knob exists to produce.
+      buildParams.transformerNHWC = ctx->transformerNHWC;
       buildParams.scale8Applied = loadedModel->scale8Applied;
       if(logger != NULL)
         logger->write("CPU backend: building ONNX graph from model weights...");
@@ -1181,6 +1268,41 @@ struct ComputeHandle {
       if(!proto->ParseFromArray(onnxBytesPtr->data(), (int)onnxBytesPtr->size()))
         throw StringError("CPU backend: could not parse the built ONNX graph");
       sharedProto = proto;
+
+      // Layout diagnostic. The NCHW-vs-NHWC decision is a GRAPH-CONSTRUCTION question -- how much
+      // layout traffic each layout needs -- and it is answerable HERE, at the ONNX level, even when
+      // the ggml interpreter cannot (yet) consume one of the two layouts. Counting ggml nodes after
+      // the fact is not enough, because the interpreter expands each Transpose into PERMUTE+CONT and
+      // each layout has its own expansion. So print the exact histogram of what the emitter built.
+      if(logger != NULL) {
+        map<string,int> opCount;
+        for(int i = 0; i < sharedProto->graph().node_size(); i++)
+          opCount[sharedProto->graph().node(i).op_type()]++;
+        string hist;
+        for(map<string,int>::const_iterator it = opCount.begin(); it != opCount.end(); ++it)
+          hist += (hist.empty() ? "" : " ") + it->first + "=" + Global::intToString(it->second);
+        logger->write(string("CPU backend: ONNX op histogram (") +
+                      (ctx->transformerNHWC ? "NHWC" : "NCHW") + " trunk, " +
+                      Global::intToString(sharedProto->graph().node_size()) + " nodes): " + hist);
+      }
+
+      // KATAGO_CPU_DUMP_ONNX=<path>: write out the graph the emitter just built. This is the only
+      // way to inspect an NHWC trunk at all while the ggml interpreter still refuses it -- and the
+      // two layouts' Transpose/Conv/MatMul mix is exactly what decides whether a layout switch is
+      // worth the port, so it has to be readable offline.
+      {
+        const char* dumpPath = getenv("KATAGO_CPU_DUMP_ONNX");
+        if(dumpPath != NULL && dumpPath[0] != '\0') {
+          ofstream dumpOut(dumpPath, ios::binary);
+          if(!dumpOut)
+            throw StringError("CPU backend: could not open KATAGO_CPU_DUMP_ONNX path " + string(dumpPath));
+          dumpOut.write(builtOnnxBytes.data(), (streamsize)builtOnnxBytes.size());
+          if(logger != NULL)
+            logger->write(string("CPU backend: dumped built ONNX graph (") +
+                          (ctx->transformerNHWC ? "NHWC" : "NCHW") + ") to " + string(dumpPath) +
+                          " (" + Global::intToString((int)builtOnnxBytes.size()) + " bytes)");
+        }
+      }
     }
     const string& onnxBytes = *onnxBytesPtr;
 

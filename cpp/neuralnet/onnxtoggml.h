@@ -1424,7 +1424,7 @@ struct OnnxToGgml {
         needsBroadcast = true;
         continue;
       }
-      throw StringError("VULKAN backend: shape mismatch in broadcast");
+      throw StringError("VULKAN backend: shape mismatch in broadcast (node " + currentOpName + ")");
     }
     if(!needsBroadcast)
       return t;
@@ -1448,7 +1448,8 @@ struct OnnxToGgml {
       if(a->ne[i] != 1 && b->ne[i] != 1 && a->ne[i] != b->ne[i])
         throw StringError("VULKAN backend: shape mismatch in broadcast a ne=" +
           Global::intToString(a->ne[0]) + "," + Global::intToString(a->ne[1]) + "," + Global::intToString(a->ne[2]) + "," + Global::intToString(a->ne[3]) +
-          " b ne=" + Global::intToString(b->ne[0]) + "," + Global::intToString(b->ne[1]) + "," + Global::intToString(b->ne[2]) + "," + Global::intToString(b->ne[3]));
+          " b ne=" + Global::intToString(b->ne[0]) + "," + Global::intToString(b->ne[1]) + "," + Global::intToString(b->ne[2]) + "," + Global::intToString(b->ne[3]) +
+          " (node " + currentOpName + ")");
     }
     testAssert(!(aHas1 && bHas1));  // one side must be elementwise-larger
     if(!aHas1 && !bHas1) {
