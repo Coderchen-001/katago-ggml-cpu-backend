@@ -477,6 +477,33 @@ function(ggml_add_cpu_backend_variant tag_name)
         endforeach()
     endif()
 
+    # KATAGO LOCAL (build-config workaround, no semantic change), 2026-09-24:
+    # clang >= 20 -- and clang 22.1.3 in particular -- has an optimizer explosion on
+    # amx/mmq.cpp when the AMX flags are on. Measured on this tree, identical command line,
+    # sapphirerapids variant:
+    #     -O3 (with -mamx-tile -mamx-int8)   > 45 min, still running (RSS 868 MB and growing,
+    #                                        whole-machine CPU ~6% == one serial pass)
+    #     -O2 (with AMX)                     > 9 min, still running
+    #     -O1                                1.9 s
+    #     -O3 -fno-unroll-loops              2.1 s   <-- this flag, object 239,965 B
+    #     -O3 without the -mamx-* flags      0.3 s   (object 1,211 B)
+    # clang 19.1.5 built the same file with the same flags without trouble, so this is a
+    # codegen regression, not a property of the source.
+    #
+    # Note on scope, because it looks broader than it is: set_source_files_properties is
+    # DIRECTORY-scoped, so this COMPILE_OPTIONS lands in every variant's compile line, not just
+    # the AMX one -- a configure-time "is this variant AMX?" guard cannot narrow it (tried;
+    # it does not work). That is harmless here and is left alone deliberately: without the AMX
+    # macros this file is an empty translation unit (object 1,211 B vs 239,965 B), so the flag
+    # has nothing to act on in the other 13 tiers. Only sapphirerapids carries AMX, and its
+    # kernels are reachable only on Sapphire Rapids class hardware while KataGo runs f16
+    # weights -- so no machine we ship to selects this tier at all.
+    # Remove this block when upstream fixes the file or the toolchain is fixed.
+    if (NOT MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 20)
+        set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/ggml-cpu/amx/mmq.cpp
+                                    PROPERTIES COMPILE_OPTIONS "-fno-unroll-loops")
+    endif()
+
     ggml_add_cpu_backend_variant_impl(${tag_name})
 endfunction()
 
