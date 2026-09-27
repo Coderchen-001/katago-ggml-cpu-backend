@@ -1703,17 +1703,43 @@ elseif(USE_BACKEND STREQUAL "CPUGGML")
   option(CPU_GGML_ICELAKE  "KataGo: static arm targets AVX-512 + VNNI + VBMI (the icelake tier)" OFF)
 
   # Build-time guard, in OUR file on purpose (no vendored edit): ggml's per-variant feature-scoring
-  # target is protected from LTO with -fno-lto, which MSVC ignores, and LTO is a GLOBAL setting
+  # target is protected from LTO with -fno-lto, and LTO is a GLOBAL setting
   # (external/ggml/src/CMakeLists.txt:58-62). With LTCG a score function can get arch-specific
-  # instructions inlined into it and SIGILL on an older CPU before the score check even runs --
-  # the exact failure the upstream comment warns about. We never enable LTO here; fail loudly
-  # instead of shipping a landmine if someone does.
-  if(CPU_GGML_VARIANTS AND GGML_LTO)
+  # instructions inlined into it and SIGILL on an older CPU before the score check even runs -- the
+  # exact failure the upstream comment warns about (both this file's vendored copy and
+  # llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:12-16 carry that comment).
+  #
+  # Scoped to MSVC and clang-cl, because that is the only case where -fno-lto does NOT work, measured
+  # on this box (clang 22.1.3 / MSVC 14.51):
+  #   clang-cl -fno-lto    -> accepted, no warning, and silently ignored  => hazard is real
+  #   clang-cl /GL-        -> "argument unused", i.e. clang-cl has no way to disable LTO at all
+  #   cl.exe   /GL-        -> accepted (produces the non-LTO object shape)
+  #   clang.exe -fno-lto   -> honoured: 870-byte object, the same shape as with no flag, whereas
+  #                           -flto yields a 2900-byte object carrying bitcode
+  # The CPU release recipe builds with clang.exe under the GNU driver (not clang-cl), so upstream's
+  # protection is effective there and the score function cannot acquire tier instructions. The Vulkan
+  # artifact is built with MSVC, where /GL and /GL- both exist but upstream still passes the
+  # ineffective -fno-lto -- so keep LTO off for anything that is not the GNU-driver CPU build.
+  if(CPU_GGML_VARIANTS AND GGML_LTO AND
+     (MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
     message(FATAL_ERROR
-      "CPUGGML: GGML_LTO=ON is not supported together with CPU_GGML_VARIANTS=ON. "
-      "ggml guards its CPU feature-scoring target with -fno-lto (a GCC/Clang flag that MSVC "
-      "ignores; the MSVC equivalent /GL- is absent upstream), so LTCG could inline AVX-512 code "
-      "into the score function and crash with SIGILL on CPUs that lack it. Leave GGML_LTO=OFF.")
+      "CPUGGML: GGML_LTO=ON is not supported together with CPU_GGML_VARIANTS=ON when compiling with "
+      "MSVC or clang-cl. ggml guards its CPU feature-scoring target with -fno-lto, which only the "
+      "GNU/Clang drivers honour; MSVC ignores it and clang-cl ignores both it and /GL-, so LTCG could "
+      "inline AVX-512 code into the score function and crash with SIGILL on CPUs that lack it. "
+      "Either leave GGML_LTO=OFF, or build with clang.exe (GNU driver), where the guard works.")
+  endif()
+
+  # Independent of CPU_GGML_VARIANTS on purpose: any MSVC/clang-cl build must keep LTO off, even when
+  # the variant set is not the thing that consumes ggml's feature-scoring target. The Vulkan artifact
+  # is the live case -- it is built with MSVC, where ggml still passes the ineffective -fno-lto.
+  if(GGML_LTO AND (MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
+    message(FATAL_ERROR
+      "CPUGGML: GGML_LTO=ON is not supported when compiling with MSVC or clang-cl, for any backend. "
+      "ggml's -fno-lto on its feature-scoring target is a GCC/Clang driver flag: MSVC ignores it and "
+      "clang-cl ignores it and /GL- as well, so LTCG can inline tier-specific instructions into the "
+      "score function and SIGILL on a CPU that lacks them before the score check runs. Use clang.exe "
+      "(GNU driver) if LTO is wanted, or leave GGML_LTO=OFF.")
   endif()
 
   set(GGML_CPU ON)
