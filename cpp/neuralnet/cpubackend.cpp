@@ -989,6 +989,10 @@ struct ComputeContext {
   ComputeContext& operator=(const ComputeContext&) = delete;
 };
 
+// Forward declaration: the topology log line reports the last-level-cache grouping, but the definition sits
+// further down next to the other CPU-topology helpers.
+static string describeL3Groups();
+
 ComputeContext* NeuralNet::createComputeContext(
   const std::vector<int>& gpuIdxs,
   Logger* logger,
@@ -1053,9 +1057,47 @@ ComputeContext* NeuralNet::createComputeContext(
                   "[" + ctx->transformerNHWCSource + "])");
     logger->write("CPU backend: topology physical=" + Global::intToString(topo.physicalCores) +
                   " [" + topo.physicalSource + "], math=" + Global::intToString(topo.mathCores) +
-                  " [" + topo.mathSource + "], logical=" + Global::intToString(topo.logicalCores));
+                  " [" + topo.mathSource + "], logical=" + Global::intToString(topo.logicalCores) +
+                  ", lastLevelCacheGroups=" + describeL3Groups());
   }
   return ctx;
+}
+
+// Human-readable last-level-cache grouping for the topology log line, e.g. "2 groups [0,2,4,6,8,10]
+// [12,14,16,18,20,22]". Exists so a cross-machine log carries its own evidence: when a machine with more
+// than one group reports a bad result, the group layout is visible without re-running anything, and a pool
+// that spans groups can be spotted directly instead of inferred. Empty string when no grouping was found.
+static string describeL3Groups() {
+  const vector<CpuCoreEntry> cores = detectPhysicalCores();
+  if(cores.empty())
+    return "(none)";
+  // collect the distinct non-negative domains in first-seen order, keeping each group's CPU list
+  vector<int> order;
+  for(size_t i = 0; i < cores.size(); i++) {
+    const int d = cores[i].l3Domain;
+    if(d < 0)
+      continue;
+    if(std::find(order.begin(), order.end(), d) == order.end())
+      order.push_back(d);
+  }
+  if(order.size() <= 1)
+    return Global::intToString((int)order.size()) + " group" + (order.size() == 1 ? "" : "s") +
+           " (no cache split: the mask cannot span groups)";
+  string s = Global::intToString((int)order.size()) + " groups";
+  for(size_t k = 0; k < order.size(); k++) {
+    s += " [";
+    bool first = true;
+    for(size_t i = 0; i < cores.size(); i++) {
+      if(cores[i].l3Domain != order[k])
+        continue;
+      if(!first)
+        s += ",";
+      s += Global::intToString(cores[i].primaryCpu);
+      first = false;
+    }
+    s += "]";
+  }
+  return s;
 }
 
 void NeuralNet::freeComputeContext(ComputeContext* computeContext) {
