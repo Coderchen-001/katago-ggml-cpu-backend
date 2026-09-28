@@ -109,8 +109,113 @@ struct CpuTopology {
 struct CpuCoreEntry {
   int primaryCpu;
   int efficiencyClass;   // lowest class = the capable cores; 0 on systems that do not report it
+  int l3Domain;          // which last-level-cache group this core sits in; see detectL3Domains
   string siblings;       // display only
 };
+
+// Map every CPU to the last-level-cache group that it shares with others, so the pool can be kept inside
+// one of them. On current AMD parts each L3 group is one CCD, and crossing CCDs costs real performance:
+// measured on a 5900X, two 6-thread pools with identical core counts and identical work differ by 22%
+// depending only on which CCD their CPUs sit in (26.60 vs 20.76 visits/s, n=5 each).
+//
+// Why this matters for the automatic mask: buildAutoMask used to take the first N physical cores in CPU
+// order, which is blind to these groups. That happens to land inside a single CCD on a 5900X (12 cores =
+// 2 groups of 6, so the first 6 fit exactly), but on a 16-core dual-CCD part taking 8 cores splits 4+4
+// across both groups and pays the crossing cost. Preferred source is RelationCache with CacheLevel 3;
+// NUMA nodes are the fallback for machines that report topology that way.
+static vector<int> detectL3Domains() {
+  // domain index per CPU, -1 when the CPU is not covered by any group
+  vector<int> domain(GGML_MAX_N_THREADS, -1);
+#if defined(_WIN32)
+  // L3 first, and only fall back to NUMA if no L3 group was found at all: an L3 group is the tighter
+  // unit, and on a chiplet part the NUMA view may be coarser.
+  for(int pass = 0; pass < 2; pass++) {
+    const LOGICAL_PROCESSOR_RELATIONSHIP rel = (pass == 0) ? RelationCache : RelationNumaNode;
+    DWORD len = 0;
+    const bool ok = GetLogicalProcessorInformationEx(rel, NULL, &len) != 0 ||
+                    GetLastError() == ERROR_INSUFFICIENT_BUFFER;
+    if(!ok)
+      continue;
+    vector<char> buf(len);
+    if(!GetLogicalProcessorInformationEx(
+         rel, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len))
+      continue;
+    int next = 0;
+    for(DWORD off = 0; off < len; ) {
+      PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info =
+        reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data() + off);
+      WORD groupCount = 0;
+      PGROUP_AFFINITY masks = NULL;
+      if(info->Relationship == RelationCache && info->Cache.Level == 3) {
+        groupCount = info->Cache.GroupCount;
+        masks = info->Cache.GroupMasks;
+      }
+      else if(info->Relationship == RelationNumaNode) {
+        groupCount = info->NumaNode.GroupCount;
+        masks = info->NumaNode.GroupMasks;
+      }
+      if(groupCount > 0 && masks != NULL) {
+        const int id = next++;
+        for(WORD g = 0; g < groupCount; g++) {
+          const KAFFINITY m = masks[g].Mask;
+          const int base = (int)masks[g].Group * 64;
+          for(int b = 0; b < 64; b++) {
+            if(((m >> b) & 1ull) == 0)
+              continue;
+            const int cpu = base + b;
+            // first group wins, so overlapping (e.g. NUMA spanning both CCDs) does not steal a CPU
+            if(cpu >= 0 && cpu < GGML_MAX_N_THREADS && domain[cpu] < 0)
+              domain[cpu] = id;
+          }
+        }
+      }
+      off += info->Size;
+    }
+    if(next > 0)
+      break;
+  }
+#elif defined(__linux__)
+  // One L3 group per shared_cpu_list under cache/index3.
+  int next = 0;
+  for(unsigned cpu = 0; cpu < 4096; cpu++) {
+    ifstream in("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                "/cache/index3/shared_cpu_list");
+    if(!in.is_open())
+      break;
+    string line;
+    if(!std::getline(in, line))
+      continue;
+    // expand "a-b,c,d" and tag every CPU in it with this group's id
+    size_t i = 0;
+    while(i < line.size()) {
+      while(i < line.size() && (line[i] == ',' || isspace((unsigned char)line[i])))
+        i++;
+      if(i >= line.size())
+        break;
+      size_t j = i;
+      while(j < line.size() && isdigit((unsigned char)line[j]))
+        j++;
+      if(j == i)
+        break;
+      const int a = atoi(line.substr(i, j - i).c_str());
+      int b = a;
+      i = j;
+      if(i < line.size() && line[i] == '-') {
+        size_t k = ++i;
+        while(k < line.size() && isdigit((unsigned char)line[k]))
+          k++;
+        b = atoi(line.substr(i, k - i).c_str());
+        i = k;
+      }
+      for(int c = a; c <= b && c < GGML_MAX_N_THREADS; c++)
+        if(c >= 0 && domain[c] < 0)
+          domain[c] = next;
+    }
+    next++;
+  }
+#endif
+  return domain;
+}
 
 // "0-1", "0,4", "0-3,8": lowest CPU in the list, or -1.
 static int parseCpuListMin(const string& line) {
@@ -199,23 +304,47 @@ static vector<CpuCoreEntry> detectPhysicalCores() {
       cores.push_back(e);
   }
 #endif
+  // Tag every core with its last-level-cache group so the mask builder can keep a pool inside one.
+  const vector<int> domain = detectL3Domains();
+  for(size_t i = 0; i < cores.size(); i++) {
+    const int c = cores[i].primaryCpu;
+    cores[i].l3Domain = (c >= 0 && c < (int)domain.size()) ? domain[c] : -1;
+  }
   return cores;
 }
 
-// Pin one pool to one CPU per physical core, preferring the capable (non-E) cores. Used only when
-// affinity was explicitly requested (KATAGO_CPU_AFFINITY=1) or a mask was given.
+// Pin one pool to one CPU per physical core, preferring the capable (non-E) cores, and keeping the pool
+// inside a single last-level-cache group when the thread count allows it. Used only when affinity was
+// explicitly requested (KATAGO_CPU_AFFINITY=1) or a mask was given.
+//
+// The group constraint is not cosmetic. Measured on a 5900X (12 cores, 2 CCDs of 6), two 6-thread pools
+// with the same core count and the same work differ by 22% purely by which CCD their CPUs are in
+// (26.60 vs 20.76 visits/s, n=5 each). The previous version took the first N physical cores in CPU order,
+// which is blind to this: it happens to fit exactly inside one 5900X CCD, but on a 16-core dual-CCD part
+// taking 8 cores would split 4+4 across both groups and pay that crossing cost.
 static void buildAutoMask(bool (&mask)[GGML_MAX_N_THREADS], int maxCores) {
   memset(mask, 0, sizeof(mask));
   vector<CpuCoreEntry> cores = detectPhysicalCores();
   std::stable_sort(cores.begin(), cores.end(), [](const CpuCoreEntry& a, const CpuCoreEntry& b) {
     if(a.efficiencyClass != b.efficiencyClass)
       return a.efficiencyClass < b.efficiencyClass;
+    if(a.l3Domain != b.l3Domain)
+      return a.l3Domain < b.l3Domain;
     return a.primaryCpu < b.primaryCpu;
   });
   int taken = 0;
-  for(size_t i = 0; i < cores.size() && taken < maxCores; i++) {
-    mask[cores[i].primaryCpu] = true;
-    taken++;
+  // Fill ONE (efficiency class, L3 group) run at a time: the moment a group is exhausted, stop, and only
+  // continue if the request is still not satisfied. Cores are already grouped and ordered, so a single
+  // pass with a break on group change is the whole policy -- stay inside one cache group whenever the
+  // thread count fits, and spill into the next group only when it does not.
+  for(size_t i = 0; i < cores.size() && taken < maxCores; ) {
+    const int ec = cores[i].efficiencyClass;
+    const int dom = cores[i].l3Domain;
+    while(i < cores.size() && cores[i].efficiencyClass == ec && cores[i].l3Domain == dom && taken < maxCores) {
+      mask[cores[i].primaryCpu] = true;
+      taken++;
+      i++;
+    }
   }
   if(taken == 0) {
     for(int i = 0; i < maxCores && i < GGML_MAX_N_THREADS; i++)
