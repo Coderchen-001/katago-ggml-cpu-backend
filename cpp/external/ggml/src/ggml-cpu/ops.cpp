@@ -332,9 +332,14 @@ static void ggml_compute_forward_dup_to_q(
 //
 // Specialising on ES makes the memcpy a compile-time constant, which the compiler inlines into a register
 // load and store. It is bit-exact: the same bytes move to the same places in the same order, only the means
-// of moving them changes. ES is the element size in bytes; SRC_T is used only to pick a natural scalar type
-// for the fixed-size copy.
-template <int ES, typename SRC_T>
+// of moving them changes.
+//
+// The carry is a byte array sized by ES, deliberately not a scalar type: an earlier revision used a wide
+// integer (int64_t) for the 16-byte case, which is only 8 bytes, so memcpy wrote past the local and clang
+// said so -- 14 -Wfortify-source warnings, buried among the inherited ggml-common.h warnings and missed. No
+// current ggml type is 16 bytes, so it was latent UB rather than a live bug, but it must not reach upstream
+// in that state. The byte array keeps the same code generation for the 2/4-byte widths.
+template <int ES>
 static void ggml_compute_forward_dup_bytes_strided(
         const char * src0_data,
         char * dst_ptr,
@@ -342,6 +347,10 @@ static void ggml_compute_forward_dup_bytes_strided(
         size_t nb00, size_t nb01, size_t nb02, size_t nb03,
         int64_t ir0, int64_t ir1,
         const size_t rs) {
+    // The correctness of the whole routine rests on the row stride being exactly ne00 elements, because the
+    // destination advances by ES per element and by rs per row. Make that explicit instead of leaving it as
+    // an unstated precondition for whoever adds the next case.
+    GGML_ASSERT(rs == (size_t) ne00 * (size_t) ES);
     int64_t id = 0;
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
@@ -349,9 +358,9 @@ static void ggml_compute_forward_dup_bytes_strided(
             for (int64_t i01 = ir0; i01 < ir1; i01++) {
                 const char * src0_row = src0_data + i01*nb01 + i02*nb02 + i03*nb03;
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    SRC_T v;
-                    memcpy(&v, src0_row + i00*nb00, ES);
-                    memcpy(dst_ptr + id, &v, ES);
+                    unsigned char v[ES];
+                    memcpy(v, src0_row + i00*nb00, ES);
+                    memcpy(dst_ptr + id, v, ES);
                     id += ES;
                 }
             }
@@ -432,11 +441,11 @@ static void ggml_compute_forward_dup_bytes(
             // compiler inlines instead of calling the CRT's variable-length memcpy. Every branch is
             // bit-exact; the final fallback is the original runtime-width loop for any other width.
             switch (type_size) {
-                case 1:  ggml_compute_forward_dup_bytes_strided<1,  int8_t >((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
-                case 2:  ggml_compute_forward_dup_bytes_strided<2,  int16_t>((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
-                case 4:  ggml_compute_forward_dup_bytes_strided<4,  int32_t>((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
-                case 8:  ggml_compute_forward_dup_bytes_strided<8,  int64_t>((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
-                case 16: ggml_compute_forward_dup_bytes_strided<16, int64_t>((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
+                case 1:  ggml_compute_forward_dup_bytes_strided<1 >((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
+                case 2:  ggml_compute_forward_dup_bytes_strided<2 >((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
+                case 4:  ggml_compute_forward_dup_bytes_strided<4 >((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
+                case 8:  ggml_compute_forward_dup_bytes_strided<8 >((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
+                case 16: ggml_compute_forward_dup_bytes_strided<16>((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
                 default:
             for (int64_t i03 = 0; i03 < ne03; i03++) {
                 for (int64_t i02 = 0; i02 < ne02; i02++) {
