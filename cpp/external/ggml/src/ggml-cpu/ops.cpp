@@ -393,24 +393,12 @@ static void ggml_compute_forward_dup_bytes(
             for (int64_t i03 = 0; i03 < ne03; i03++) {
                 for (int64_t i02 = 0; i02 < ne02; i02++) {
                     id += rs * ir0;
-                    if (nb00 == type_size && ne00 == ne0 && nb0 == type_size) {
-                        // Rows are contiguous on both first dimensions, so a whole row can move at once
-                        // instead of one memcpy per element. Bit-exact: a block copy equals the
-                        // element-by-element copy of the same block, byte for byte, and the destination
-                        // stays contiguous across rows (nb0 == type_size).
-                        for (int64_t i01 = ir0; i01 < ir1; i01++) {
-                            const char * src0_ptr = (char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
-                            memcpy(dst_ptr + id, src0_ptr, rs);
-                            id += rs;
-                        }
-                    } else {
-                        for (int64_t i01 = ir0; i01 < ir1; i01++) {
-                            for (int64_t i00 = 0; i00 < ne00; i00++) {
-                                const char * src0_ptr = (char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
-                                memcpy(dst_ptr + id, src0_ptr, type_size);
+                    for (int64_t i01 = ir0; i01 < ir1; i01++) {
+                        for (int64_t i00 = 0; i00 < ne00; i00++) {
+                            const char * src0_ptr = (char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
+                            memcpy(dst_ptr + id, src0_ptr, type_size);
 
-                                id += type_size;
-                            }
+                            id += type_size;
                         }
                     }
                     id += rs * (ne01 - ir1);
