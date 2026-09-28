@@ -322,6 +322,44 @@ static void ggml_compute_forward_dup_to_q(
     }
 }
 
+// Copy the strided-source / contiguous-destination case at a compile-time element width.
+//
+// Why: the per-element fallback below calls memcpy(dst, src, type_size) with a RUNTIME width, so the
+// compiler cannot turn it into a load/store and it lands in the CRT's variable-length memcpy -- on this
+// platform memcpy_avx_ermsb_amd, whose rep-movsb path pays a large fixed cost per call. A profile of the
+// release build put ggml_compute_forward_dup plus the memcpy hanging below it at roughly 7% of all samples,
+// almost all of it in exactly this loop.
+//
+// Specialising on ES makes the memcpy a compile-time constant, which the compiler inlines into a register
+// load and store. It is bit-exact: the same bytes move to the same places in the same order, only the means
+// of moving them changes. ES is the element size in bytes; SRC_T is used only to pick a natural scalar type
+// for the fixed-size copy.
+template <int ES, typename SRC_T>
+static void ggml_compute_forward_dup_bytes_strided(
+        const char * src0_data,
+        char * dst_ptr,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        size_t nb00, size_t nb01, size_t nb02, size_t nb03,
+        int64_t ir0, int64_t ir1,
+        const size_t rs) {
+    int64_t id = 0;
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            id += rs * ir0;
+            for (int64_t i01 = ir0; i01 < ir1; i01++) {
+                const char * src0_row = src0_data + i01*nb01 + i02*nb02 + i03*nb03;
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    SRC_T v;
+                    memcpy(&v, src0_row + i00*nb00, ES);
+                    memcpy(dst_ptr + id, &v, ES);
+                    id += ES;
+                }
+            }
+            id += rs * (ne01 - ir1);
+        }
+    }
+}
+
 // A simplified version of ggml_compute_forward_dup that doesn't do float upcasting, and just plain old memcpy.
 static void ggml_compute_forward_dup_bytes(
         const ggml_compute_params * params,
@@ -390,6 +428,16 @@ static void ggml_compute_forward_dup_bytes(
         } else {
             //printf("%s: this is not optimal - fix me\n", __func__);
 
+            // Dispatch on the element width so the copy inside is a compile-time-constant memcpy, which the
+            // compiler inlines instead of calling the CRT's variable-length memcpy. Every branch is
+            // bit-exact; the final fallback is the original runtime-width loop for any other width.
+            switch (type_size) {
+                case 1:  ggml_compute_forward_dup_bytes_strided<1,  int8_t >((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
+                case 2:  ggml_compute_forward_dup_bytes_strided<2,  int16_t>((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
+                case 4:  ggml_compute_forward_dup_bytes_strided<4,  int32_t>((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
+                case 8:  ggml_compute_forward_dup_bytes_strided<8,  int64_t>((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
+                case 16: ggml_compute_forward_dup_bytes_strided<16, int64_t>((const char *) src0->data, dst_ptr, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, ir0, ir1, rs); break;
+                default:
             for (int64_t i03 = 0; i03 < ne03; i03++) {
                 for (int64_t i02 = 0; i02 < ne02; i02++) {
                     id += rs * ir0;
@@ -403,6 +451,8 @@ static void ggml_compute_forward_dup_bytes(
                     }
                     id += rs * (ne01 - ir1);
                 }
+            }
+            break;
             }
         }
 
