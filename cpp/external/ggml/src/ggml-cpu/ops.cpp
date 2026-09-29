@@ -3967,6 +3967,19 @@ void ggml_compute_forward_rms_norm_mul_fused(
     }
 }
 
+// Debug-only cross-check hooks (KATAGO_CPU_ROPE_HASH=1).
+//
+// Why this exists: comparing hashes across two runs is INVALID here, because ggml_gallocr assigns buffers
+// per run and a fusion changes the assignment, so the same tensor lands at a different address. The only
+// valid comparison is inside one run, on one buffer. So when the fused kernel is FUSED-ONLY (its own
+// destination buffer, ONCE=1) it hashes the block it wrote and stores it; a later run of the stock chain
+// then hashes its own ADD output at the same address range and diffs the two.
+// This file is C++ and ggml-cpu.c is C, so the hooks need C linkage or the C side cannot resolve them.
+extern "C" {
+void (*ggml_cpu_rope_dbg_store)(uint64_t h) = NULL;
+int  (*ggml_cpu_rope_dbg_check)(uint64_t h) = NULL;
+}
+
 // Fused {MUL, GET_ROWS|MUL, MUL, ADD} diamond -- the RoPE rotation pair.
 //
 //   dst_add = (x * tab_a) + (get_rows(x, idx) * tab_b)
@@ -4047,6 +4060,10 @@ static void ggml_compute_forward_rope_fused_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    // Hash the whole destination block the fused kernel writes (all threads contribute; each hashes its own
+    // rows afterwards). See the hook comment above for why this is an in-run comparison.
+    const bool rope_hash = getenv("KATAGO_CPU_ROPE_HASH") != NULL;
+
     // rows per thread -- same split as the gather it replaces
     const int64_t dr  = (nr + nth - 1)/nth;
     const int64_t ir0 = dr*ith;
@@ -4109,6 +4126,30 @@ static void ggml_compute_forward_rope_fused_f32(
                     }
                 }
             }
+        }
+    }
+
+    if (rope_hash) {
+        // Address-independent content hash: walk rows and elements in LOGICAL order via the strides, so the
+        // value does not depend on where ggml_gallocr happened to place the buffer. That is what makes the
+        // two runs comparable at all.
+        uint64_t h = 1469598103934665603ULL;
+        for (int64_t r = 0; r < dst_add->ne[1]; r++) {
+            for (int64_t c = 0; c < nc; ++c) {
+                const unsigned char * q = (const unsigned char *) dst_add->data + r*dst_add->nb[1] + c*dst_add->nb[0];
+                for (int64_t k = 0; k < nb_o0; k++) {
+                    h ^= q[k];
+                    h *= 1099511628211ULL;
+                }
+            }
+        }
+        static int n_rep = 0;
+        if (ith == 0 && n_rep < 4) {
+            n_rep++;
+            fprintf(stderr, "[rope-hash] FUSED  h=%016llx\n", (unsigned long long) h);
+        }
+        if (ggml_cpu_rope_dbg_check != NULL && ith == 0) {
+            ggml_cpu_rope_dbg_check(h);
         }
     }
 }

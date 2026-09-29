@@ -1,5 +1,13 @@
 #include "binary-ops.h"
 
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+// Debug-only hook, defined (with C linkage) in ops.cpp. With KATAGO_CPU_ROPE_HASH=1 the ADD kernel hashes
+// its own output block so it can be compared, inside a single run, against what the fused RoPE kernel wrote.
+extern "C" int (*ggml_cpu_rope_dbg_check)(uint64_t h);
+
 #if defined(GGML_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
 
@@ -89,6 +97,26 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
         dst_t        * dst_ptr  = (dst_t  *)       ((char *)       dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
         const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
         const src1_t * src1_ptr = (const src1_t *) ((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+
+        if (params->ith == 0 && ir == 0 && ne00 > 1000 && op == op_add && ggml_cpu_rope_dbg_check != nullptr) {
+            if constexpr (std::is_same_v<dst_t, float>) {
+                // Same address-independent hash as the fused kernel: rows and elements in LOGICAL order.
+                uint64_t h = 1469598103934665603ULL;
+                for (int64_t r = 0; r < ggml_nrows(dst); r++) {
+                    const int64_t r03 = r/(ne02*ne01);
+                    const int64_t r02 = (r - r03*ne02*ne01)/ne01;
+                    const int64_t r01 = (r - r03*ne02*ne01 - r02*ne01);
+                    for (int64_t c = 0; c < ne00; ++c) {
+                        const unsigned char * q = (const unsigned char *) dst->data + r03*nb3 + r02*nb2 + r01*nb1 + c*nb0;
+                        for (int64_t k = 0; k < (int64_t) sizeof(float); k++) {
+                            h ^= q[k];
+                            h *= 1099511628211ULL;
+                        }
+                    }
+                }
+                ggml_cpu_rope_dbg_check(h);
+            }
+        }
 
         if (is_src1_contiguous_rows) {
             // src1 is broadcastable across src0 and dst in i1, i2, i3

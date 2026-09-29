@@ -3397,6 +3397,66 @@ static void ggml_cpu_rope_dump_census(const struct ggml_cgraph * cgraph, int thr
     }
 }
 
+// Defined in ops.cpp (which owns the fused kernel these hooks cross-check).
+extern void (*ggml_cpu_rope_dbg_store)(uint64_t h);
+extern int  (*ggml_cpu_rope_dbg_check)(uint64_t h);
+
+// Debug-only cross-check state, KATAGO_CPU_ROPE_HASH=1. Two runs are used on purpose://   run 1: KATAGO_CPU_ROPE_HASH=1 KATAGO_CPU_ROPE_ONCE=1  -> exactly one rope site is fused, the fused
+//          kernel hashes the block it wrote, and the hook stores it (the stock chain never runs for it,
+//          so nothing can overwrite it);
+//   run 2: KATAGO_CPU_ROPE_HASH=1 KATAGO_CPU_ROPE_OFF=1   -> no fusion; every ADD hashes its output and
+//          the hook compares against the stored value.
+// Same-process comparison, so this is immune to ggml_gallocr assigning buffers differently across runs.
+static uint64_t ggml_cpu_rope_hash_stored = 0;
+static int      ggml_cpu_rope_hash_have   = 0;
+
+static void ggml_cpu_rope_dbg_store_fn(uint64_t h) {
+    ggml_cpu_rope_hash_stored = h;
+    ggml_cpu_rope_hash_have   = 1;
+    fprintf(stderr, "[rope-hash] FUSED  h=%016llx\n", (unsigned long long) h);
+}
+
+static int ggml_cpu_rope_dbg_check_fn(uint64_t h) {
+    if (!ggml_cpu_rope_hash_have) {
+        return 1;
+    }
+    const int same = (h == ggml_cpu_rope_hash_stored);
+    static int n_rep = 0;
+    if (n_rep < 3) {
+        n_rep++;
+        fprintf(stderr, "[rope-hash] STOCK  h=%016llx  %s (stored=%016llx)\n",
+                (unsigned long long) h, same ? "MATCH" : "DIFFER",
+                (unsigned long long) ggml_cpu_rope_hash_stored);
+    }
+    return same;
+}
+
+// Do two tensors occupy overlapping bytes of the same allocation? This is the check the Vulkan backend
+// runs after deciding to fuse (GV:20349-20394, ggml_vk_tensors_overlap): a fused kernel writes the chain
+// tail while reading the chain's sources, so if gallocr aliased the output onto a source then the kernel
+// reads its own overwritten data. The CPU loop had no such check; KATAGO_CPU_ROPE_OVERLAP=1 reports it.
+static int ggml_cpu_tensors_overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    if (a == b) {
+        return 1;
+    }
+    if (a->data == NULL || b->data == NULL || a->buffer == NULL || a->buffer != b->buffer) {
+        return 0;
+    }
+
+    size_t a_size = 0;
+    size_t b_size = 0;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        a_size += (size_t) (a->ne[i] - 1)*a->nb[i];
+        b_size += (size_t) (b->ne[i] - 1)*b->nb[i];
+    }
+    a_size += ggml_type_size(a->type);
+    b_size += ggml_type_size(b->type);
+
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + b_size && b0 < a0 + a_size;
+}
+
 // Emitted after the walk, from thread 0 only: all threads walk the same node sequence, so the thread test
 // plus the last_hit latch yields exactly one line per graph.
 static void ggml_cpu_rope_report_graph(ggml_cpu_rope_uses * cache, int n_nodes, int thread_n) {
@@ -3466,6 +3526,30 @@ static int ggml_cpu_rope_match(
                 (long long) dmb->src[1]->nb[0], (long long) dad->nb[0]);
     }
 
+    // Debug-only cross-check hooks. KATAGO_CPU_ROPE_HASH=1 activates the comparison; gated further by
+    // KATAGO_CPU_ROPE_ONCE (fuse a single site and record) and KATAGO_CPU_ROPE_OFF (fuse nothing, so the
+    // stock ADD hashes its own output and the hook diffs it).
+    if (getenv("KATAGO_CPU_ROPE_HASH") != NULL) {
+        ggml_cpu_rope_dbg_store = &ggml_cpu_rope_dbg_store_fn;
+        ggml_cpu_rope_dbg_check = &ggml_cpu_rope_dbg_check_fn;
+    }
+    {
+        static int once = -1;
+        if (once < 0) {
+            once = (getenv("KATAGO_CPU_ROPE_ONCE") != NULL) ? 1 : 0;
+        }
+        if (once) {
+            static int done = 0;
+            if (done) {
+                return 0;
+            }
+            done = 1;
+        }
+    }
+    if (getenv("KATAGO_CPU_ROPE_OFF") != NULL) {
+        return 0;
+    }
+
     ggml_cpu_rope_uses * cache = ggml_cpu_rope_use_counts(cgraph);
 
     // --- three-node form: {MUL, MUL, ADD}. This is what N59's paired-read shape leaves behind once it has
@@ -3515,7 +3599,37 @@ static int ggml_cpu_rope_match(
         return 0;
     }
 
-    ggml_cpu_rope_note_hit(cache, "{MUL,GET_ROWS,MUL,ADD}", node_n);
+    // 🔴 SAFETY GUARD. This is the CPU analogue of GV:20349-20394 + the GV:20260-20267 flag, and it is the
+    // check whose ABSENCE caused the first version of this fusion to produce wrong numbers.
+    //
+    // Fusing means only the chain tail is written, so the three intermediate buffers become dead and
+    // ggml_gallocr may hand their regions to the tail. When it does, the destination ends up overlapping
+    // the region where the intermediate results (and therefore what the kernel reads) live. Measured on the
+    // production shape: dst(ADD) aliases dst(MUL#0), and dst(GET_ROWS) aliases dst(MUL#1).
+    //
+    // Crucially the gather is a PERMUTED read (out[d] reads q[d^1]), so this is not the harmless
+    // "in-place elementwise" case: the kernel reads row i after having written row i-1 of the same region.
+    // Vulkan sets op_srcs_fused_elementwise to false for exactly this reason, so its overlap check refuses
+    // the alias group; the CPU loop has no such stage, so the refusal has to happen here.
+    //
+    // Check every buffer the kernel actually READS. Checking only the chain sources is not enough -- the
+    // first version of this guard did that, found nothing, and let the fusion through.
+    if (ggml_cpu_tensors_overlap(ad, a)             ||   // read via b->src[0] == gr == hash of a
+        ggml_cpu_tensors_overlap(ad, gr)            ||
+        ggml_cpu_tensors_overlap(ad, a->src[0])     ||
+        ggml_cpu_tensors_overlap(ad, a->src[1])     ||
+        ggml_cpu_tensors_overlap(ad, b->src[1])     ||
+        ggml_cpu_tensors_overlap(ad, gr->src[1])) {
+        if (ggml_cpu_rope_trace_on() >= 1 && params->ith == 0) {
+            fprintf(stderr, "[rope-refuse] node=%d dst aliases a buffer the fused kernel reads "
+                            "(a=%d gr=%d x=%d tabA=%d tabB=%d idx=%d)\n",
+                    node_n,
+                    ggml_cpu_tensors_overlap(ad, a), ggml_cpu_tensors_overlap(ad, gr),
+                    ggml_cpu_tensors_overlap(ad, a->src[0]), ggml_cpu_tensors_overlap(ad, a->src[1]),
+                    ggml_cpu_tensors_overlap(ad, b->src[1]), ggml_cpu_tensors_overlap(ad, gr->src[1]));
+        }
+        return 0;
+    }
 
     const int only = ggml_cpu_rope_only_node();
     if (only >= 0 && node_n != only) {
@@ -3524,9 +3638,16 @@ static int ggml_cpu_rope_match(
 
     ggml_compute_forward_rope_fused(params, ad, a, b, gr);
 
-    // KATAGO_CPU_ROPE_NOSKIP=1 runs the fused kernel but still lets the three nodes run afterwards. If the
-    // result is then correct, the kernel is right and the problem is in what skipping does to the graph
-    // (buffer liveness in ggml-alloc), not in the arithmetic.
+    // Counted only once the fusion really happened (i.e. after the bisection gate), so the reported
+    // ropeNodes is the number of sites actually fused.
+    ggml_cpu_rope_note_hit(cache, "{MUL,GET_ROWS,MUL,ADD}", node_n);
+
+    // KATAGO_CPU_ROPE_NOSKIP=1 runs the fused kernel but still lets the three nodes run afterwards. This is
+    // the NEGATIVE CONTROL that separates "the kernel is wrong" from "skipping is wrong": with it the
+    // network output is bit-identical to the baseline, which is how the kernel was shown to be free of side
+    // effects. NOTE its epistemic limit -- the stock chain overwrites what the fused kernel wrote, so it
+    // does NOT by itself prove the kernel's arithmetic; that comes from KATAGO_CPU_ROPE_AUDIT (see
+    // ROPE-FUSION-OUTCOME.md section 2).
     {
         static int noskip = -1;
         if (noskip < 0) {
