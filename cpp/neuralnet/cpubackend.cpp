@@ -1206,6 +1206,16 @@ static void dumpGraphNodes(ggml_cgraph* g, Logger* logger) {
   if(env == NULL || env[0] != '1')
     return;
   const int n = ggml_graph_n_nodes(g);
+  // Index every node so a src can be named as its producer, not just its op type. Without this the src
+  // field reads "src0=RESHAPE/f32" for any of 113 RESHAPEs and it is impossible to tell whether a given ADD
+  // consumes a MUL_MAT (possibly through a free view) or something else entirely. That distinction is
+  // exactly what decides whether a {MUL_MAT, [VIEW/RESHAPE,] ADD} epilogue fusion is available on this
+  // backend, which the design doc lists as T9 and had to leave open for want of this index
+  // (cpu-ggml-design.md section 10).
+  std::unordered_map<const ggml_tensor*, int> nodeIdx;
+  nodeIdx.reserve((size_t)n * 2);
+  for(int i = 0; i < n; i++)
+    nodeIdx[ggml_graph_node(g, i)] = i;
   for(int i = 0; i < n; i++) {
     ggml_tensor* t = ggml_graph_node(g, i);
     string line = Global::strprintf(
@@ -1217,9 +1227,11 @@ static void dumpGraphNodes(ggml_cgraph* g, Logger* logger) {
     for(int s = 0; s < GGML_MAX_SRC; s++) {
       if(t->src[s] == NULL)
         break;
-      line += Global::strprintf(" src%d=%s/%s%s", s, ggml_op_name(t->src[s]->op),
+      const auto it = nodeIdx.find(t->src[s]);
+      line += Global::strprintf(" src%d=%s/%s%s#%s", s, ggml_op_name(t->src[s]->op),
                                 ggml_type_name(t->src[s]->type),
-                                ggml_is_contiguous(t->src[s]) ? "" : "(noncontig)");
+                                ggml_is_contiguous(t->src[s]) ? "" : "(noncontig)",
+                                (it == nodeIdx.end() ? string("leaf") : Global::intToString(it->second)).c_str());
     }
     logger->write(line);
   }
