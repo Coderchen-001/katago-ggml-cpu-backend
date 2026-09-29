@@ -45,6 +45,14 @@ void ggml_compute_forward_silu_back(const struct ggml_compute_params * params, s
 void ggml_compute_forward_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rms_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rms_norm_mul_fused(const struct ggml_compute_params * params, struct ggml_tensor * dst_rms_norm, struct ggml_tensor * dst_mul);
+// Fused {MUL, GET_ROWS|MUL, MUL, ADD} diamond (the RoPE rotation pair):
+//   dst_add = (x * tab_a) + (get_rows(x, idx) * tab_b)
+// See the definition in ops.cpp for the exact-match contract this relies on.
+void ggml_compute_forward_rope_fused(const struct ggml_compute_params * params,
+        struct ggml_tensor * dst_add,
+        struct ggml_tensor * dst_mul_a,
+        struct ggml_tensor * dst_mul_b,
+        struct ggml_tensor * dst_get_rows);
 void ggml_compute_forward_rms_norm_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_group_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_l2_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);

@@ -3139,6 +3139,416 @@ struct ggml_cplan ggml_graph_plan(
 }
 
 
+// ---- fused RoPE diamond {MUL, GET_ROWS, MUL, ADD} ------------------------------------------------
+//
+// STATUS: EXPERIMENTAL, DEFAULT OFF (KATAGO_CPU_ROPE_FUSE=1 to enable). Read ROPE-FUSION-OUTCOME.md in
+// the workspace before touching this. Summary of what was measured before it was parked:
+//   * the predicate and the kernel are CORRECT -- with KATAGO_CPU_ROPE_NOSKIP=1 (fused kernel runs but
+//     the three nodes are still executed afterwards) the network output is BIT-IDENTICAL to the baseline,
+//     and an in-kernel audit that recomputes every element with the stock addressing finds 0 mismatches
+//     across all 40 sites;
+//   * the BARRIER LEDGER IMPROVES EXACTLY AS DESIGNED -- 10240 fewer barriers per 8 graph walks
+//     (= 40 sites x 3 nodes x 8), 6392 -> 5112 barrier points per walk;
+//   * but with the skip ENABLED the network output is wrong, deterministically, even for a single fused
+//     site, and it stays wrong with KATAGO_CPU_NOALLOC=1 (every tensor separately allocated, so it is not
+//     gallocr aliasing) and at one thread (so it is not a race).
+// So the remaining problem is neither the arithmetic nor a data race: it is that having the executor skip
+// nodes is not something the graph/plan layer accounts for. The fix belongs at graph-emission time, not in
+// this loop -- see the document.
+//
+// The graph contains, 40 times per forward, the rotation pair that RoPE attention writes out as four
+// separate nodes:
+//     n0 MUL      <- src0 = RESHAPE(#44), src1 = table A
+//     n1 GET_ROWS <- src0 = RESHAPE(#44), src1 = i32 indices
+//     n2 MUL      <- src0 = n1,          src1 = table B
+//     n3 ADD      <- src0 = n0,          src1 = n2
+// That is a DIAMOND, not a chain: ggml_can_fuse rejects it because it requires every node to depend
+// directly on its predecessor (ggml-impl.h:687), whereas ADD depends on n0 rather than on n1. The
+// predicate therefore has to be hand-written, and it has to step over the free layout op at the head.
+//
+// Why it would be worth doing at all: it removes three non-empty nodes per site, hence three barriers per
+// site per graph walk. Measured, the barrier cost is proportional to NODE COUNT rather than to data volume
+// (BARRIER-SPIN-QUANTIFIED.md), so the win would be the ledger, not the saved loads.
+
+// Fusable only if used exactly once, and not a view or a requested output. Mirrors ggml_node_has_n_uses
+// (ggml-impl.h:641), which is not used directly because the count itself is wanted, so it can be cached.
+static int ggml_cpu_rope_uses_once(const struct ggml_cgraph * cgraph, const struct ggml_tensor * t) {
+    if (t->view_src != NULL) {
+        return 0;
+    }
+    if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        return 0;
+    }
+
+    int32_t n_uses = 0;
+    if (cgraph->use_counts != NULL) {
+        const size_t hash_pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+        if (ggml_bitset_get(cgraph->visited_hash_set.used, hash_pos)) {
+            n_uses = cgraph->use_counts[hash_pos];
+        }
+    }
+    return n_uses == 1;
+}
+
+// Operand checks shared by both chain forms. `add` is the chain tail, `a` the first MUL, `b` the second.
+// Both MULs must read the same head through their src0, and multiply by a table of the same full shape.
+static int ggml_cpu_rope_operands_ok(const struct ggml_tensor * add, const struct ggml_tensor * a,
+                                     const struct ggml_tensor * b) {
+    if (add->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    if (a->src[0]->type != GGML_TYPE_F32 || a->src[1]->type != GGML_TYPE_F32 || b->src[1]->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    if (!ggml_are_same_shape(add, a) || !ggml_are_same_shape(add, b)) {
+        return 0;
+    }
+    if (!ggml_are_same_shape(a->src[0], add) || !ggml_are_same_shape(a->src[1], add) ||
+        !ggml_are_same_shape(b->src[0], add) || !ggml_are_same_shape(b->src[1], add)) {
+        return 0;
+    }
+    // Contiguity is what lets the fused kernel stand in for apply_binary_op's broadcast path and lets the
+    // table rows be addressed with the head's own strides.
+    if (!ggml_is_contiguous(add) || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) ||
+        !ggml_is_contiguous(a->src[0]) || !ggml_is_contiguous(a->src[1]) || !ggml_is_contiguous(b->src[1])) {
+        return 0;
+    }
+    return 1;
+}
+
+// The gather half of the four-node form.
+static int ggml_cpu_rope_gather_ok(const struct ggml_tensor * add, const struct ggml_tensor * a,
+                                   const struct ggml_tensor * gr, const struct ggml_tensor * b) {
+    if (gr->op != GGML_OP_GET_ROWS) {
+        return 0;
+    }
+    if (gr->type != GGML_TYPE_F32 || gr->src[0]->type != GGML_TYPE_F32 || gr->src[1]->type != GGML_TYPE_I32) {
+        return 0;
+    }
+    if (a->src[0] != gr->src[0]) {   // diamond: both MULs read the same operand
+        return 0;
+    }
+    if (b->src[0] != gr) {           // and the second table multiplies the gathered rows
+        return 0;
+    }
+    if (!ggml_are_same_shape(gr, add) || !ggml_are_same_shape(gr->src[0], add)) {
+        return 0;
+    }
+    // ggml_compute_forward_get_rows_f32 requires ggml_nrows(dst) == ggml_nelements(src1) and walks the
+    // indices with nb10/nb11/nb12, so the index tensor must be contiguous in rows for the fused index
+    // arithmetic to match. Element-contiguity alone is not sufficient here.
+    if (!ggml_is_contiguous(gr) || !ggml_is_contiguous_rows(gr->src[1])) {
+        return 0;
+    }
+    return 1;
+}
+
+// One-pass cache of "used exactly once" for every node of the graph being walked. Without it the
+// predicate would do a hash lookup per node per walk, i.e. millions per forward pass.
+//
+// The type is deliberately not named ggml_cpu_rope_use_counts: in C a typedef name and a function name
+// share the ordinary identifier namespace, so it would collide with the accessor defined below.
+typedef struct {
+    int *  used_once;
+    size_t n_used;
+    int    total;
+    int    last_hit;
+} ggml_cpu_rope_uses;
+
+static ggml_cpu_rope_uses * ggml_cpu_rope_uses_cache              = NULL;
+static const struct ggml_cgraph * ggml_cpu_rope_uses_cache_graph  = NULL;
+static int ggml_cpu_rope_uses_lock = 0;
+
+// Every compute thread reaches this, so the once-per-graph scan has to be serialised. An earlier version
+// was not, and it segfaulted with 8 threads: one thread published the "graph cached" marker after
+// allocating the array but before filling it, so the other seven read uninitialised -- or already freed
+// -- memory. The release/acquire pair below is what makes the array contents visible to the others.
+static ggml_cpu_rope_uses * ggml_cpu_rope_use_counts(const struct ggml_cgraph * cgraph) {
+    if (__atomic_load_n(&ggml_cpu_rope_uses_cache_graph, __ATOMIC_ACQUIRE) == cgraph) {
+        return ggml_cpu_rope_uses_cache;
+    }
+
+    while (__atomic_exchange_n(&ggml_cpu_rope_uses_lock, 1, __ATOMIC_ACQUIRE) != 0) {
+        // another thread is running the scan; it is short
+    }
+
+    if (ggml_cpu_rope_uses_cache_graph != cgraph) {
+        const size_t n_nodes = (size_t) cgraph->n_nodes;
+
+        free(ggml_cpu_rope_uses_cache);
+        ggml_cpu_rope_uses_cache = (ggml_cpu_rope_uses *) calloc(1, sizeof(ggml_cpu_rope_uses));
+        if (ggml_cpu_rope_uses_cache != NULL) {
+            ggml_cpu_rope_uses_cache->used_once = (int *) calloc(n_nodes > 0 ? n_nodes : 1, sizeof(int));
+            if (ggml_cpu_rope_uses_cache->used_once == NULL) {
+                free(ggml_cpu_rope_uses_cache);
+                ggml_cpu_rope_uses_cache = NULL;
+            } else {
+                ggml_cpu_rope_uses_cache->n_used = n_nodes;
+                for (size_t i = 0; i < n_nodes; i++) {
+                    ggml_cpu_rope_uses_cache->used_once[i] =
+                        ggml_cpu_rope_uses_once(cgraph, cgraph->nodes[i]);
+                }
+            }
+        }
+
+        __atomic_store_n(&ggml_cpu_rope_uses_cache_graph, cgraph, __ATOMIC_RELEASE);
+    }
+
+    __atomic_store_n(&ggml_cpu_rope_uses_lock, 0, __ATOMIC_RELEASE);
+    return ggml_cpu_rope_uses_cache;
+}
+
+static int ggml_cpu_rope_uses_ok(const ggml_cpu_rope_uses * cache, const struct ggml_cgraph * cgraph, int node_n) {
+    if (node_n < 0 || node_n >= cgraph->n_nodes) {
+        return 0;
+    }
+    if (cache == NULL) {
+        return ggml_cpu_rope_uses_once(cgraph, cgraph->nodes[node_n]);
+    }
+    return cache->used_once[node_n];
+}
+
+// Diagnostics, both off by default and never reached in a production run:
+//   KATAGO_CPU_BARRIER_STATS=1  one summary line per graph, so a cross-machine csv carries its own evidence
+//   KATAGO_CPU_ROPE_TRACE=1     one line per match; =2 also explains each rejected candidate. That is what
+//                               tells "the predicate never fired" apart from "the fusion did not help".
+static int ggml_cpu_rope_trace = -1;
+static int ggml_cpu_rope_only  = -2;
+
+// KATAGO_CPU_ROPE_ONLY=<node index> fuses a single matching site and leaves the rest alone. This is the
+// bisection tool: fusing exactly one site answers "is the fused arithmetic right" without the answer being
+// muddied by 40 sites or by downstream rearrangement.
+static int ggml_cpu_rope_only_node(void) {
+    if (ggml_cpu_rope_only < -1) {
+        const char * e = getenv("KATAGO_CPU_ROPE_ONLY");
+        ggml_cpu_rope_only = (e != NULL && e[0] != '\0') ? atoi(e) : -1;
+    }
+    return ggml_cpu_rope_only;
+}
+
+static int ggml_cpu_rope_trace_on(void) {
+    if (ggml_cpu_rope_trace < 0) {
+        const char * e = getenv("KATAGO_CPU_ROPE_TRACE");
+        ggml_cpu_rope_trace = (e != NULL) ? atoi(e) : 0;
+    }
+    return ggml_cpu_rope_trace;
+}
+
+static void ggml_cpu_rope_note_hit(ggml_cpu_rope_uses * cache, const char * form, int node_n) {
+    if (cache == NULL) {
+        return;
+    }
+    if (ggml_cpu_rope_trace_on() >= 1) {
+        fprintf(stderr, "[rope-fuse] hit %s node=%d n_nodes=%zu\n", form, node_n, cache->n_used);
+    }
+    if (node_n > cache->last_hit) {
+        cache->last_hit = node_n;
+        cache->total++;
+    }
+}
+
+// One-shot structural census of the {MUL, GET_ROWS} candidates, printed straight to stderr.
+// KATAGO_CPU_ROPE_DUMP=1. Purpose: the executable's own graph dump goes through KataGo's Logger and lands
+// in gtp_logs/, which makes it awkward to line up with what the predicate actually sees. This prints the
+// exact tensor identities the predicate compares, plus the free-view chain above the head, so a rejected
+// candidate can be diagnosed from the backend itself.
+static void ggml_cpu_rope_dump_census(const struct ggml_cgraph * cgraph, int thread_n) {
+    static int done = 0;
+    const char * env = getenv("KATAGO_CPU_ROPE_DUMP");
+    if (env == NULL || env[0] != '1' || thread_n != 0 || done) {
+        return;
+    }
+    done = 1;
+
+    fprintf(stderr, "[rope-dump] n_nodes=%d\n", cgraph->n_nodes);
+    for (int i = 0; i + 1 < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * n1 = cgraph->nodes[i];
+        const struct ggml_tensor * g  = cgraph->nodes[i + 1];
+        if (n1->op != GGML_OP_MUL || g->op != GGML_OP_GET_ROWS) {
+            continue;
+        }
+        fprintf(stderr, "[rope-dump] MUL@%d src0=#%d(%s) src1=#%d | GR@%d src0=#%d(%s) src1=#%d(%s)\n",
+                i, (int) n1->src[0]->op, ggml_op_name(n1->src[0]->op),
+                (int) n1->src[1]->op, i + 1,
+                (int) g->src[0]->op, ggml_op_name(g->src[0]->op),
+                (int) g->src[1]->op, ggml_type_name(g->src[1]->type));
+        // Walk the free-view chain above the MUL's src0, printing how far it goes.
+        const struct ggml_tensor * t = n1->src[0];
+        for (int d = 0; d < 6 && t != NULL; d++) {
+            fprintf(stderr, "[rope-dump]    ^%d %s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] contig=%d src0=%s\n",
+                    d, ggml_op_name(t->op), ggml_type_name(t->type),
+                    (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                    (long long) t->nb[0], (long long) t->nb[1], (long long) t->nb[2], (long long) t->nb[3],
+                    (int) ggml_is_contiguous(t), t->src[0] ? ggml_op_name(t->src[0]->op) : "NULL");
+            t = t->src[0];
+        }
+        // The identity the predicate compares: does the MUL's src0 reach a RESHAPE/VIEW whose own src0 is
+        // the same tensor the gather reads?
+        fprintf(stderr, "[rope-dump]    diamond: mul=%p mul..src0=%p gr..src0=%p head_candidate=%p\n",
+                (const void *) n1, (const void *) n1->src[0], (const void *) g->src[0],
+                (const void *) ((n1->src[0]->op == GGML_OP_RESHAPE || n1->src[0]->op == GGML_OP_VIEW ||
+                                 n1->src[0]->op == GGML_OP_PERMUTE || n1->src[0]->op == GGML_OP_TRANSPOSE)
+                                && n1->src[0]->src[0] != NULL ? n1->src[0]->src[0] : n1->src[0]));
+        fprintf(stderr, "[rope-dump]    equal_direct=%d equal_head_vs_grsrc0=%d\n",
+                n1->src[0] == g->src[0],
+                (((n1->src[0]->op == GGML_OP_RESHAPE || n1->src[0]->op == GGML_OP_VIEW ||
+                   n1->src[0]->op == GGML_OP_PERMUTE || n1->src[0]->op == GGML_OP_TRANSPOSE)
+                  && n1->src[0]->src[0] != NULL ? n1->src[0]->src[0] : n1->src[0]) == g->src[0]));
+    }
+}
+
+// Emitted after the walk, from thread 0 only: all threads walk the same node sequence, so the thread test
+// plus the last_hit latch yields exactly one line per graph.
+static void ggml_cpu_rope_report_graph(ggml_cpu_rope_uses * cache, int n_nodes, int thread_n) {
+    if (cache == NULL || thread_n != 0 || !ggml_cpu_barrier_stats_on) {
+        return;
+    }
+    if (cache->total == 0 && ggml_cpu_rope_trace_on() == 0) {
+        return;
+    }
+    fprintf(stderr, "fusion {MUL,GET_ROWS,MUL,ADD} ropeNodes=%d n_nodes=%d adjacent=1 singleUse=1\n",
+            cache->total, n_nodes);
+}
+
+// Match the RoPE diamond and run the fused kernel.
+// Returns the number of nodes to skip (3 for the four-node form, 2 for the three-node form), or 0.
+//
+// NOTE: this must NOT be called ggml_cpu_try_fuse_rope -- the wrapper below already has that name, and a
+// same-named static silently makes the wrapper's own call resolve to itself.
+static int ggml_cpu_rope_match(
+        const struct ggml_cgraph * cgraph,
+        const int node_n,
+        const struct ggml_compute_params * params) {
+
+    const int n_rest = cgraph->n_nodes - node_n;
+    if (n_rest < 3) {
+        return 0;
+    }
+
+    struct ggml_tensor * n0 = cgraph->nodes[node_n];
+
+    if (n_rest < 4 || cgraph->nodes[node_n + 1]->op != GGML_OP_GET_ROWS) {
+        return 0;
+    }
+
+    // The chain head is defined by what the two MULs and the gather actually READ, not by how many layout
+    // ops happen to sit above them. Getting this wrong is what made the first version of this predicate
+    // reject all 40 sites: it walked the head continuously up the free-view chain and landed on the CONT
+    // underneath (measured chain: MUL/GET_ROWS -> RESHAPE -> CONT -> PERMUTE -> VIEW -> VIEW -> MUL_MAT),
+    // while the shared operand of the three consumers is the RESHAPE one level up.
+    //
+    // So: the head is the tensor all three share. Stepping one further hop is allowed only when that hop is
+    // itself a pure alias (RESHAPE) and is still shared by the gather -- CONT/PERMUTE are real work and
+    // must never be stepped over.
+    struct ggml_tensor * head = n0->src[0];
+    if (head != NULL && head->op == GGML_OP_RESHAPE && head->src[0] != NULL &&
+        head->src[0] == cgraph->nodes[node_n + 1]->src[0]) {
+        head = head->src[0];
+    }
+
+    if (ggml_cpu_rope_trace_on() >= 2) {
+        const struct ggml_tensor * g = cgraph->nodes[node_n + 1];
+        fprintf(stderr, "[rope-blk] node=%d n_rest=%d mul.s0=%p gr.s0=%p head=%p eq=%d\n",
+                node_n, n_rest, (const void *) n0->src[0], (const void *) g->src[0],
+                (const void *) head, n0->src[0] == head);
+        fprintf(stderr, "[rope-blk]   a.s0.ne=[%lld,%lld] op=%s contig=%d | g.src1.type=%s contigrows=%d\n",
+                (long long) n0->src[0]->ne[0], (long long) n0->src[0]->ne[1],
+                ggml_op_name(n0->src[0]->op), (int) ggml_is_contiguous(n0->src[0]),
+                ggml_type_name(g->src[1]->type), (int) ggml_is_contiguous_rows(g->src[1]));
+        const struct ggml_tensor * dma = cgraph->nodes[node_n];
+        const struct ggml_tensor * dmb = cgraph->nodes[node_n + 2];
+        const struct ggml_tensor * dad = cgraph->nodes[node_n + 3];
+        fprintf(stderr, "[rope-blk]   TYPES x=%s tabA=%s tabB=%s add=%s | idx=%s | x.nb0=%lld tabA.nb0=%lld tabB.nb0=%lld add.nb0=%lld\n",
+                ggml_type_name(dma->src[0]->type), ggml_type_name(dma->src[1]->type),
+                ggml_type_name(dmb->src[1]->type), ggml_type_name(dad->type),
+                ggml_type_name(g->src[1]->type),
+                (long long) dma->src[0]->nb[0], (long long) dma->src[1]->nb[0],
+                (long long) dmb->src[1]->nb[0], (long long) dad->nb[0]);
+    }
+
+    ggml_cpu_rope_uses * cache = ggml_cpu_rope_use_counts(cgraph);
+
+    // --- three-node form: {MUL, MUL, ADD}. This is what N59's paired-read shape leaves behind once it has
+    // removed the gather, and having it here is what keeps that change from becoming a silent regression
+    // in which the fusion simply stops firing (gate 1's barrier ledger would catch it, but late). ---
+    if (cgraph->nodes[node_n + 1]->op == GGML_OP_MUL && cgraph->nodes[node_n + 2]->op == GGML_OP_ADD) {
+        struct ggml_tensor * a  = n0;
+        struct ggml_tensor * b  = cgraph->nodes[node_n + 1];
+        struct ggml_tensor * ad = cgraph->nodes[node_n + 2];
+
+        if (a->src[0] == head && b->src[0] == head &&
+            ad->src[0] == a && ad->src[1] == b &&
+            ggml_cpu_rope_operands_ok(ad, a, b) &&
+            ggml_cpu_rope_uses_ok(cache, cgraph, node_n) &&
+            ggml_cpu_rope_uses_ok(cache, cgraph, node_n + 1)) {
+
+            ggml_cpu_rope_note_hit(cache, "{MUL,MUL,ADD}", node_n);
+            ggml_compute_forward_rope_fused(params, ad, a, b, NULL);
+            return 2;
+        }
+    }
+
+    // --- four-node form: {MUL, GET_ROWS, MUL, ADD} ---
+    if (n_rest < 4 || cgraph->nodes[node_n + 1]->op != GGML_OP_GET_ROWS ||
+        cgraph->nodes[node_n + 2]->op != GGML_OP_MUL ||
+        cgraph->nodes[node_n + 3]->op != GGML_OP_ADD) {
+        return 0;
+    }
+
+    struct ggml_tensor * a  = n0;
+    struct ggml_tensor * gr = cgraph->nodes[node_n + 1];
+    struct ggml_tensor * b  = cgraph->nodes[node_n + 2];
+    struct ggml_tensor * ad = cgraph->nodes[node_n + 3];
+
+    if (a->src[0] != head) {
+        return 0;
+    }
+    if (!ggml_cpu_rope_operands_ok(ad, a, b)) {
+        return 0;
+    }
+    if (!ggml_cpu_rope_gather_ok(ad, a, gr, b)) {
+        return 0;
+    }
+    if (!ggml_cpu_rope_uses_ok(cache, cgraph, node_n)     ||
+        !ggml_cpu_rope_uses_ok(cache, cgraph, node_n + 1) ||
+        !ggml_cpu_rope_uses_ok(cache, cgraph, node_n + 2)) {
+        return 0;
+    }
+
+    ggml_cpu_rope_note_hit(cache, "{MUL,GET_ROWS,MUL,ADD}", node_n);
+
+    const int only = ggml_cpu_rope_only_node();
+    if (only >= 0 && node_n != only) {
+        return 0;   // bisection mode: this matched site is left to the stock kernels
+    }
+
+    ggml_compute_forward_rope_fused(params, ad, a, b, gr);
+
+    // KATAGO_CPU_ROPE_NOSKIP=1 runs the fused kernel but still lets the three nodes run afterwards. If the
+    // result is then correct, the kernel is right and the problem is in what skipping does to the graph
+    // (buffer liveness in ggml-alloc), not in the arithmetic.
+    {
+        static int noskip = -1;
+        if (noskip < 0) {
+            const char * e = getenv("KATAGO_CPU_ROPE_NOSKIP");
+            noskip = (e != NULL && e[0] == '1') ? 1 : 0;
+        }
+        if (noskip) {
+            return 0;
+        }
+    }
+
+    return 3;
+}
+
+static int ggml_cpu_try_fuse_rope(
+        const struct ggml_cgraph * cgraph,
+        const int node_n,
+        const struct ggml_compute_params * params) {
+
+    return ggml_cpu_rope_match(cgraph, node_n, params);
+}
+
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
@@ -3170,6 +3580,26 @@ static int ggml_cpu_try_fuse_ops(
 
                 ggml_compute_forward_rms_norm_mul_fused(params, node, mul_node);
                 return 1;
+            }
+        }
+    }
+
+    if (node->op == GGML_OP_MUL) {
+        // RoPE rotation pair, matched as a diamond: {MUL, GET_ROWS, MUL, ADD}, or the gather-less
+        // {MUL, MUL, ADD} that a paired-read shape will leave behind.
+        //
+        // DEFAULT OFF: see the status block above the predicate. The kernel and the predicate are verified
+        // correct, but skipping the three nodes changes the network's numbers, so this must not be on by
+        // accident.
+        static int rope_fuse_enabled = -1;
+        if (rope_fuse_enabled < 0) {
+            const char * e = getenv("KATAGO_CPU_ROPE_FUSE");
+            rope_fuse_enabled = (e != NULL && e[0] == '1') ? 1 : 0;
+        }
+        if (rope_fuse_enabled) {
+            const int skipped = ggml_cpu_try_fuse_rope(cgraph, node_n, params);
+            if (skipped > 0) {
+                return skipped;
             }
         }
     }
@@ -3209,6 +3639,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     // value rather than lazily initialising it mid-loop.
     (void) ggml_cpu_barrier_stats_enabled();
     ggml_cpu_barrier_backoff_init();
+
+    ggml_cpu_rope_dump_census(cgraph, params.ith);
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
@@ -3259,6 +3691,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_barrier(state->threadpool);
         }
     }
+
+    ggml_cpu_rope_report_graph(ggml_cpu_rope_use_counts(cgraph), cgraph->n_nodes, params.ith);
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);

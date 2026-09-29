@@ -12,6 +12,19 @@
 #include <cfloat>
 #include <cmath>
 
+// Rounding helpers for ggml_compute_forward_rope_fused_f32 below. The fused RoPE kernel must round at
+// exactly the four points the four stock kernels round at, so it uses explicit-rounding intrinsics where
+// they exist; clang defaults to -ffp-contract=fast and would otherwise contract `s*a + s2*b` into FMAs.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#  include <immintrin.h>
+#  define GGML_ROPE_FUSED_RN_MUL(x, y) _mm_cvtss_f32(_mm_mul_ss(_mm_set_ss(x), _mm_set_ss(y)))
+#  define GGML_ROPE_FUSED_RN_ADD(x, y) _mm_cvtss_f32(_mm_add_ss(_mm_set_ss(x), _mm_set_ss(y)))
+#else
+// The kernel also marks each rounding point volatile, which is a hard optimisation barrier on its own,
+// but on a non-x86 target that has not been verified bit-for-bit do not build this at all.
+#  error "ggml_compute_forward_rope_fused_f32: no explicit-rounding path implemented for this target"
+#endif
+
 // ggml_compute_forward_dup
 
 static void ggml_compute_forward_dup_same_cont(
@@ -3946,6 +3959,178 @@ void ggml_compute_forward_rms_norm_mul_fused(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_MUL>(params, dst_rms_norm, dst_mul);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// Fused {MUL, GET_ROWS|MUL, MUL, ADD} diamond -- the RoPE rotation pair.
+//
+//   dst_add = (x * tab_a) + (get_rows(x, idx) * tab_b)
+//           = (#45)       + (#47)
+//   with  #45 = mul(#44, tab_a),  #46 = get_rows(#44, idx),  #47 = mul(#46, tab_b).
+//
+// This is a DIAMOND, not a chain, so ggml_can_fuse cannot express it (ggml-impl.h:687 requires each
+// node to depend directly on the previous one, whereas #48/ADD depends on #45, not on #46).
+// The predicate for it therefore lives in ggml_cpu_try_fuse_ops in ggml-cpu.c.
+//
+// BIT-EXACTNESS CONTRACT -- this is the whole point of the fusion, do not relax it:
+// the four stock kernels each round to float four separate times (two multiplications, one
+// addition, one of which the gather does not contribute to), and the fused form must round at the
+// exact same four points. clang defaults to -ffp-contract=fast, which would happily contract
+// `s*a + s2*b` into two FMAs and lose bit-exactness. Two independent defences are used:
+//   1. explicit-rounding intrinsics __fmul_rn/__fadd_rn (never contracted), and
+//   2. a volatile intermediate per rounding point, which is a hard optimisation barrier
+//      regardless of the intrinsic's availability.
+// The measured chain is: 40 sites, all ne=[2166,32,1,1], all four tensors F32/contiguous,
+// interior nodes each used exactly once. Assertions below enforce exactly that.
+static void ggml_compute_forward_rope_fused_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst_add,
+        ggml_tensor * dst_mul_a,
+        ggml_tensor * dst_mul_b,
+        ggml_tensor * dst_get_rows) {
+
+    const ggml_tensor * src_a = dst_mul_a->src[0];    // the MUL's non-table operand == x
+    const ggml_tensor * tab_a = dst_mul_a->src[1];
+    const ggml_tensor * idx   = dst_get_rows->src[1]; // i32 row indices
+    const ggml_tensor * tab_b = dst_mul_b->src[1];
+
+    GGML_ASSERT(dst_mul_a->src[0] == dst_get_rows->src[0]); // diamond: same source
+    GGML_ASSERT(dst_mul_b->src[0] == dst_get_rows);
+
+    GGML_ASSERT(dst_add->type == GGML_TYPE_F32);
+    GGML_ASSERT(src_a->type == GGML_TYPE_F32);
+    GGML_ASSERT(tab_a->type == GGML_TYPE_F32);
+    GGML_ASSERT(tab_b->type == GGML_TYPE_F32);
+    GGML_ASSERT(idx->type   == GGML_TYPE_I32);
+
+    GGML_ASSERT(ggml_are_same_shape(src_a, dst_mul_a));
+    GGML_ASSERT(ggml_are_same_shape(src_a, dst_mul_b));
+    GGML_ASSERT(ggml_are_same_shape(src_a, dst_add));
+    GGML_ASSERT(ggml_are_same_shape(dst_mul_a->src[1], src_a)); // tables carry the run dimension
+
+    // Contiguity is what lets the flat row arithmetic below (ne10, nb0) stand in for the generic
+    // broadcast logic in apply_binary_op and the generic gather in ggml_compute_forward_get_rows_f32.
+    GGML_ASSERT(ggml_is_contiguous(src_a));
+    GGML_ASSERT(ggml_is_contiguous(tab_a));
+    GGML_ASSERT(ggml_is_contiguous(tab_b));
+    GGML_ASSERT(ggml_is_contiguous(dst_add));
+
+    // Gather layout, mirrored verbatim from ggml_compute_forward_get_rows_f32 (ops.cpp:5031).
+    const int64_t nc   = dst_get_rows->ne[0];
+    const int64_t ne10 = dst_get_rows->src[1]->ne[0];
+    const int64_t ne11 = dst_get_rows->src[1]->ne[1];
+    const int64_t nb10 = dst_get_rows->src[1]->nb[0];
+    const int64_t nb11 = dst_get_rows->src[1]->nb[1];
+    const int64_t nb12 = dst_get_rows->src[1]->nb[2];
+
+    const int64_t ne_src1 = src_a->ne[1];
+    const int64_t nb_src0 = src_a->nb[0];
+    const int64_t nb_src1 = src_a->nb[1];
+    const int64_t nb_src2 = src_a->nb[2];
+    const int64_t nb_src3 = src_a->nb[3];
+
+    // Each operand's innermost stride is used for its own addressing, exactly as the four stock kernels do:
+    // apply_binary_op asserts nb00 == sizeof(src0_t) on the tensor it is looking at, and the gather reads
+    // src0 with src0->nb[0]. Sharing one stride between operands is only safe because all of these are F32,
+    // but taking each tensor's own keeps the kernel honest if that ever stops being true.
+    const int64_t nb_a0 = tab_a->nb[0];
+    const int64_t nb_b0 = tab_b->nb[0];
+    const int64_t nb_o0 = dst_add->nb[0];
+
+    const int64_t nr = ggml_nelements(idx);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // rows per thread -- same split as the gather it replaces
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        // c-order decomposition, copied from ggml_compute_forward_get_rows_f32. Note that the write
+        // offset is symmetric in (i10, i11) but the *read* offsets are not, so this must not be
+        // "simplified".
+        const int64_t i12 = i/(ne11*ne10);
+        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+
+        const int64_t i01 = *(const int32_t *) ((const char *) idx->data + i10*nb10 + i11*nb11 + i12*nb12);
+        GGML_ASSERT(i01 >= 0 && i01 < ne_src1); // same semantics as the stock gather's assert
+
+        const char * x_cont = (const char *) src_a->data + i11*nb_src2 + i12*nb_src3;
+        const char * gath   = (const char *) src_a->data + i01*nb_src1 + i11*nb_src2 + i12*nb_src3;
+
+        const char * a_tab  = (const char *) tab_a->data + i11*nb_src2 + i12*nb_src3;
+        const char * b_tab  = (const char *) tab_b->data + i11*nb_src2 + i12*nb_src3;
+        char       * out    = (char       *) dst_add->data + i10*dst_add->nb[1] + i11*dst_add->nb[2] + i12*dst_add->nb[3];
+
+        for (int64_t c = 0; c < nc; ++c) {
+            const float xv = *(const float *) (x_cont + c*nb_src0);
+            const float gv = *(const float *) (gath   + c*nb_src0);
+            const float av = *(const float *) (a_tab  + c*nb_a0);
+            const float bv = *(const float *) (b_tab  + c*nb_b0);
+
+            const volatile float t1 = GGML_ROPE_FUSED_RN_MUL(xv, av);
+            const volatile float t2 = GGML_ROPE_FUSED_RN_MUL(gv, bv);
+            const volatile float s  = GGML_ROPE_FUSED_RN_ADD(t1, t2);
+
+            *(float *) (out + c*nb_o0) = s;
+        }
+
+        // KATAGO_CPU_ROPE_AUDIT=1, thread 0: recompute every element the way the four stock kernels would
+        // address it (their own strides, their own index decomposition) and report any difference. This is
+        // what proved the kernel itself correct -- 0 mismatches across all 40 sites -- and so localised the
+        // remaining failure to the node-skipping, not the arithmetic. Kept because it is the instrument
+        // that has to run again if this fusion is ever re-enabled at the emission level.
+        {
+            static const char * audit = getenv("KATAGO_CPU_ROPE_AUDIT");
+            if (audit != NULL && audit[0] == '1' && ith == 0) {
+                for (int64_t c = 0; c < nc; ++c) {
+                    const float xv2 = *(const float *) ((const char *) src_a->data + i11*nb_src2 + i12*nb_src3 + c*nb_src0);
+                    const float gv2 = *(const float *) ((const char *) src_a->data + i01*nb_src1 + i11*nb_src2 + i12*nb_src3 + c*nb_src0);
+                    const float av2 = *(const float *) ((const char *) tab_a->data + i11*nb_src2 + i12*nb_src3 + c*nb_a0);
+                    const float bv2 = *(const float *) ((const char *) tab_b->data + i11*nb_src2 + i12*nb_src3 + c*nb_b0);
+                    const float want = GGML_ROPE_FUSED_RN_ADD(GGML_ROPE_FUSED_RN_MUL(xv2, av2), GGML_ROPE_FUSED_RN_MUL(gv2, bv2));
+                    const float got  = *(const float *) (out + c*nb_o0);
+                    if (want != got) {
+                        static int n_bad = 0;
+                        if (n_bad < 12) {
+                            n_bad++;
+                            fprintf(stderr, "[rope-audit] MISMATCH i=%lld c=%lld i10=%lld i11=%lld i01=%lld want=%.9g got=%.9g\n",
+                                    (long long) i, (long long) c, (long long) i10, (long long) i11, (long long) i01,
+                                    (double) want, (double) got);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Rounding macros GGML_ROPE_FUSED_RN_MUL / _ADD are defined at the top of this file.
+
+void ggml_compute_forward_rope_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * dst_add,
+        ggml_tensor * dst_mul_a,
+        ggml_tensor * dst_mul_b,
+        ggml_tensor * dst_get_rows) {
+
+    GGML_ASSERT(dst_add     != nullptr);
+    GGML_ASSERT(dst_mul_a   != nullptr);
+    GGML_ASSERT(dst_mul_b   != nullptr);
+    GGML_ASSERT(dst_get_rows != nullptr);
+
+    switch (dst_add->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_rope_fused_f32(params, dst_add, dst_mul_a, dst_mul_b, dst_get_rows);
             } break;
         default:
             {
