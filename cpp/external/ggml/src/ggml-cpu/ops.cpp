@@ -4072,9 +4072,31 @@ extern "C" void ggml_cpu_rope_shadow_cmp(const float * got, int64_t ne0, int64_t
 
 // Generic publisher (see the extern "C" declaration above).
 extern "C" void ggml_cpu_shadow_publish(const float * src, int64_t ne0, int64_t ne1, const void * key) {
-    if (ggml_cpu_rope_shadow_on()) {
-        ggml_cpu_rope_shadow_put(src, ne0, ne1, key);
+    if (!ggml_cpu_rope_shadow_on()) {
+        return;
     }
+    // NEGATIVE CONTROL (LESSONS-AND-GATES G-6 #3). The harness reported "0 mismatches" twice while the
+    // network output was wrong, so it must first be shown to report a NON-zero count for a known error.
+    // With KATAGO_CPU_ROPE_SHADOW_NEGCTL=1 exactly one element of the published block is perturbed; the
+    // compare side must then print exactly one MISMATCH with the right index, and bad == 1.
+    static int negctl = -1;
+    if (negctl < 0) {
+        negctl = (getenv("KATAGO_CPU_ROPE_SHADOW_NEGCTL") != NULL) ? 1 : 0;
+    }
+    if (negctl) {
+        const size_t need = (size_t) ne0 * (size_t) ne1;
+        float * tmp = (float *) malloc(need * sizeof(float));
+        if (tmp != NULL) {
+            memcpy(tmp, src, need * sizeof(float));
+            const size_t at = need / 2;              // deterministic: the middle element
+            tmp[at] = tmp[at] + 1.0f;                 // a change no rounding can hide
+            fprintf(stderr, "[rope-negctl] perturbed element %zu of %zu (+1.0f)\n", at, need);
+            ggml_cpu_rope_shadow_put(tmp, ne0, ne1, key);
+            free(tmp);
+            return;
+        }
+    }
+    ggml_cpu_rope_shadow_put(src, ne0, ne1, key);
 }
 extern "C" void ggml_cpu_rope_shadow_cmp(const float * got, int64_t ne0, int64_t ne1, const void * key) {
     if (!g_rope_shadow.armed || g_rope_shadow.data == NULL) {
