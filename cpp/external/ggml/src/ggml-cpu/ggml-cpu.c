@@ -594,6 +594,18 @@ static void ggml_cpu_barrier_stats_report(void);
 static __declspec(thread) uint64_t ggml_cpu_tls_spin_iters = 0;
 static __declspec(thread) uint64_t ggml_cpu_tls_waits      = 0;
 
+// Node-visit accounting, to settle why the barrier count (1344) exceeds the number of nodes that should pay a
+// barrier. ggml_op_is_empty skips NONE/RESHAPE/TRANSPOSE/VIEW/PERMUTE, and a second continue skips nodes
+// without GGML_TENSOR_FLAG_COMPUTE, so the loop should only reach ggml_barrier for the remainder. If the
+// counted barriers disagree with that arithmetic, one of the two continuations is not doing what the code
+// appears to say -- and a stride of ~561 RESHAPE nodes each paying a barrier would be several times larger
+// than every fusion candidate on the list.
+static uint64_t ggml_cpu_n_nodes_seen    = 0;  // node_n iterations of the main loop
+static uint64_t ggml_cpu_n_nodes_empty   = 0;  // skipped by ggml_op_is_empty
+static uint64_t ggml_cpu_n_nodes_nocomp  = 0;  // skipped by the COMPUTE flag test
+static uint64_t ggml_cpu_n_nodes_barr    = 0;  // reached the ggml_barrier call site
+static uint64_t ggml_cpu_n_nodes_compute = 0;  // reached ggml_compute_forward / the fusion path
+
 static void ggml_cpu_barrier_stats_report(void) {
     if (!ggml_cpu_barrier_stats_on) {
         return;
@@ -601,6 +613,12 @@ static void ggml_cpu_barrier_stats_report(void) {
     fprintf(stderr, "[barrier-stats] waits=%llu spin_iters=%llu\n",
             (unsigned long long) ggml_cpu_n_barriers,
             (unsigned long long) ggml_cpu_n_spin_iters);
+    fprintf(stderr, "[barrier-stats] nodes_seen=%llu empty=%llu no_compute=%llu computed=%llu barrier_sites=%llu\n",
+            (unsigned long long) ggml_cpu_n_nodes_seen,
+            (unsigned long long) ggml_cpu_n_nodes_empty,
+            (unsigned long long) ggml_cpu_n_nodes_nocomp,
+            (unsigned long long) ggml_cpu_n_nodes_compute,
+            (unsigned long long) ggml_cpu_n_nodes_barr);
 }
 
 static bool ggml_cpu_barrier_stats_enabled(void) {
@@ -3147,16 +3165,35 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    // Resolve the diagnostic switch once, before the node loop, so the per-node counters below read a settled
+    // value rather than lazily initialising it mid-loop.
+    (void) ggml_cpu_barrier_stats_enabled();
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
+        // Counted only when the diagnostic is on; the counters are shared, but these sites run once per node
+        // rather than once per spin iteration, so the contention is negligible (unlike the spin counters,
+        // which had to be made thread-local).
+        if (ggml_cpu_barrier_stats_on) {
+            __atomic_fetch_add(&ggml_cpu_n_nodes_seen, 1, __ATOMIC_RELAXED);
+        }
         if (ggml_op_is_empty(node->op)) {
             // skip NOPs
+            if (ggml_cpu_barrier_stats_on) {
+                __atomic_fetch_add(&ggml_cpu_n_nodes_empty, 1, __ATOMIC_RELAXED);
+            }
             continue;
         }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            if (ggml_cpu_barrier_stats_on) {
+                __atomic_fetch_add(&ggml_cpu_n_nodes_nocomp, 1, __ATOMIC_RELAXED);
+            }
             continue;
+        }
+        if (ggml_cpu_barrier_stats_on) {
+            __atomic_fetch_add(&ggml_cpu_n_nodes_compute, 1, __ATOMIC_RELAXED);
         }
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
@@ -3175,6 +3212,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
+            if (ggml_cpu_barrier_stats_on) {
+                __atomic_fetch_add(&ggml_cpu_n_nodes_barr, 1, __ATOMIC_RELAXED);
+            }
             ggml_barrier(state->threadpool);
         }
     }
