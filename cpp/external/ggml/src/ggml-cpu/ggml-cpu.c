@@ -3654,6 +3654,26 @@ static int ggml_cpu_rope_match(
         }
     }
 
+    // LAYOUT GATE for GGML_OP_ROPE (KATAGO_CPU_ROPE_LAYOUT=1), one line per site.
+    //
+    // ops.cpp:6278 asserts n_dims <= ne0 and rotate_pairs only rotates an ne0 prefix, so the built-in rope
+    // requires the rotated axis (the head dim D) to be (a) ne0 AND (b) stride es. That is a stronger
+    // requirement than "a relabelled view exists": a relabelling can move D to ne0 but cannot change its
+    // stride, so it still fails (b). This probe reports both per site so the (c) option is decided by data
+    // on every site rather than by one observed sample.
+    {
+        const char * lay = getenv("KATAGO_CPU_ROPE_LAYOUT");
+        if (lay != NULL && lay[0] == '1' && params->ith == 0) {
+            const struct ggml_tensor * x = a->src[0];
+            const int64_t es = (int64_t) ggml_type_size(x->type);
+            fprintf(stderr, "[rope-layout] node=%d x.ne0=%lld x.ne1=%lld x.nb0=%lld x.nb1=%lld es=%lld "
+                            "D_in_ne0=%d nb0_eq_es=%d D_fastest=%d\n",
+                    node_n, (long long) x->ne[0], (long long) x->ne[1],
+                    (long long) x->nb[0], (long long) x->nb[1], (long long) es,
+                    x->ne[0] == 32, x->nb[0] == es, x->nb[0] == es && x->ne[0] == 32);
+        }
+    }
+
     // Check every buffer the kernel actually READS. Checking only the chain sources is not enough -- the
     // first version of this guard did that, found nothing, and let the fusion through.
     //
