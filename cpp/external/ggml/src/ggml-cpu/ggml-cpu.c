@@ -572,6 +572,49 @@ struct ggml_state {
 
 static struct ggml_state g_state = {0};
 
+// --- barrier instrumentation (diagnostic; off unless KATAGO_CPU_BARRIER_STATS=1) -------------------
+// Counts how often threads reach the barrier and how many spin iterations they burn there. The point is to
+// turn "about 14% of the profile sits in the barrier wait" into a per-node figure: measured, not inferred
+// from a batch-1-versus-batch-6 comparison. The counter is a relaxed add inside a loop that already spins on
+// a shared atomic, so its cost is far below one iteration of the spin itself; the totals are read once at
+// teardown, so nothing here needs to be exact, only representative. Zero overhead when disabled.
+static int      ggml_cpu_barrier_stats_on  = 0;
+static int      ggml_cpu_barrier_stats_env = -1;
+static uint64_t ggml_cpu_n_barriers        = 0;
+static uint64_t ggml_cpu_n_spin_iters      = 0;
+
+static void ggml_cpu_barrier_stats_report(void);
+
+// Both counters are THREAD-LOCAL while the barrier runs and folded into the shared totals once per barrier.
+// This matters more than it looks. The first version added to a global atomic on every barrier entry and the
+// build ran 60x slower than the same build without the flag -- 5258 ms/batch against 88 ms/batch -- with the
+// stats enabled AND disabled, because the branch changed the code layout. Nine hundred nodes times sixty
+// iterations times seven waiting threads is tens of thousands of contended read-modify-writes on one cache
+// line, laid right on top of the barrier's own atomics. Counting must not perturb what it counts.
+static __declspec(thread) uint64_t ggml_cpu_tls_spin_iters = 0;
+static __declspec(thread) uint64_t ggml_cpu_tls_waits      = 0;
+
+static void ggml_cpu_barrier_stats_report(void) {
+    if (!ggml_cpu_barrier_stats_on) {
+        return;
+    }
+    fprintf(stderr, "[barrier-stats] waits=%llu spin_iters=%llu\n",
+            (unsigned long long) ggml_cpu_n_barriers,
+            (unsigned long long) ggml_cpu_n_spin_iters);
+}
+
+static bool ggml_cpu_barrier_stats_enabled(void) {
+    if (ggml_cpu_barrier_stats_env < 0) {
+        const char * e = getenv("KATAGO_CPU_BARRIER_STATS");
+        ggml_cpu_barrier_stats_env = (e != NULL && e[0] == '1') ? 1 : 0;
+        ggml_cpu_barrier_stats_on  = ggml_cpu_barrier_stats_env;
+        if (ggml_cpu_barrier_stats_on) {
+            atexit(ggml_cpu_barrier_stats_report);
+        }
+    }
+    return ggml_cpu_barrier_stats_on != 0;
+}
+
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
@@ -581,6 +624,7 @@ void ggml_barrier(struct ggml_threadpool * tp) {
 #ifdef GGML_USE_OPENMP
     #pragma omp barrier
 #else
+    const bool stats = ggml_cpu_barrier_stats_enabled();
     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
 
     // enter barrier (full seq-cst fence)
@@ -596,8 +640,21 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     }
 
     // wait for other threads
-    while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
-        ggml_thread_cpu_relax();
+    if (stats) {
+        ggml_cpu_tls_waits++;
+        ggml_cpu_tls_spin_iters = 0;
+        while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
+            ggml_cpu_tls_spin_iters++;
+            ggml_thread_cpu_relax();
+        }
+        // one shared update per barrier, never one per iteration and never two per barrier
+        __atomic_fetch_add(&ggml_cpu_n_barriers,   ggml_cpu_tls_waits,      __ATOMIC_RELAXED);
+        __atomic_fetch_add(&ggml_cpu_n_spin_iters, ggml_cpu_tls_spin_iters, __ATOMIC_RELAXED);
+        ggml_cpu_tls_waits = 0;
+    } else {
+        while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
+            ggml_thread_cpu_relax();
+        }
     }
 
     // exit barrier (full seq-cst fence)
