@@ -4260,11 +4260,22 @@ static void ggml_compute_forward_rope_fused_f32(
         const int64_t i11 = i / nc;         // slow dimension
         const int64_t i10 = i % nc;         // fast dimension
 
-        const int64_t i01 = *(const int32_t *) ((const char *) idx->data + i10*nb_i0);
-        GGML_ASSERT(i01 >= 0 && i01 < ne_src1);   // 0 <= idx[j] < ne1
+        // 🔴 SETTLED BY THE OUT-OF-GRAPH UNIT TEST (rope-dsgather-unittest.cpp), not by reasoning here.
+        //
+        // The test prints the operands and shows the real structure: `idx` has length ne1 = the SLOW axis,
+        // so its subscript is a SLOW coordinate. Using it to pick a FAST-axis element is a type mismatch --
+        // that is the kernel's current error, and it is why moving the index position around could never
+        // have worked. The test's fast-axis PAIR form reproduces the reference at 0/12 mismatches.
+        //
+        // So: the VALUE partner of fast coordinate c is the element at fast coordinate c^1 OF THE SAME SLOW
+        // ROW (blanket caveat: this holds while the swap table is the adjacent-pair sigma(d)=d^1 that the
+        // ONNX generator writes; if a future model ships a general permutation, this must read the table
+        // instead -- the predicate must then also check the table's contents, as upstream E1/E2 do).
+        const int64_t c_pair = i10 ^ 1;     // fast-axis partner (adjacent pair swap)
+        GGML_ASSERT(c_pair >= 0 && c_pair < nc);
 
-        const char * x_cont = (const char *) src_a->data + i10*nb_src0;
-        const char * gath   = (const char *) src_a->data + i01*nb_src1 + i10*nb_src0;
+        const char * x_cont = (const char *) src_a->data + i10*nb_src0 + i11*nb_src1;
+        const char * gath   = (const char *) src_a->data + c_pair*nb_src0 + i11*nb_src1;
 
         const char * a_tab  = (const char *) tab_a->data + i10*nb_src0 + i11*nb_a1;
         const char * b_tab  = (const char *) tab_b->data + i10*nb_src0 + i11*nb_b1;
