@@ -4022,15 +4022,18 @@ int  (*ggml_cpu_rope_dbg_check)(uint64_t h) = NULL;
 // Generic entry point for the A1 kernel in ggml-cpu.c: publish a fused result into the shadow so the stock
 // ADD can diff it. Reuses the same scratch buffer and the same compare function as the RoPE harness -- the
 // instrument is method-level on purpose, so any "skip nodes" fusion can be validated with it.
-extern "C" void ggml_cpu_shadow_publish(const float * src, int64_t ne0, int64_t ne1);
+extern "C" void ggml_cpu_shadow_publish(const float * src, int64_t ne0, int64_t ne1, const void * key);
 
 struct ggml_cpu_rope_shadow {
     float *  data;
     size_t   cap;        // capacity in floats
     int64_t  ne0;        // fast axis length
     int64_t  ne1;        // slow axis length
+    const void * key;    // who published: the consuming ADD's dst. Guards against slot contention when
+                         // several fusions publish (measured: A1 and RoPE collided here, which produced
+                         // "SHAPE MISMATCH fused ne=(384,1083) stock ne=(6498,32)" and made the reading
+                         // meaningless).
     int      armed;      // a fused result is sitting in the buffer
-    int      reported;
 };
 static ggml_cpu_rope_shadow g_rope_shadow = { NULL, 0, 0, 0, 0, 0 };
 
@@ -4043,8 +4046,9 @@ static int ggml_cpu_rope_shadow_on(void) {
     return on;
 }
 
-// Called by the fused kernel once per site (single thread owns the buffer write).
-static void ggml_cpu_rope_shadow_put(const float * src, int64_t ne0, int64_t ne1) {
+// Called by the fused kernel once per site (single thread owns the buffer write). `key` names the consumer
+// so that when several fusions publish into this one slot the right ADD claims the right result.
+static void ggml_cpu_rope_shadow_put(const float * src, int64_t ne0, int64_t ne1, const void * key) {
     const size_t need = (size_t) ne0 * (size_t) ne1;
     if (g_rope_shadow.cap < need) {
         free(g_rope_shadow.data);
@@ -4055,25 +4059,30 @@ static void ggml_cpu_rope_shadow_put(const float * src, int64_t ne0, int64_t ne1
         return;
     }
     memcpy(g_rope_shadow.data, src, need * sizeof(float));
-    g_rope_shadow.ne0      = ne0;
-    g_rope_shadow.ne1      = ne1;
-    g_rope_shadow.armed    = 1;
-    g_rope_shadow.reported = 0;
+    g_rope_shadow.ne0   = ne0;
+    g_rope_shadow.ne1   = ne1;
+    g_rope_shadow.key   = key;
+    g_rope_shadow.armed = 1;
 }
 
 // Called by the stock ADD (binary-ops.cpp) with its own result. Reports the FIRST mismatch by logical
 // index and disarms. Not thread safe by design: only ith == 0 calls it.
 // extern "C" so the C++ translation unit that .cpp-compiles binary-ops can resolve the symbol.
-extern "C" void ggml_cpu_rope_shadow_cmp(const float * got, int64_t ne0, int64_t ne1);
+extern "C" void ggml_cpu_rope_shadow_cmp(const float * got, int64_t ne0, int64_t ne1, const void * key);
 
 // Generic publisher (see the extern "C" declaration above).
-extern "C" void ggml_cpu_shadow_publish(const float * src, int64_t ne0, int64_t ne1) {
+extern "C" void ggml_cpu_shadow_publish(const float * src, int64_t ne0, int64_t ne1, const void * key) {
     if (ggml_cpu_rope_shadow_on()) {
-        ggml_cpu_rope_shadow_put(src, ne0, ne1);
+        ggml_cpu_rope_shadow_put(src, ne0, ne1, key);
     }
 }
-extern "C" void ggml_cpu_rope_shadow_cmp(const float * got, int64_t ne0, int64_t ne1) {
+extern "C" void ggml_cpu_rope_shadow_cmp(const float * got, int64_t ne0, int64_t ne1, const void * key) {
     if (!g_rope_shadow.armed || g_rope_shadow.data == NULL) {
+        return;
+    }
+    // Only the consumer this result was published FOR may claim it. Anything else must leave the slot
+    // armed, otherwise one fusion's result is compared against another fusion's tensor (measured).
+    if (key != NULL && g_rope_shadow.key != key) {
         return;
     }
     g_rope_shadow.armed = 0;
@@ -4291,7 +4300,7 @@ static void ggml_compute_forward_rope_fused_f32(
                                       + c*dst_add->nb[0] + r*dst_add->nb[1]);
                 }
             }
-            ggml_cpu_rope_shadow_put(tmp, nc, nr);
+            ggml_cpu_rope_shadow_put(tmp, nc, nr, (const void *) dst_add);
             free(tmp);
         }
     }

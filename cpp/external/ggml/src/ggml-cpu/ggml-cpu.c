@@ -3956,7 +3956,7 @@ t9_done:
 // Generic shadow publisher, defined in ops.cpp. Used to diff the fused result against the stock ADD inside
 // one run (KATAGO_CPU_ROPE_SHADOW=1 + KATAGO_CPU_T9_NOSKIP=1). The instrument is method-level so that any
 // "skip nodes" fusion can be validated with the same reference.
-void ggml_cpu_shadow_publish(const float * src, int64_t ne0, int64_t ne1);
+void ggml_cpu_shadow_publish(const float * src, int64_t ne0, int64_t ne1, const void * key);
 //
 // The reduction and the buffer mapping are taken from the stock paths, deliberately:
 //   * the row->(i1,i2,i3) decomposition and the `%` reductions are apply_binary_op's broadcast rule, which
@@ -4031,7 +4031,7 @@ void ggml_compute_forward_add_fused_epilogue(
         float * tmp = (float *) malloc(need * sizeof(float));
         if (tmp != NULL) {
             memcpy(tmp, dst->data, need * sizeof(float));
-            ggml_cpu_shadow_publish(tmp, ne0, ne1*ne2*ne3);
+            ggml_cpu_shadow_publish(tmp, ne0, ne1*ne2*ne3, (const void *) dst);
             free(tmp);
         }
     }
