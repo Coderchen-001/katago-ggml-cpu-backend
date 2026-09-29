@@ -3361,6 +3361,25 @@ static void ggml_cpu_rope_dump_census(const struct ggml_cgraph * cgraph, int thr
     done = 1;
 
     fprintf(stderr, "[rope-dump] n_nodes=%d\n", cgraph->n_nodes);
+    // Full node census, KATAGO_CPU_ROPE_DUMP=full: one line per node in the same format the executable's
+    // own dump uses, so the union table can be computed for the PRODUCTION shape (the Logging-hook dump
+    // lands in gtp_logs/ and is awkward to line up, and the old _rope.txt is a different model).
+    {
+        const char * full = getenv("KATAGO_CPU_ROPE_DUMP");
+        if (full != NULL && full[0] == 'f') {
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                const struct ggml_tensor * t = cgraph->nodes[i];
+                const char * s0 = t->src[0] ? ggml_op_name(t->src[0]->op) : "NULL";
+                const char * s1 = t->src[1] ? ggml_op_name(t->src[1]->op) : "NULL";
+                fprintf(stderr, ": CPU graph node %d %s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] contig=%d src0=%s src1=%s\n",
+                        i, ggml_op_name(t->op), ggml_type_name(t->type),
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                        (long long) t->nb[0], (long long) t->nb[1], (long long) t->nb[2], (long long) t->nb[3],
+                        (int) ggml_is_contiguous(t), s0, s1);
+            }
+            return;
+        }
+    }
     for (int i = 0; i + 1 < cgraph->n_nodes; i++) {
         const struct ggml_tensor * n1 = cgraph->nodes[i];
         const struct ggml_tensor * g  = cgraph->nodes[i + 1];
@@ -3780,6 +3799,27 @@ static int ggml_cpu_try_fuse_ops(
         const int node_n,
         const struct ggml_compute_params * params,
         const struct ggml_cplan * cplan) {
+
+    // Full-census trigger, moved here because this call site is known to run (the earlier one in the thread
+    // entry did not fire). KATAGO_CPU_ROPE_DUMP=full.
+    {
+        static int census_done = 0;
+        const char * full = getenv("KATAGO_CPU_ROPE_DUMP");
+        if (!census_done && full != NULL && full[0] == 'f' && params->ith == 0) {
+            census_done = 1;
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                const struct ggml_tensor * t = cgraph->nodes[i];
+                fprintf(stderr, ": CPU graph node %d %s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] contig=%d src0=%s src1=%s\n",
+                        i, ggml_op_name(t->op), ggml_type_name(t->type),
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                        (long long) t->nb[0], (long long) t->nb[1], (long long) t->nb[2], (long long) t->nb[3],
+                        (int) ggml_is_contiguous(t),
+                        t->src[0] ? ggml_op_name(t->src[0]->op) : "NULL",
+                        t->src[1] ? ggml_op_name(t->src[1]->op) : "NULL");
+            }
+            fprintf(stderr, "[rope-dump] CENSUS n_nodes=%d\n", cgraph->n_nodes);
+        }
+    }
 
     if (ggml_cpu_disable_fusion || cplan->use_ref) {
         return 0;
