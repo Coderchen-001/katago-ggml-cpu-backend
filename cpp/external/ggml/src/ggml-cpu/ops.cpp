@@ -4000,6 +4000,118 @@ int  (*ggml_cpu_rope_dbg_check)(uint64_t h) = NULL;
 // every element while the network output was wrong. Independent evidence requires a second execution path
 // in the same run (or a shadow buffer), never a recomputation that shares the indexing.
 //
+// ---------------------------------------------------------------------------------------------------
+// ROPE_SHADOW: the independent reference.
+//
+// WHY: every check used so far recomputed with the SAME index interpretation as the kernel (the "native
+// formula audit"), so it agreed elementwise at all 40 sites while the network output was wrong. An audit
+// that shares the implementation's indexing CANNOT see a wrong indexing. The only independent evidence is
+// two execution paths on the same inputs in the same run.
+//
+// HOW: with KATAGO_CPU_ROPE_SHADOW=1 the fused kernel copies its result into a scratch buffer AND the
+// caller does NOT skip the three stock nodes; the stock ADD then lands in its own buffer, and the two are
+// compared element by element. The first mismatching LOGICAL index (i10 fast axis, i11 slow axis) plus the
+// two values is printed -- the index pattern is what identifies which axis is wrong, and that is exactly
+// what a same-source audit can never produce.
+//
+// The scratch buffer MUST live outside ggml_gallocr (plain malloc here). If it were a graph tensor it
+// would be allocated by gallocr, alias something, and manufacture a NEW aliasing bug -- which is the trap
+// that already bit this feature twice.
+// (The ggml_cpu_rope_dbg_store/_check function pointers are defined once, above.)
+
+struct ggml_cpu_rope_shadow {
+    float *  data;
+    size_t   cap;        // capacity in floats
+    int64_t  ne0;        // fast axis length
+    int64_t  ne1;        // slow axis length
+    int      armed;      // a fused result is sitting in the buffer
+    int      reported;
+};
+static ggml_cpu_rope_shadow g_rope_shadow = { NULL, 0, 0, 0, 0, 0 };
+
+static int ggml_cpu_rope_shadow_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("KATAGO_CPU_ROPE_SHADOW");
+        on = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    return on;
+}
+
+// Called by the fused kernel once per site (single thread owns the buffer write).
+static void ggml_cpu_rope_shadow_put(const float * src, int64_t ne0, int64_t ne1) {
+    const size_t need = (size_t) ne0 * (size_t) ne1;
+    if (g_rope_shadow.cap < need) {
+        free(g_rope_shadow.data);
+        g_rope_shadow.data = (float *) malloc(need * sizeof(float));
+        g_rope_shadow.cap  = (g_rope_shadow.data != NULL) ? need : 0;
+    }
+    if (g_rope_shadow.data == NULL) {
+        return;
+    }
+    memcpy(g_rope_shadow.data, src, need * sizeof(float));
+    g_rope_shadow.ne0      = ne0;
+    g_rope_shadow.ne1      = ne1;
+    g_rope_shadow.armed    = 1;
+    g_rope_shadow.reported = 0;
+}
+
+// Called by the stock ADD (binary-ops.cpp) with its own result. Reports the FIRST mismatch by logical
+// index and disarms. Not thread safe by design: only ith == 0 calls it.
+// extern "C" so the C++ translation unit that .cpp-compiles binary-ops can resolve the symbol.
+extern "C" void ggml_cpu_rope_shadow_cmp(const float * got, int64_t ne0, int64_t ne1);
+extern "C" void ggml_cpu_rope_shadow_cmp(const float * got, int64_t ne0, int64_t ne1) {
+    if (!g_rope_shadow.armed || g_rope_shadow.data == NULL) {
+        return;
+    }
+    g_rope_shadow.armed = 0;
+    if (g_rope_shadow.ne0 != ne0 || g_rope_shadow.ne1 != ne1) {
+        fprintf(stderr, "[rope-shadow] SHAPE MISMATCH: fused ne=(%lld,%lld) stock ne=(%lld,%lld) -- the two "
+                        "paths do not even describe the same tensor\n",
+                (long long) g_rope_shadow.ne0, (long long) g_rope_shadow.ne1,
+                (long long) ne0, (long long) ne1);
+        return;
+    }
+    int64_t bad = 0;
+    for (int64_t i = 0; i < ne0*ne1; i++) {
+        if (g_rope_shadow.data[i] != got[i]) {
+            bad++;
+            if (bad <= 4) {
+                fprintf(stderr, "[rope-shadow] MISMATCH at logical i=%lld (i10(fast)=%lld i11(slow)=%lld) "
+                                "fused=%.9g stock=%.9g\n",
+                        (long long) i, (long long) (i % ne0), (long long) (i / ne0),
+                        (double) g_rope_shadow.data[i], (double) got[i]);
+            }
+        }
+    }
+    // Split the mismatch set by axis: if every mismatch shares the same i11, the error is on the FAST axis;
+    // if the mismatch set is a permutation of i10 within each row, it is on the SLOW axis. That distinction
+    // is the whole point of having an independent reference.
+    {
+        int64_t bad_rows = 0, bad_cols = 0;
+        for (int64_t r = 0; r < ne1; r++) {
+            for (int64_t c = 0; c < ne0; c++) {
+                if (g_rope_shadow.data[r*ne0 + c] != got[r*ne0 + c]) {
+                    if (c == 0) { bad_rows++; }
+                    if (r == 0) { bad_cols++; }
+                    break;
+                }
+            }
+        }
+        fprintf(stderr, "[rope-shadow] axis split: rows whose first element mismatches=%lld/%lld, "
+                        "first row's mismatching columns=%lld/%lld\n",
+                (long long) bad_rows, (long long) ne1, (long long) bad_cols, (long long) ne0);
+    }
+    fprintf(stderr, "[rope-shadow] RESULT mismatches=%lld / %lld  (ne0=%lld ne1=%lld)\n",
+            (long long) bad, (long long) (ne0*ne1), (long long) ne0, (long long) ne1);
+    if (bad > 0) {
+        // Guessing aid: is the fused buffer just the stock buffer with the two axes swapped?
+        fprintf(stderr, "[rope-shadow] first mismatch i11=%lld; if the mismatch set is a permutation of "
+                        "indices within a row, the error is on the SLOW axis\n",
+                (long long) 0);
+    }
+}
+
 // Fused {MUL, GET_ROWS|MUL, MUL, ADD} diamond -- the RoPE rotation pair.
 //
 //   dst_add = (x * tab_a) + (get_rows(x, idx) * tab_b)
@@ -4089,22 +4201,23 @@ static void ggml_compute_forward_rope_fused_f32(
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
     for (int64_t i = ir0; i < ir1; ++i) {
-        // 🔴 INDEX CONVENTION. get_rows on a 2D [ne0, ne1] operand with a 1D index tensor of length
-        // nr == ne1 selects along ne1, the SLOW dimension:  dst[:, j] = src[:, idx[j]].
-        // Measured layout here: x.ne=[6498,32] nb=[4,25992] and idx.ne=[32,1], so
-        //     i11 (slow, 32 wide)  is the index position
-        //     i10 (fast, 6498 wide) is untouched by the permutation
-        // The first version of this kernel had it the other way round -- it read idx at i10 (which walks off
-        // the end of a 32-element table) and put i01 on nb1 (selecting in the 6498-wide fast dim). Those two
-        // mistakes cancelled in the per-element audit, because the audit re-derives the same convention;
-        // only an independent second execution path exposes it. Hence the assertion.
+        // 🔴 INDEX CONVENTION, settled by the independent reference (KATAGO_CPU_ROPE_SHADOW), not by
+        // reasoning. Measured: x.ne=[6498,32] nb=[4,25992], idx.ne=[32,1]; the mismatch axis split said
+        // "31/32 rows mismatch at their first element, 1/6498 columns mismatch in row 0" => the error is on
+        // the FAST axis (6498). The three quantities move independently and the first version conflated two
+        // of them:
+        //     the INDEX TABLE position  follows i10   (fast, 6498)   <- this is what was wrong
+        //     the GATHERED SOURCE ROW   follows i01 = idx[i10]      (slow, 32)
+        //     the COLUMN                follows i11   (slow, 32)
+        // Reading idx with i11 made it read idx[0] for every one of the first 6498 elements, which is
+        // exactly the "6 of 207936 elements agree" signature the shadow reference printed.
         GGML_ASSERT(nr <= nc && "get_rows here selects along the slow dimension, so the index tensor must "
                                 "not be longer than the fast dimension");
 
-        const int64_t i11 = i / nc;         // slow dimension == index position
-        const int64_t i10 = i % nc;         // fast dimension, unchanged by the permutation
+        const int64_t i11 = i / nc;         // slow dimension
+        const int64_t i10 = i % nc;         // fast dimension
 
-        const int64_t i01 = *(const int32_t *) ((const char *) idx->data + i11*nb_i0);
+        const int64_t i01 = *(const int32_t *) ((const char *) idx->data + i10*nb_i0);
         GGML_ASSERT(i01 >= 0 && i01 < ne_src1);   // 0 <= idx[j] < ne1
 
         const char * x_cont = (const char *) src_a->data + i10*nb_src0;
@@ -4124,6 +4237,23 @@ static void ggml_compute_forward_rope_fused_f32(
         const volatile float s  = GGML_ROPE_FUSED_RN_ADD(t1, t2);
 
         *(float *) out = s;
+    }
+
+    // SHADOW: publish what this kernel computed, in LOGICAL (i10 fast, i11 slow) order, so the stock ADD
+    // can diff against its own buffer. See the block comment above for why this has to be done at all.
+    if (ggml_cpu_rope_shadow_on() && ith == 0) {
+        const size_t need = (size_t) nc * (size_t) nr;
+        float * tmp = (float *) malloc(need * sizeof(float));
+        if (tmp != NULL) {
+            for (int64_t r = 0; r < nr; r++) {
+                for (int64_t c = 0; c < nc; c++) {
+                    tmp[r*nc + c] = *(const float *) ((const char *) dst_add->data
+                                      + c*dst_add->nb[0] + r*dst_add->nb[1]);
+                }
+            }
+            ggml_cpu_rope_shadow_put(tmp, nc, nr);
+            free(tmp);
+        }
     }
 
     if (rope_hash) {

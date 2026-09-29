@@ -7,6 +7,9 @@
 // Debug-only hook, defined (with C linkage) in ops.cpp. With KATAGO_CPU_ROPE_HASH=1 the ADD kernel hashes
 // its own output block so it can be compared, inside a single run, against what the fused RoPE kernel wrote.
 extern "C" int (*ggml_cpu_rope_dbg_check)(uint64_t h);
+// ROPE_SHADOW independent reference: hand the stock ADD's result to ops.cpp, which diffs it against what
+// the fused kernel published. Only thread 0 calls it; the arming/disarming is single-threaded by design.
+extern "C" void ggml_cpu_rope_shadow_cmp(const float * got, int64_t ne0, int64_t ne1);
 
 #if defined(GGML_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
@@ -98,23 +101,28 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
         const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
         const src1_t * src1_ptr = (const src1_t *) ((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
 
-        if (params->ith == 0 && ir == 0 && ne00 > 1000 && op == op_add && ggml_cpu_rope_dbg_check != nullptr) {
+        if (params->ith == 0 && ir == 0 && ne00 > 1000 && op == op_add) {
             if constexpr (std::is_same_v<dst_t, float>) {
-                // Same address-independent hash as the fused kernel: rows and elements in LOGICAL order.
-                uint64_t h = 1469598103934665603ULL;
-                for (int64_t r = 0; r < ggml_nrows(dst); r++) {
-                    const int64_t r03 = r/(ne02*ne01);
-                    const int64_t r02 = (r - r03*ne02*ne01)/ne01;
-                    const int64_t r01 = (r - r03*ne02*ne01 - r02*ne01);
-                    for (int64_t c = 0; c < ne00; ++c) {
-                        const unsigned char * q = (const unsigned char *) dst->data + r03*nb3 + r02*nb2 + r01*nb1 + c*nb0;
-                        for (int64_t k = 0; k < (int64_t) sizeof(float); k++) {
-                            h ^= q[k];
-                            h *= 1099511628211ULL;
+                // ROPE_SHADOW: diff the stock chain's own result against the fused kernel's, in the same run.
+                ggml_cpu_rope_shadow_cmp((const float *) dst->data, ne00, ggml_nrows(dst));
+
+                if (ggml_cpu_rope_dbg_check != nullptr) {
+                    // Address-independent hash, same shape as the fused kernel's, for KATAGO_CPU_ROPE_HASH.
+                    uint64_t h = 1469598103934665603ULL;
+                    for (int64_t r = 0; r < ggml_nrows(dst); r++) {
+                        const int64_t r03 = r/(ne02*ne01);
+                        const int64_t r02 = (r - r03*ne02*ne01)/ne01;
+                        const int64_t r01 = (r - r03*ne02*ne01 - r02*ne01);
+                        for (int64_t c = 0; c < ne00; ++c) {
+                            const unsigned char * q = (const unsigned char *) dst->data + r03*nb3 + r02*nb2 + r01*nb1 + c*nb0;
+                            for (int64_t k = 0; k < (int64_t) sizeof(float); k++) {
+                                h ^= q[k];
+                                h *= 1099511628211ULL;
+                            }
                         }
                     }
+                    ggml_cpu_rope_dbg_check(h);
                 }
-                ggml_cpu_rope_dbg_check(h);
             }
         }
 
