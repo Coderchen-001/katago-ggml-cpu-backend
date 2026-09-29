@@ -53,13 +53,11 @@ void ggml_compute_forward_rope_fused(const struct ggml_compute_params * params,
         struct ggml_tensor * dst_mul_a,
         struct ggml_tensor * dst_mul_b,
         struct ggml_tensor * dst_get_rows);
-// A1: {MUL_MAT, <free view>, ADD} -- elementwise broadcast add of the free view (`mid`, which aliases the
-// MUL_MAT's output) and the other operand, written straight into the ADD's destination. Defined in
-// ggml-cpu.c next to the predicate that decides it, because that is where the fusion state lives.
-void ggml_compute_forward_add_fused_epilogue(const struct ggml_compute_params * params,
-        struct ggml_tensor * dst,
-        const struct ggml_tensor * mid,
-        const struct ggml_tensor * other);
+// A1: {MUL_MAT, <free view>, ADD}. There is deliberately NO entry point here: the pass is not a standalone
+// op, it is threaded into the MUL_MAT's own chunk loop (see ggml_cpu_t9_anchor_epilogue in ggml-cpu.c), so
+// that each thread only reads the rows it just wrote and the fusion can save a barrier. Exposing it as a
+// callable kernel is exactly the mistake the previous version made -- called from the matcher, before the
+// GEMM had run, it read the anchor's output buffer while it was still unwritten.
 void ggml_compute_forward_rms_norm_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_group_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_l2_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);

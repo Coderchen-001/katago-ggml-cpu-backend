@@ -481,6 +481,32 @@ static constexpr inline int64_t BLOC_POS(int64_t ib, int64_t ibN, int64_t bloc_s
     return ib < ibN ? ib * bloc_size : ibN * bloc_size + (ib - ibN) * (bloc_size - 1);
 }
 
+// ---- A1: "the writes are published" handshake with ggml-cpu.c --------------------------------------
+// tinyBLAS::gemm ends with a ggml_barrier placed AFTER all of its writes to C, so once
+// llamafile_sgemm() returns, the whole output of that matmul is visible to every thread. ggml-cpu.c
+// reuses that fact to run a fused elementwise pass over C WITHOUT adding a barrier -- which is the entire
+// gain of the A1 fusion, and the only way that pass can be free for the 51 of 52 measured sites that take
+// this path instead of the ggml chunk loop.
+//
+// This flag turns that reliance into something the caller can CHECK: the barrier sets it, and the caller
+// takes (and clears) it. An instantiation without such a trailing barrier leaves it clear and the caller
+// refuses to fuse rather than racing. The guard's precise limit: it reports "a barrier was taken during
+// this call", not "a barrier was taken after the writes" -- so the barrier must stay where it is, and this
+// flag must move with it if it ever moves.
+static thread_local int ggml_cpu_tb_writes_published = 0;
+
+extern "C" void ggml_cpu_tb_clear_writes_published(void) {
+    ggml_cpu_tb_writes_published = 0;
+}
+extern "C" int ggml_cpu_tb_take_writes_published(void) {
+    const int v = ggml_cpu_tb_writes_published;
+    ggml_cpu_tb_writes_published = 0;
+    return v;
+}
+static inline void ggml_cpu_tb_note_writes_published(void) {
+    ggml_cpu_tb_writes_published = 1;
+}
+
 template <int KN, typename D, typename V, typename TA, typename TB, typename TC>
 class tinyBLAS {
   public:
@@ -628,6 +654,7 @@ class tinyBLAS {
         }
 
         ggml_barrier(params->threadpool);
+        ggml_cpu_tb_note_writes_published();
         return;
     }
 

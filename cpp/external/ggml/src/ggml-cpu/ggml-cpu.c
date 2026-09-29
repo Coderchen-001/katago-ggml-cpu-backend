@@ -636,6 +636,16 @@ static uint64_t ggml_cpu_n_nodes_compute = 0;  // reached ggml_compute_forward /
 static uint64_t ggml_cpu_t9_hit     = 0;
 static uint64_t ggml_cpu_t9_refuse  = 0;
 static uint64_t ggml_cpu_t9_execute = 0;
+// epilogue_chunks counts the chunk passes that actually wrote something (one per non-empty chunk of every
+// executed site), so "execute>0" can be told apart from "the pass ran but covered nothing".
+// path_chunk / path_early / path_fallback split the executed anchors by which GEMM path carried the fused
+// pass. Measured on b10c384: 51 of 52 anchors per walk come back through the llamafile sgemm (so the pass
+// runs after it, reusing that kernel's own publish barrier) and 1 goes through the ggml chunk loop. Without
+// this split, "the fusion did nothing" and "the fusion ran and was wrong" look identical.
+static uint64_t ggml_cpu_t9_epilogue_chunks = 0;
+static uint64_t ggml_cpu_t9_path_chunk      = 0;
+static uint64_t ggml_cpu_t9_path_early      = 0;
+static uint64_t ggml_cpu_t9_path_fallback   = 0;
 
 static void ggml_cpu_barrier_stats_report(void) {
     if (!ggml_cpu_barrier_stats_on) {
@@ -652,10 +662,15 @@ static void ggml_cpu_barrier_stats_report(void) {
             (unsigned long long) ggml_cpu_n_nodes_barr);
     // A1 counters, printed SEPARATELY on purpose: hit (predicate matched), refuse (matched then guarded),
     // execute (kernel actually ran). Conflating these cost this project a whole debugging round once.
-    fprintf(stderr, "[t9-stats] hit=%llu refuse=%llu execute=%llu\n",
+    fprintf(stderr, "[t9-stats] hit=%llu refuse=%llu execute=%llu epilogue_chunks=%llu "
+                    "path_chunk=%llu path_early=%llu path_fallback=%llu\n",
             (unsigned long long) ggml_cpu_t9_hit,
             (unsigned long long) ggml_cpu_t9_refuse,
-            (unsigned long long) ggml_cpu_t9_execute);
+            (unsigned long long) ggml_cpu_t9_execute,
+            (unsigned long long) ggml_cpu_t9_epilogue_chunks,
+            (unsigned long long) ggml_cpu_t9_path_chunk,
+            (unsigned long long) ggml_cpu_t9_path_early,
+            (unsigned long long) ggml_cpu_t9_path_fallback);
 }
 
 static bool ggml_cpu_barrier_stats_enabled(void) {
@@ -1287,6 +1302,79 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// ---- A1 fusion: the state the GEMM and the matcher share (the matcher itself is much further down) ---//
+// A1 is {MUL_MAT, <free view>, ADD}. The fusion skips the free view and the ADD, but the matmul must still
+// run, and the fused add-pass must be performed in the SAME barrier interval as that matmul -- otherwise
+// the ADD's barrier is not saved and the fusion buys nothing.
+//
+// There are exactly two ways to be in that interval, and the measured graph uses both:
+//
+//   * ggml's own chunk loop (1 of 52 anchors): the pass runs right after each chunk, on the very rows that
+//     chunk just wrote. The chunk->thread assignment is dynamic (a thread starts at chunk == ith and then
+//     auto-claims), so reading any other thread's rows would need a barrier -- which is why the pass must
+//     stay INSIDE the loop, with the same ir0/ir1 ranges.
+//   * the llamafile sgemm (51 of 52 anchors): it owns the whole output and ends with a barrier ordered
+//     after its writes, so once it returns the pass may use any partition and adds no barrier of its own.
+//     See the handshake in llamafile/sgemm.cpp -- and note the caller CHECKS for that barrier rather than
+//     assuming it, falling back to the stock chain if the instantiation that ran had none.
+//
+// A1-EPILOGUE-FUSION-STATUS.md has the measurements behind both counts.
+struct ggml_cpu_t9_pending {
+    const struct ggml_tensor * mm;      // the anchor MUL_MAT node
+    const struct ggml_tensor * view;    // the free view between anchor and ADD (never dereferenced for data)
+    const struct ggml_tensor * add;     // the ADD node, i.e. the write target
+    const struct ggml_tensor * other;   // the ADD's non-view operand
+    int64_t s_ne1, s_ne2, s_ne3;        // the view's dims 1..3: the reduction/broadcast shape
+    int64_t nr_rows;                    // s_ne1*s_ne2*s_ne3, the row count the pass partitions over
+    int     armed;
+    int     pass_ran;                   // set once the fused pass has actually been performed
+    int     diag[4];                    // trace only: src0 type, src1 type, vec_dot type, which early exit
+};
+
+// THREAD LOCAL ON PURPOSE: the matcher runs on every thread and each thread then calls the GEMM itself, so
+// the hand-off never crosses threads -- set and consumed within one call, with no barrier in between. A
+// shared static would be a race, and would leak across graphs if a refusal landed between set and call.
+static _Thread_local struct ggml_cpu_t9_pending ggml_cpu_t9_pend;
+
+// Defined in llamafile/sgemm.cpp. See the handshake comment there: tinyBLAS::gemm ends with a barrier that
+// is ordered after all of its writes, and these two let the fused pass reuse it -- or refuse to run when
+// the instantiation that served this matmul had no such barrier.
+void ggml_cpu_tb_clear_writes_published(void);
+int  ggml_cpu_tb_take_writes_published(void);
+
+// Called by the GEMM for every MUL_MAT it computes. Returns non-zero only for the anchor of a pending
+// match, which costs one thread-local load and a pointer compare on the hot path.
+static int ggml_cpu_t9_anchor_pending(const struct ggml_tensor * dst) {
+    return ggml_cpu_t9_pend.armed && ggml_cpu_t9_pend.mm == dst;
+}
+
+// The fused pass, over a range of the MUL_MAT's rows (which are the view's rows) and a range of the fast
+// dimension. Two callers use two different partitions of the same work; see each call site.
+static void ggml_cpu_t9_anchor_epilogue(const struct ggml_compute_params * params,
+                                        const struct ggml_tensor * mm,
+                                        int64_t r_begin, int64_t r_end,
+                                        int64_t c_begin, int64_t c_end);
+
+// Ran inside the GEMM's chunk loop (the thread reads only rows it just wrote).
+static void ggml_cpu_t9_pass_in_chunk(const struct ggml_compute_params * params,
+                                      const struct ggml_tensor * mm,
+                                      int64_t ir0_start, int64_t ir0_end,
+                                      int64_t ir1_start, int64_t ir1_end) {
+    ggml_cpu_t9_anchor_epilogue(params, mm, ir1_start, ir1_end, ir0_start, ir0_end);
+}
+
+// Ran after a llamafile sgemm that ended with its own publish barrier. Every thread has passed that
+// barrier, so the whole output is visible and ANY partition is safe here -- including this plain row split,
+// which is cheaper to compute than the GEMM's dynamic chunking and adds no barrier.
+static void ggml_cpu_t9_pass_after_sgemm(const struct ggml_compute_params * params,
+                                         const struct ggml_tensor * mm) {
+    const int64_t nth = params->nth;
+    const int64_t dr  = (ggml_cpu_t9_pend.nr_rows + nth - 1) / nth;
+    const int64_t r0  = dr * params->ith;
+    const int64_t r1  = MIN(r0 + dr, ggml_cpu_t9_pend.nr_rows);
+    ggml_cpu_t9_anchor_epilogue(params, mm, r0, r1, 0, mm->ne[0]);
+}
+
 // ggml_compute_forward_mul_mat
 
 static void ggml_compute_forward_mul_mat_one_chunk(
@@ -1386,8 +1474,27 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
+    // A1: is a fused add-pass pending for THIS matmul? If so the pass runs in the chunk loop below. The
+    // GEMM paths here are NOT diverted to make room for it -- forcing a MUL_MAT off the llamafile sgemm
+    // path changes its summation order and therefore its bits (p0-bitequal.ps1 relies on exactly that
+    // difference for its negative control), which would show up as a network-level change even with a
+    // perfectly correct pass. Instead the pass records whether it actually ran and the matcher falls back
+    // to the stock chain when it did not. See t9-stats path_chunk/path_early.
+    const int t9_pending = ggml_cpu_t9_anchor_pending(dst);
+
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
+    if (t9_pending) {
+        // Clear before the matmul so a stale "published" note from an earlier sgemm on this thread can never
+        // be mistaken for this call's. Trace fields are filled here too: which GEMM path an anchor takes
+        // decides whether the fused pass can run at all, so it is recorded rather than inferred.
+        ggml_cpu_tb_clear_writes_published();
+        ggml_cpu_t9_pend.diag[0] = (int) src0->type;
+        ggml_cpu_t9_pend.diag[1] = (int) src1->type;
+        ggml_cpu_t9_pend.diag[2] = (int) type_traits_cpu[src0->type].vec_dot_type;
+        ggml_cpu_t9_pend.diag[3] = 0;
+    }
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
+        if (t9_pending) { ggml_cpu_t9_pend.diag[3] = 1; }
         ggml_compute_forward_fwht(params, dst);
         return;
     }
@@ -1442,6 +1549,14 @@ void ggml_compute_forward_mul_mat(
                                      src1->type,
                                      dst->type))
                     goto UseGgmlGemm1;
+        // A1: the sgemm served this matmul and left a barrier after its writes; fold the ADD in here.
+        if (t9_pending) {
+            ggml_cpu_t9_pend.diag[3] = 2;
+            if (ggml_cpu_tb_take_writes_published()) {
+                ggml_cpu_t9_pass_after_sgemm(params, dst);
+                ggml_cpu_t9_pend.pass_ran = 1;
+            }
+        }
         return;
     }
 UseGgmlGemm1:;
@@ -1510,6 +1625,15 @@ UseGgmlGemm1:;
                                      vec_dot_type,
                                      dst->type))
                     goto UseGgmlGemm2;
+        // A1: same as the first sgemm site -- and this is the one the measured anchors actually take
+        // (src0 f16, vec_dot f16, so the activations were converted into wdata first).
+        if (t9_pending) {
+            ggml_cpu_t9_pend.diag[3] = 3;
+            if (ggml_cpu_tb_take_writes_published()) {
+                ggml_cpu_t9_pass_after_sgemm(params, dst);
+                ggml_cpu_t9_pend.pass_ran = 1;
+            }
+        }
         return;
     }
 UseGgmlGemm2:;
@@ -1517,6 +1641,14 @@ UseGgmlGemm2:;
 
     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
     const int64_t nr0 = ne0;
+
+    // A1: reaching this line means the GEMM is going to run in the chunk loop, which is where the fused
+    // add-pass lives. Every thread passes through here or through one of the early-outs above, and the
+    // choice depends only on shapes and types, so the whole pool agrees -- the matcher can therefore
+    // decide "skip the ADD" from its OWN thread's flag, with no barrier and no shared state.
+    if (t9_pending) {
+        ggml_cpu_t9_pend.pass_ran = 1;
+    }
 
     // This is the size of the rest of the dimensions of the result
     const int64_t nr1 = ne1 * ne2 * ne3;
@@ -1570,6 +1702,14 @@ UseGgmlGemm2:;
             num_rows_per_vec_dot = 1;
         }
         ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+
+        // A1: fold the pending ADD into the chunk this thread just produced. Deliberately the SAME
+        // ir0/ir1 ranges as the call above, which is what makes every element read here an element this
+        // thread wrote a moment ago -- the constraint that lets the pass live without a barrier, and the
+        // reason it must not be hoisted out of this loop.
+        if (t9_pending) {
+            ggml_cpu_t9_pass_in_chunk(params, dst, ir0_start, ir0_end, ir1_start, ir1_end);
+        }
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -3887,6 +4027,22 @@ static int ggml_cpu_t9_match(
     if (ggml_nelements(cgraph->nodes[node_n]) != ggml_nelements(mid)) {
         T9_NO("gemm output and view differ in element count");
     }
+    if (ggml_nelements(mid) <= 0 || ggml_nelements(add) <= 0) {
+        T9_NO("empty tensor");   // keeps the row arithmetic below free of division by zero
+    }
+    // The pass is keyed on the GEMM's own chunk ranges (columns of the MUL_MAT output), so the fast
+    // dimension must be shared, unresized, by all three tensors. Contiguity plus the equal element count
+    // above then makes the view's element order identical to the MUL_MAT's, which is what lets the pass
+    // read the MUL_MAT buffer directly with the view's row mapping.
+    if (mid->ne[0] != cgraph->nodes[node_n]->ne[0]) {
+        T9_NO("view does not preserve the MUL_MAT's fast dimension");
+    }
+    if (mid->ne[0] != add->ne[0] || other->ne[0] != add->ne[0]) {
+        T9_NO("fast dimension is broadcast");
+    }
+    if (!ggml_can_repeat(other, add)) {
+        T9_NO("other operand cannot be broadcast to the ADD's shape");
+    }
     // single-use checks last: they need the per-graph cache, which is expensive to build, so only a chain
     // that already looks like A1 pays for it.
     //
@@ -3917,13 +4073,63 @@ static int ggml_cpu_t9_match(
     }
 
     __atomic_fetch_add(&ggml_cpu_t9_hit, 1, __ATOMIC_RELAXED);
-    ggml_compute_forward_add_fused_epilogue(params, add, mid, other);
+
+    // The matmul must still run: A1 skips the free view and the ADD, NOT the GEMM. Running it HERE, at the
+    // anchor, is exactly what saves the ADD's barrier -- the previous version returned "skip 2" without ever
+    // computing the matmul, so the pass read the anchor's output buffer before anything had written it
+    // (A1-EPILOGUE-FUSION-STATUS.md 3.2). Publishing the match and calling into the GEMM on this same thread
+    // lets the pass ride along in the GEMM's own barrier interval, by whichever of the two routes that GEMM
+    // supports; see the block comment above ggml_cpu_t9_pending.
+    ggml_cpu_t9_pend.mm     = cgraph->nodes[node_n];
+    ggml_cpu_t9_pend.view   = mid;
+    ggml_cpu_t9_pend.add    = add;
+    ggml_cpu_t9_pend.other  = other;
+    ggml_cpu_t9_pend.s_ne1  = mid->ne[1];
+    ggml_cpu_t9_pend.s_ne2  = mid->ne[2];
+    ggml_cpu_t9_pend.s_ne3  = mid->ne[3];
+    ggml_cpu_t9_pend.nr_rows = mid->ne[1] * mid->ne[2] * mid->ne[3];
+    ggml_cpu_t9_pend.armed  = 1;
+    ggml_cpu_t9_pend.pass_ran = 0;
+
+    ggml_compute_forward_mul_mat(params, cgraph->nodes[node_n]);
+
+    const int pass_ran = ggml_cpu_t9_pend.pass_ran;
+    const int chunk_path = ggml_cpu_t9_pend.diag[3] == 0;
+    ggml_cpu_t9_pend.armed  = 0;
+
+    // No path was able to carry the pass: the GEMM left through an early-out whose kernel published no
+    // barrier after its writes (see the handshake in llamafile/sgemm.cpp), so the ADD has not been written.
+    // Fall back to the stock chain -- the node loop recomputes this same matmul identically and then runs
+    // the view and the ADD. Refusing here is the whole point of the handshake: it turns "this kernel's
+    // internals changed" into a lost optimisation instead of a silent race.
+    if (!pass_ran) {
+        __atomic_fetch_add(&ggml_cpu_t9_path_fallback, 1, __ATOMIC_RELAXED);
+        {
+            static int n_rep = 0;
+            if (getenv("KATAGO_CPU_T9_TRACE") != NULL && params->ith == 0 && n_rep < 8) {
+                n_rep++;
+                const int * d = ggml_cpu_t9_pend.diag;
+                fprintf(stderr, "[t9-path] node=%d FALLBACK exit=%d src0=%s src1=%s vec_dot=%s\n",
+                        node_n, d[3],
+                        ggml_type_name((enum ggml_type) d[0]),
+                        ggml_type_name((enum ggml_type) d[1]),
+                        ggml_type_name((enum ggml_type) d[2]));
+            }
+        }
+        #undef T9_NO
+        return 0;
+    }
+
+    if (chunk_path) {
+        __atomic_fetch_add(&ggml_cpu_t9_path_chunk, 1, __ATOMIC_RELAXED);
+    } else {
+        __atomic_fetch_add(&ggml_cpu_t9_path_early, 1, __ATOMIC_RELAXED);
+    }
     __atomic_fetch_add(&ggml_cpu_t9_execute, 1, __ATOMIC_RELAXED);
 
-    // KATAGO_CPU_T9_NOSKIP=1 runs the fused kernel but still lets the stock chain run afterwards. Used
-    // together with the (generic) shadow harness to diff the two paths INSIDE one run: the stock ADD will
-    // call ggml_cpu_rope_shadow_cmp against whatever the fused kernel published. This is the same
-    // independent-reference instrument that settled the RoPE question, reused as intended.
+    // KATAGO_CPU_T9_NOSKIP=1 lets the stock chain run afterwards as well, so the fused result and the stock
+    // ADD can be diffed inside one run, on identical inputs. Note it recomputes the GEMM (the anchor now
+    // always computes it); the second run is redundant but harmless, and this mode is diagnostic only.
     {
         static int t9_noskip = -1;
         if (t9_noskip < 0) {
@@ -3950,92 +4156,81 @@ t9_done:
     return 0;
 }
 
-// A1 kernel: dst = mid + other, where `mid` is the free view over the MUL_MAT output and may be BROADCAST
-// to the ADD's shape (measured: MM[384,3] -> RESHAPE[384,1,3,1] -> ADD[384,361,3,1]).
+// A1 pass: for each MUL_MAT row r in [r_begin, r_end), write every ADD element that reads that row, over the
+// fast-dimension range [c_begin, c_end). `mm` is the anchor MUL_MAT and is read directly instead of through
+// the view: the matcher guarantees the view preserves the fast dimension and has the same element count, so
+// the two share one flat layout, and `mm` is the buffer whose writes the caller has made visible.
 //
-// Generic shadow publisher, defined in ops.cpp. Used to diff the fused result against the stock ADD inside
-// one run (KATAGO_CPU_ROPE_SHADOW=1 + KATAGO_CPU_T9_NOSKIP=1). The instrument is method-level so that any
-// "skip nodes" fusion can be validated with the same reference.
-void ggml_cpu_shadow_publish(const float * src, int64_t ne0, int64_t ne1, const void * key);
+// The caller decides the partition. In the chunk loop it passes the GEMM's own ir0/ir1 ranges, so a thread
+// only ever reads rows it just wrote. After a llamafile sgemm it passes a plain row split, which is safe
+// because that sgemm ended with a barrier ordered after all of its writes.
 //
-// The reduction and the buffer mapping are taken from the stock paths, deliberately:
-//   * the row->(i1,i2,i3) decomposition and the `%` reductions are apply_binary_op's broadcast rule, which
-//     is what makes this equal the stock ADD;
-//   * `mid` is contiguous, so its element order equals the MUL_MAT buffer's element order; reading it with
-//     the same (i1 % ne1, i2 % ne2, i3 % ne3) map therefore lands on exactly the element the stock MUL_MAT's
-//     dst would have held. No gather is involved here (unlike the RoPE chain), which is why this kernel does
-//     not carry that failure mode.
-void ggml_compute_forward_add_fused_epilogue(
+// Both the decomposition and the row mapping come from the stock paths on purpose:
+//   * the (i1,i2,i3) decomposition of the ADD's rows and the `%` reductions are apply_binary_op's broadcast
+//     rule, which is what makes the result equal the stock ADD;
+//   * the view's row index is the same `%` reduction over the view's own ne.
+// No gather is involved here (unlike the RoPE chain), which is why this pass does not carry that failure
+// mode.
+static void ggml_cpu_t9_anchor_epilogue(
         const struct ggml_compute_params * params,
-        struct ggml_tensor * dst,
-        const struct ggml_tensor * mid,
-        const struct ggml_tensor * other) {
+        const struct ggml_tensor * mm,
+        int64_t r_begin, int64_t r_end,
+        int64_t c_begin, int64_t c_end) {
 
-    GGML_ASSERT(dst != NULL && mid != NULL && other != NULL);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 && mid->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_can_repeat(mid, dst));
-    GGML_ASSERT(ggml_can_repeat(other, dst));   // same broadcast rule the stock ADD path asserts
-    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(mid) && ggml_is_contiguous(other));
+    GGML_UNUSED(params);
 
-    const int64_t ne0 = dst->ne[0];
-    const int64_t ne1 = dst->ne[1];
-    const int64_t ne2 = dst->ne[2];
-    const int64_t ne3 = dst->ne[3];
+    const struct ggml_tensor * add   = ggml_cpu_t9_pend.add;
+    const struct ggml_tensor * other = ggml_cpu_t9_pend.other;
 
-    const int64_t s_ne0 = mid->ne[0],   s_ne1 = mid->ne[1],   s_ne2 = mid->ne[2],   s_ne3 = mid->ne[3];
+    const int64_t ne0 = add->ne[0];              // == mm->ne[0], enforced by the matcher
+    const int64_t a_ne1 = add->ne[1], a_ne2 = add->ne[2], a_ne3 = add->ne[3];
+    const int64_t s_ne0 = mm->ne[0];
+    const int64_t s_ne1 = ggml_cpu_t9_pend.s_ne1;
+    const int64_t s_ne2 = ggml_cpu_t9_pend.s_ne2;
+    const int64_t s_ne3 = ggml_cpu_t9_pend.s_ne3;
     const int64_t o_ne0 = other->ne[0], o_ne1 = other->ne[1], o_ne2 = other->ne[2], o_ne3 = other->ne[3];
 
-    // The fast dimension is never broadcast by the stock path (it asserts ne0 == ne00 there); require the
-    // same here so the per-row loop below can walk the row linearly.
-    GGML_ASSERT(s_ne0 == ne0 && o_ne0 == ne0);
+    if (r_begin >= r_end || c_begin >= c_end) {
+        return;
+    }
 
-    const int64_t nr = ne1*ne2*ne3;
+    // Rows are walked in the GEMM's own row space and each such row is fanned out to the ADD rows that
+    // alias it. Walking from the GEMM side rather than scanning every ADD row keeps the work proportional
+    // to what is actually written: a scan would cost O(nr_add) per call even when a range maps to a
+    // handful of rows. The fan-out loop is the general `%` reduction read backwards: i_k runs over the ADD
+    // indices congruent to the view's index v_k modulo the view's ne_k, with a step of 1 whenever that
+    // dimension is broadcast (s_ne_k == 1, and then v_k == 0).
+    const int64_t s_row   = s_ne1 * s_ne2;         // rows per plane of the view
+    for (int64_t r = r_begin; r < r_end; ++r) {
+        const int64_t v3  = r / s_row;
+        const int64_t rem = r - v3 * s_row;
+        const int64_t v2  = rem / s_ne1;
+        const int64_t v1  = rem - v2 * s_ne1;
 
-    const int ith = params->ith;
-    const int nth = params->nth;
-    const int64_t dr  = (nr + nth - 1)/nth;
-    const int64_t ir0 = dr*ith;
-    const int64_t ir1 = MIN(ir0 + dr, nr);
+        const float * s = (const float *) ((const char *) mm->data + r * s_ne0 * sizeof(float));
 
-    for (int64_t ir = ir0; ir < ir1; ++ir) {
-        const int64_t i3 = ir/(ne2*ne1);
-        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
-        const int64_t i1 = (ir - i3*ne2*ne1 - i2*ne1);
+        for (int64_t i3 = v3; i3 < a_ne3; i3 += s_ne3) {
+            const int64_t o3 = i3 % o_ne3;
+            for (int64_t i2 = v2; i2 < a_ne2; i2 += s_ne2) {
+                const int64_t o2 = i2 % o_ne2;
+                for (int64_t i1 = v1; i1 < a_ne1; i1 += s_ne1) {
+                    const int64_t o1    = i1 % o_ne1;
+                    const int64_t o_row = o1 + o_ne1 * o2 + o_ne1 * o_ne2 * o3;
+                    const float * o     = (const float *) ((const char *) other->data + o_row * o_ne0 * sizeof(float));
+                    const int64_t ir    = i1 + a_ne1 * (i2 + a_ne2 * i3);
+                    float * d           = (float *) ((char *) add->data + ir * ne0 * sizeof(float));
 
-        // Row offsets. Derived from the measured chain, not from a rule of thumb:
-        //   stock apply_binary_op uses src0_ptr = base + (i03%nb03) + (i02%nb02) + (i01%nb01) where those
-        //   nb/ne come from SRC0's own shape. Here the fused "src0" is the free view, whose ne is
-        //   [384,1,3,1] (measured) -- so the row offset is (i2 % 3) rows of the view, i.e. reducing by the
-        //   VIEW's ne, and both operands reduce the same way.
-        // The first version reduced by the view's ne but then composed the offset with the wrong stride
-        // factors, which read the wrong rows.
-        const int64_t v1 = i1 % s_ne1, v2 = i2 % s_ne2, v3 = i3 % s_ne3;
-        const int64_t o1 = i1 % o_ne1, o2 = i2 % o_ne2, o3 = i3 % o_ne3;
-
-        const int64_t s_row = v1 + s_ne1*v2 + s_ne1*s_ne2*v3;
-        const int64_t o_row = o1 + o_ne1*o2 + o_ne1*o_ne2*o3;
-
-        const float * s = (const float *) ((const char *) mid->data + s_row*s_ne0*sizeof(float));
-        const float * o = (const float *) ((const char *) other->data + o_row*o_ne0*sizeof(float));
-        float * d = (float *) ((char *) dst->data + ir*ne0*sizeof(float));
-
-        for (int64_t c = 0; c < ne0; ++c) {
-            d[c] = s[c] + o[c];
+                    for (int64_t c = c_begin; c < c_end; ++c) {
+                        d[c] = s[c] + o[c];
+                    }
+                }
+            }
         }
     }
 
-    // Publish for the generic shadow harness (only active under KATAGO_CPU_ROPE_SHADOW=1), so the stock ADD
-    // can diff against this result in the same run. Thread 0 only owns the scratch buffer.
-    if (params->ith == 0 && ne1*ne2*ne3 > 0) {
-        const size_t need = (size_t) ne0*(size_t)(ne1*ne2*ne3);
-        float * tmp = (float *) malloc(need * sizeof(float));
-        if (tmp != NULL) {
-            memcpy(tmp, dst->data, need * sizeof(float));
-            ggml_cpu_shadow_publish(tmp, ne0, ne1*ne2*ne3, (const void *) dst);
-            free(tmp);
-        }
-    }
+    __atomic_fetch_add(&ggml_cpu_t9_epilogue_chunks, 1, __ATOMIC_RELAXED);
 }
+
 
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
