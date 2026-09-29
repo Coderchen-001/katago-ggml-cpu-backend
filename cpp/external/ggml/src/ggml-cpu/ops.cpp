@@ -4239,6 +4239,34 @@ static void ggml_compute_forward_rope_fused_f32(
         *(float *) out = s;
     }
 
+    // POSITIVE CONTROL for the harness (LESSONS-AND-GATES G-6): print the index table's actual contents and
+    // the i01 the kernel resolves for the first few (i10, i11). Two purposes:
+    //   1. it shows whether the index table really is the adjacent-pair swap sigma(d)=d^1;
+    //   2. it is a positive control -- if swapping the two index decompositions (the one allowed fix) does
+    //      NOT change this line, then that fix did not change the read mapping and the harness result is
+    //      suspect. An instrument must be shown to be SENSITIVE, not merely present.
+    if (getenv("KATAGO_CPU_ROPE_IDXDUMP") != NULL && ith == 0) {
+        static int n_idx = 0;
+        if (n_idx < 1) {
+            n_idx++;
+            fprintf(stderr, "[rope-idx] idx[0..7] =");
+            for (int k = 0; k < 8; k++) {
+                fprintf(stderr, " %d", *(const int32_t *) ((const char *) idx->data + k*nb_i0));
+            }
+            fprintf(stderr, "   (idx.ne0=%lld nb0=%lld)\n",
+                    (long long) idx->ne[0], (long long) idx->nb[0]);
+            fprintf(stderr, "[rope-idx] resolved i01 for the first elements: i10 fast / i11 slow =>\n");
+            for (int64_t k = 0; k < 8; k++) {
+                const int64_t i10 = k % nc;
+                const int64_t i11 = k / nc;
+                const int32_t v_fast = *(const int32_t *) ((const char *) idx->data + i10*nb_i0);
+                const int32_t v_slow = *(const int32_t *) ((const char *) idx->data + i11*nb_i0);
+                fprintf(stderr, "[rope-idx]   k=%lld i10=%lld i11=%lld  idx[i10]=%d  idx[i11]=%d\n",
+                        (long long) k, (long long) i10, (long long) i11, (int) v_fast, (int) v_slow);
+            }
+        }
+    }
+
     // SHADOW: publish what this kernel computed, in LOGICAL (i10 fast, i11 slow) order, so the stock ADD
     // can diff against its own buffer. See the block comment above for why this has to be done at all.
     if (ggml_cpu_rope_shadow_on() && ith == 0) {
