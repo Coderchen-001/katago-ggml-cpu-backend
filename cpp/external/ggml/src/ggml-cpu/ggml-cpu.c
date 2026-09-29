@@ -585,6 +585,30 @@ static uint64_t ggml_cpu_n_spin_iters      = 0;
 
 static void ggml_cpu_barrier_stats_report(void);
 
+// Cap for the exponential backoff in the barrier wait, in cpu_relax units. 0 = disabled (stock spin), which
+// is also the DEFAULT and the best setting. Resolved once from KATAGO_CPU_BARRIER_BACKOFF so one binary can be
+// A/B'd. Kept small on purpose: the backoff only delays the NEXT poll, so the worst case it adds to a
+// completed barrier is one cap's worth of relax instructions, against waits measured at ~2.3 us.
+//
+// MEASURED NEGATIVE RESULT (2026-09-29) -- do not retry this expecting a win. Interleaved A/B, 7 rounds,
+// T=8, batch 6, median ms/batch: off 88.36, cap 64 88.60 (+0.27%), cap 256 89.11 (+0.85%), cap 1024 90.38
+// (+2.29%), monotone and non-crossing. So touching the shared cache line less often does not help: the wait
+// is genuine waiting for the slowest partner, not removable polling contention. The same reasoning retires
+// the more invasive "one flag per thread" barrier -- if the contention were on the critical path, backing off
+// would have helped. Only removing nodes (i.e. fewer barriers) actually reduces this cost.
+static int ggml_cpu_barrier_backoff_env = -1;
+static int ggml_cpu_barrier_backoff     = 0;
+
+static void ggml_cpu_barrier_backoff_init(void) {
+    if (ggml_cpu_barrier_backoff_env < 0) {
+        const char * e = getenv("KATAGO_CPU_BARRIER_BACKOFF");
+        ggml_cpu_barrier_backoff_env = 1;
+        ggml_cpu_barrier_backoff     = (e != NULL) ? atoi(e) : 0;
+        if (ggml_cpu_barrier_backoff < 0)   ggml_cpu_barrier_backoff = 0;
+        if (ggml_cpu_barrier_backoff > 4096) ggml_cpu_barrier_backoff = 4096;
+    }
+}
+
 // Both counters are THREAD-LOCAL while the barrier runs and folded into the shared totals once per barrier.
 // This matters more than it looks. The first version added to a global atomic on every barrier entry and the
 // build ran 60x slower than the same build without the flag -- 5258 ms/batch against 88 ms/batch -- with the
@@ -658,6 +682,12 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     }
 
     // wait for other threads
+    // Backoff, opt-in via KATAGO_CPU_BARRIER_BACKOFF (default off = stock behaviour). The wait polls
+    // n_barrier_passed, and all T-1 waiting threads poll the SAME cache line, so every check pulls that line
+    // across the interconnect -- measured at ~2.3 us per wait, which is far more than the ~800 relax
+    // iterations would cost locally. Backing off means touching the line less often. It cannot change the
+    // result: the loop still exits only when the flag actually changes, and the backoff is capped at a few
+    // hundred cycles so it cannot add meaningful latency when the last thread arrives.
     if (stats) {
         ggml_cpu_tls_waits++;
         ggml_cpu_tls_spin_iters = 0;
@@ -669,6 +699,16 @@ void ggml_barrier(struct ggml_threadpool * tp) {
         __atomic_fetch_add(&ggml_cpu_n_barriers,   ggml_cpu_tls_waits,      __ATOMIC_RELAXED);
         __atomic_fetch_add(&ggml_cpu_n_spin_iters, ggml_cpu_tls_spin_iters, __ATOMIC_RELAXED);
         ggml_cpu_tls_waits = 0;
+    } else if (ggml_cpu_barrier_backoff) {
+        int backoff = 4;
+        while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
+            for (int i = 0; i < backoff; i++) {
+                ggml_thread_cpu_relax();
+            }
+            if (backoff < ggml_cpu_barrier_backoff) {
+                backoff += backoff;
+            }
+        }
     } else {
         while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
             ggml_thread_cpu_relax();
@@ -3168,6 +3208,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     // Resolve the diagnostic switch once, before the node loop, so the per-node counters below read a settled
     // value rather than lazily initialising it mid-loop.
     (void) ggml_cpu_barrier_stats_enabled();
+    ggml_cpu_barrier_backoff_init();
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
