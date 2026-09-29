@@ -3552,6 +3552,9 @@ static int ggml_cpu_rope_match(
 
     ggml_cpu_rope_uses * cache = ggml_cpu_rope_use_counts(cgraph);
 
+    // KATAGO_CPU_ROPE_ADDR=1: the address dump lives in the four-node branch below, where a/gr/b/ad are in
+    // scope. It must run before the guards so it also reports the case the guard refuses.
+
     // --- three-node form: {MUL, MUL, ADD}. This is what N59's paired-read shape leaves behind once it has
     // removed the gather, and having it here is what keeps that change from becoming a silent regression
     // in which the fusion simply stops firing (gate 1's barrier ledger would catch it, but late). ---
@@ -3612,9 +3615,49 @@ static int ggml_cpu_rope_match(
     // Vulkan sets op_srcs_fused_elementwise to false for exactly this reason, so its overlap check refuses
     // the alias group; the CPU loop has no such stage, so the refusal has to happen here.
     //
+    // KATAGO_CPU_ROPE_ADDR=1: dump every address the fused kernel would touch, for the first site. This
+    // sits BEFORE the guard on purpose -- the guard refuses on this graph, so a dump placed after it can
+    // never be read. The READ set is what the kernel actually loads (x, tabA, tabB, idx); the ELIDED set
+    // is the three intermediate results it does NOT load, which is how a benign alias is told from a
+    // harmful one.
+    {
+        const char * ad_env = getenv("KATAGO_CPU_ROPE_ADDR");
+        static int n_addr = 0;
+        if (ad_env != NULL && ad_env[0] == '1' && params->ith == 0 && n_addr < 1) {
+            n_addr++;
+            fprintf(stderr, "[rope-addr] node=%d nbytes(ad)=%lld nbytes(x)=%lld\n",
+                    node_n, (long long) ggml_nbytes(ad), (long long) ggml_nbytes(a->src[0]));
+            fprintf(stderr, "[rope-addr]   WRITE  dst(ADD) =%p\n", (const void *) ad->data);
+            fprintf(stderr, "[rope-addr]   READ   x        =%p\n", (const void *) a->src[0]->data);
+            fprintf(stderr, "[rope-addr]   READ   tabA     =%p\n", (const void *) a->src[1]->data);
+            fprintf(stderr, "[rope-addr]   READ   tabB     =%p\n", (const void *) b->src[1]->data);
+            fprintf(stderr, "[rope-addr]   READ   idx      =%p\n", (const void *) gr->src[1]->data);
+            fprintf(stderr, "[rope-addr]   ELIDED dst(MUL0)=%p\n", (const void *) a->data);
+            fprintf(stderr, "[rope-addr]   ELIDED dst(GR)  =%p\n", (const void *) gr->data);
+            fprintf(stderr, "[rope-addr]   ELIDED dst(MUL1)=%p\n", (const void *) b->data);
+            fprintf(stderr, "[rope-addr]   OVERLAP x=%d tabA=%d tabB=%d idx=%d | MUL0=%d GR=%d MUL1=%d\n",
+                    ggml_cpu_tensors_overlap(ad, a->src[0]), ggml_cpu_tensors_overlap(ad, a->src[1]),
+                    ggml_cpu_tensors_overlap(ad, b->src[1]), ggml_cpu_tensors_overlap(ad, gr->src[1]),
+                    ggml_cpu_tensors_overlap(ad, a), ggml_cpu_tensors_overlap(ad, gr),
+                    ggml_cpu_tensors_overlap(ad, b));
+        }
+    }
+
     // Check every buffer the kernel actually READS. Checking only the chain sources is not enough -- the
     // first version of this guard did that, found nothing, and let the fusion through.
-    if (ggml_cpu_tensors_overlap(ad, a)             ||   // read via b->src[0] == gr == hash of a
+    //
+    // KATAGO_CPU_ROPE_NOA=1 disables ONLY the `ad vs a` term. That term is the one that fires on this graph
+    // (a=1, everything else 0) and it is the one whose harm is arguable: the kernel recomputes t1 itself and
+    // never loads dst(MUL#0), so aliasing it looks benign. This switch is the discriminator between
+    // "the guard is protecting something real" and "the guard is rejecting a benign alias and the failure
+    // has another cause" -- run it, read the ledger and the output hash, and do not argue.
+    static int no_a = -1;
+    if (no_a < 0) {
+        no_a = (getenv("KATAGO_CPU_ROPE_NOA") != NULL) ? 1 : 0;
+    }
+    const int a_alias = no_a ? 0 : ggml_cpu_tensors_overlap(ad, a);
+
+    if (a_alias                                   ||
         ggml_cpu_tensors_overlap(ad, gr)            ||
         ggml_cpu_tensors_overlap(ad, a->src[0])     ||
         ggml_cpu_tensors_overlap(ad, a->src[1])     ||
@@ -3629,6 +3672,33 @@ static int ggml_cpu_rope_match(
                     ggml_cpu_tensors_overlap(ad, b->src[1]), ggml_cpu_tensors_overlap(ad, gr->src[1]));
         }
         return 0;
+    }
+
+    // KATAGO_CPU_ROPE_ADDR=1: dump every address the fused kernel touches, for ONE site, so the aliasing
+    // question is answered from data instead of argued. The READ set is what the kernel actually loads
+    // (x, tabA, tabB, idx); the ELIDED set is the three intermediate results it does NOT load, which is
+    // how a benign alias is told apart from a harmful one.
+    {
+        const char * ad_env = getenv("KATAGO_CPU_ROPE_ADDR");
+        static int n_addr = 0;
+        if (ad_env != NULL && ad_env[0] == '1' && params->ith == 0 && n_addr < 1) {
+            n_addr++;
+            fprintf(stderr, "[rope-addr] node=%d  nbytes(ad)=%lld\n",
+                    node_n, (long long) ggml_nbytes(ad));
+            fprintf(stderr, "[rope-addr]   WRITE dst(ADD)  =%p\n", (const void *) ad->data);
+            fprintf(stderr, "[rope-addr]   READ  x         =%p\n", (const void *) a->src[0]->data);
+            fprintf(stderr, "[rope-addr]   READ  tabA      =%p\n", (const void *) a->src[1]->data);
+            fprintf(stderr, "[rope-addr]   READ  tabB      =%p\n", (const void *) b->src[1]->data);
+            fprintf(stderr, "[rope-addr]   READ  idx       =%p\n", (const void *) gr->src[1]->data);
+            fprintf(stderr, "[rope-addr]   ELIDED dst(MUL0)=%p\n", (const void *) a->data);
+            fprintf(stderr, "[rope-addr]   ELIDED dst(GR)  =%p\n", (const void *) gr->data);
+            fprintf(stderr, "[rope-addr]   ELIDED dst(MUL1)=%p\n", (const void *) b->data);
+            fprintf(stderr, "[rope-addr]   OVERLAP x=%d tabA=%d tabB=%d idx=%d | MUL0=%d GR=%d MUL1=%d\n",
+                    ggml_cpu_tensors_overlap(ad, a->src[0]), ggml_cpu_tensors_overlap(ad, a->src[1]),
+                    ggml_cpu_tensors_overlap(ad, b->src[1]), ggml_cpu_tensors_overlap(ad, gr->src[1]),
+                    ggml_cpu_tensors_overlap(ad, a), ggml_cpu_tensors_overlap(ad, gr),
+                    ggml_cpu_tensors_overlap(ad, b));
+        }
     }
 
     const int only = ggml_cpu_rope_only_node();
