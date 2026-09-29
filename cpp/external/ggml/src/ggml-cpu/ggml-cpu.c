@@ -3627,6 +3627,17 @@ static int ggml_cpu_rope_match(
             n_addr++;
             fprintf(stderr, "[rope-addr] node=%d nbytes(ad)=%lld nbytes(x)=%lld\n",
                     node_n, (long long) ggml_nbytes(ad), (long long) ggml_nbytes(a->src[0]));
+            // Strides decide the layout question: if x has ne0 = D (the head dim) with nb0 == 4, then
+            // GGML_OP_ROPE (which asserts n_dims <= ne0 and only rotates an ne0 prefix) can be used on a
+            // RELABELLED VIEW with no data movement at all; if ne0 is S*N instead, it cannot.
+            fprintf(stderr, "[rope-addr]   x.ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld]\n",
+                    (long long) a->src[0]->ne[0], (long long) a->src[0]->ne[1],
+                    (long long) a->src[0]->ne[2], (long long) a->src[0]->ne[3],
+                    (long long) a->src[0]->nb[0], (long long) a->src[0]->nb[1],
+                    (long long) a->src[0]->nb[2], (long long) a->src[0]->nb[3]);
+            fprintf(stderr, "[rope-addr]   idx.ne=[%lld,%lld] tabA.ne=[%lld,%lld]\n",
+                    (long long) gr->src[1]->ne[0], (long long) gr->src[1]->ne[1],
+                    (long long) a->src[1]->ne[0], (long long) a->src[1]->ne[1]);
             fprintf(stderr, "[rope-addr]   WRITE  dst(ADD) =%p\n", (const void *) ad->data);
             fprintf(stderr, "[rope-addr]   READ   x        =%p\n", (const void *) a->src[0]->data);
             fprintf(stderr, "[rope-addr]   READ   tabA     =%p\n", (const void *) a->src[1]->data);

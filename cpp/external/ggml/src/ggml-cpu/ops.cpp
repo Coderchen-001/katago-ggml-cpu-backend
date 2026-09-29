@@ -3980,6 +3980,26 @@ void (*ggml_cpu_rope_dbg_store)(uint64_t h) = NULL;
 int  (*ggml_cpu_rope_dbg_check)(uint64_t h) = NULL;
 }
 
+// ⛔ STATUS: this kernel has NEVER produced a correct result in any variant tried, and it is therefore
+// NOT validated. It is default-off (the caller is gated on KATAGO_CPU_ROPE_FUSE) and must stay that way.
+//
+// What was ruled OUT, by measurement rather than argument (see ROPE-FUSION-OUTCOME.md):
+//   * buffer aliasing            -- NOALLOC=1 (every tensor in its own buffer) reproduces the wrong output
+//                                   bit-for-bit, so it is neither the alias nor ggml_gallocr;
+//   * data race                  -- wrong at one thread, deterministic across runs;
+//   * the predicate/matcher      -- matches 40/40 sites and the shape checks hold;
+//   * the FMA/rounding contract  -- explicit-rounding intrinsics plus volatile intermediates.
+//
+// What was FOUND wrong and FIXED (but the result was still wrong afterwards, so it was not the whole
+// story): the gather index convention. get_rows on a [ne0, ne1] operand with nr == ne1 selects along the
+// SLOW dimension (dst[:, j] = src[:, idx[j]]); the first version read the index with i10 and applied i01
+// to nb1, i.e. exactly the transpose of that. Measured layout: x.ne=[6498,32] nb=[4,25992], idx.ne=[32,1].
+//
+// METHODOLOGICAL LESSON, and the reason this took so long: a per-element audit that recomputes with the
+// SAME index interpretation CANNOT detect a wrong index interpretation -- it agreed with the kernel at
+// every element while the network output was wrong. Independent evidence requires a second execution path
+// in the same run (or a shadow buffer), never a recomputation that shares the indexing.
+//
 // Fused {MUL, GET_ROWS|MUL, MUL, ADD} diamond -- the RoPE rotation pair.
 //
 //   dst_add = (x * tab_a) + (get_rows(x, idx) * tab_b)
@@ -4033,19 +4053,18 @@ static void ggml_compute_forward_rope_fused_f32(
     GGML_ASSERT(ggml_is_contiguous(tab_b));
     GGML_ASSERT(ggml_is_contiguous(dst_add));
 
-    // Gather layout, mirrored verbatim from ggml_compute_forward_get_rows_f32 (ops.cpp:5031).
-    const int64_t nc   = dst_get_rows->ne[0];
-    const int64_t ne10 = dst_get_rows->src[1]->ne[0];
-    const int64_t ne11 = dst_get_rows->src[1]->ne[1];
+    // Operand layout. Measured on the production shape: x.ne = [6498, 32] with nb = [4, 25992], and the
+    // index table is idx.ne = [32, 1]. So the FAST dimension (ne0 = nc = 6498) is walked flat and the SLOW
+    // dimension (ne1 = 32) is the one the gather permutes -- that is what get_rows does with nr == ne1.
+    const int64_t nc   = src_a->ne[0];
+    const int64_t nr   = src_a->ne[1];
     const int64_t nb10 = dst_get_rows->src[1]->nb[0];
-    const int64_t nb11 = dst_get_rows->src[1]->nb[1];
-    const int64_t nb12 = dst_get_rows->src[1]->nb[2];
 
     const int64_t ne_src1 = src_a->ne[1];
     const int64_t nb_src0 = src_a->nb[0];
     const int64_t nb_src1 = src_a->nb[1];
-    const int64_t nb_src2 = src_a->nb[2];
-    const int64_t nb_src3 = src_a->nb[3];
+    const int64_t nb_a1   = tab_a->nb[1];
+    const int64_t nb_b1   = tab_b->nb[1];
 
     // Each operand's innermost stride is used for its own addressing, exactly as the four stock kernels do:
     // apply_binary_op asserts nb00 == sizeof(src0_t) on the tensor it is looking at, and the gather reads
@@ -4054,8 +4073,8 @@ static void ggml_compute_forward_rope_fused_f32(
     const int64_t nb_a0 = tab_a->nb[0];
     const int64_t nb_b0 = tab_b->nb[0];
     const int64_t nb_o0 = dst_add->nb[0];
-
-    const int64_t nr = ggml_nelements(idx);
+    const int64_t nb_o1 = dst_add->nb[1];
+    const int64_t nb_i0 = idx->nb[0];
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -4070,63 +4089,41 @@ static void ggml_compute_forward_rope_fused_f32(
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
     for (int64_t i = ir0; i < ir1; ++i) {
-        // c-order decomposition, copied from ggml_compute_forward_get_rows_f32. Note that the write
-        // offset is symmetric in (i10, i11) but the *read* offsets are not, so this must not be
-        // "simplified".
-        const int64_t i12 = i/(ne11*ne10);
-        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
-        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+        // 🔴 INDEX CONVENTION. get_rows on a 2D [ne0, ne1] operand with a 1D index tensor of length
+        // nr == ne1 selects along ne1, the SLOW dimension:  dst[:, j] = src[:, idx[j]].
+        // Measured layout here: x.ne=[6498,32] nb=[4,25992] and idx.ne=[32,1], so
+        //     i11 (slow, 32 wide)  is the index position
+        //     i10 (fast, 6498 wide) is untouched by the permutation
+        // The first version of this kernel had it the other way round -- it read idx at i10 (which walks off
+        // the end of a 32-element table) and put i01 on nb1 (selecting in the 6498-wide fast dim). Those two
+        // mistakes cancelled in the per-element audit, because the audit re-derives the same convention;
+        // only an independent second execution path exposes it. Hence the assertion.
+        GGML_ASSERT(nr <= nc && "get_rows here selects along the slow dimension, so the index tensor must "
+                                "not be longer than the fast dimension");
 
-        const int64_t i01 = *(const int32_t *) ((const char *) idx->data + i10*nb10 + i11*nb11 + i12*nb12);
-        GGML_ASSERT(i01 >= 0 && i01 < ne_src1); // same semantics as the stock gather's assert
+        const int64_t i11 = i / nc;         // slow dimension == index position
+        const int64_t i10 = i % nc;         // fast dimension, unchanged by the permutation
 
-        const char * x_cont = (const char *) src_a->data + i11*nb_src2 + i12*nb_src3;
-        const char * gath   = (const char *) src_a->data + i01*nb_src1 + i11*nb_src2 + i12*nb_src3;
+        const int64_t i01 = *(const int32_t *) ((const char *) idx->data + i11*nb_i0);
+        GGML_ASSERT(i01 >= 0 && i01 < ne_src1);   // 0 <= idx[j] < ne1
 
-        const char * a_tab  = (const char *) tab_a->data + i11*nb_src2 + i12*nb_src3;
-        const char * b_tab  = (const char *) tab_b->data + i11*nb_src2 + i12*nb_src3;
-        char       * out    = (char       *) dst_add->data + i10*dst_add->nb[1] + i11*dst_add->nb[2] + i12*dst_add->nb[3];
+        const char * x_cont = (const char *) src_a->data + i10*nb_src0;
+        const char * gath   = (const char *) src_a->data + i01*nb_src1 + i10*nb_src0;
 
-        for (int64_t c = 0; c < nc; ++c) {
-            const float xv = *(const float *) (x_cont + c*nb_src0);
-            const float gv = *(const float *) (gath   + c*nb_src0);
-            const float av = *(const float *) (a_tab  + c*nb_a0);
-            const float bv = *(const float *) (b_tab  + c*nb_b0);
+        const char * a_tab  = (const char *) tab_a->data + i10*nb_src0 + i11*nb_a1;
+        const char * b_tab  = (const char *) tab_b->data + i10*nb_src0 + i11*nb_b1;
+        char       * out    = (char       *) dst_add->data + i10*dst_add->nb[0] + i11*dst_add->nb[1];
 
-            const volatile float t1 = GGML_ROPE_FUSED_RN_MUL(xv, av);
-            const volatile float t2 = GGML_ROPE_FUSED_RN_MUL(gv, bv);
-            const volatile float s  = GGML_ROPE_FUSED_RN_ADD(t1, t2);
+        const float xv = *(const float *) x_cont;
+        const float gv = *(const float *) gath;
+        const float av = *(const float *) a_tab;
+        const float bv = *(const float *) b_tab;
 
-            *(float *) (out + c*nb_o0) = s;
-        }
+        const volatile float t1 = GGML_ROPE_FUSED_RN_MUL(xv, av);
+        const volatile float t2 = GGML_ROPE_FUSED_RN_MUL(gv, bv);
+        const volatile float s  = GGML_ROPE_FUSED_RN_ADD(t1, t2);
 
-        // KATAGO_CPU_ROPE_AUDIT=1, thread 0: recompute every element the way the four stock kernels would
-        // address it (their own strides, their own index decomposition) and report any difference. This is
-        // what proved the kernel itself correct -- 0 mismatches across all 40 sites -- and so localised the
-        // remaining failure to the node-skipping, not the arithmetic. Kept because it is the instrument
-        // that has to run again if this fusion is ever re-enabled at the emission level.
-        {
-            static const char * audit = getenv("KATAGO_CPU_ROPE_AUDIT");
-            if (audit != NULL && audit[0] == '1' && ith == 0) {
-                for (int64_t c = 0; c < nc; ++c) {
-                    const float xv2 = *(const float *) ((const char *) src_a->data + i11*nb_src2 + i12*nb_src3 + c*nb_src0);
-                    const float gv2 = *(const float *) ((const char *) src_a->data + i01*nb_src1 + i11*nb_src2 + i12*nb_src3 + c*nb_src0);
-                    const float av2 = *(const float *) ((const char *) tab_a->data + i11*nb_src2 + i12*nb_src3 + c*nb_a0);
-                    const float bv2 = *(const float *) ((const char *) tab_b->data + i11*nb_src2 + i12*nb_src3 + c*nb_b0);
-                    const float want = GGML_ROPE_FUSED_RN_ADD(GGML_ROPE_FUSED_RN_MUL(xv2, av2), GGML_ROPE_FUSED_RN_MUL(gv2, bv2));
-                    const float got  = *(const float *) (out + c*nb_o0);
-                    if (want != got) {
-                        static int n_bad = 0;
-                        if (n_bad < 12) {
-                            n_bad++;
-                            fprintf(stderr, "[rope-audit] MISMATCH i=%lld c=%lld i10=%lld i11=%lld i01=%lld want=%.9g got=%.9g\n",
-                                    (long long) i, (long long) c, (long long) i10, (long long) i11, (long long) i01,
-                                    (double) want, (double) got);
-                        }
-                    }
-                }
-            }
-        }
+        *(float *) out = s;
     }
 
     if (rope_hash) {
