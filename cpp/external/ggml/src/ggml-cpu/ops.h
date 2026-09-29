@@ -53,6 +53,13 @@ void ggml_compute_forward_rope_fused(const struct ggml_compute_params * params,
         struct ggml_tensor * dst_mul_a,
         struct ggml_tensor * dst_mul_b,
         struct ggml_tensor * dst_get_rows);
+// A1: {MUL_MAT, <free view>, ADD} -- elementwise broadcast add of the free view (`mid`, which aliases the
+// MUL_MAT's output) and the other operand, written straight into the ADD's destination. Defined in
+// ggml-cpu.c next to the predicate that decides it, because that is where the fusion state lives.
+void ggml_compute_forward_add_fused_epilogue(const struct ggml_compute_params * params,
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * mid,
+        const struct ggml_tensor * other);
 void ggml_compute_forward_rms_norm_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_group_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_l2_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);

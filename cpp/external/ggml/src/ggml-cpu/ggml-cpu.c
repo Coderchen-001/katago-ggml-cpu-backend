@@ -630,6 +630,13 @@ static uint64_t ggml_cpu_n_nodes_nocomp  = 0;  // skipped by the COMPUTE flag te
 static uint64_t ggml_cpu_n_nodes_barr    = 0;  // reached the ggml_barrier call site
 static uint64_t ggml_cpu_n_nodes_compute = 0;  // reached ggml_compute_forward / the fusion path
 
+// A1 counters, declared up here so the teardown report can read them (the A1 code itself is much further
+// down). Kept as three SEPARATE counters on purpose: hit / refuse / execute. Conflating these cost this
+// project a whole debugging round once ("logged 40 hits when 1 site fused").
+static uint64_t ggml_cpu_t9_hit     = 0;
+static uint64_t ggml_cpu_t9_refuse  = 0;
+static uint64_t ggml_cpu_t9_execute = 0;
+
 static void ggml_cpu_barrier_stats_report(void) {
     if (!ggml_cpu_barrier_stats_on) {
         return;
@@ -643,6 +650,12 @@ static void ggml_cpu_barrier_stats_report(void) {
             (unsigned long long) ggml_cpu_n_nodes_nocomp,
             (unsigned long long) ggml_cpu_n_nodes_compute,
             (unsigned long long) ggml_cpu_n_nodes_barr);
+    // A1 counters, printed SEPARATELY on purpose: hit (predicate matched), refuse (matched then guarded),
+    // execute (kernel actually ran). Conflating these cost this project a whole debugging round once.
+    fprintf(stderr, "[t9-stats] hit=%llu refuse=%llu execute=%llu\n",
+            (unsigned long long) ggml_cpu_t9_hit,
+            (unsigned long long) ggml_cpu_t9_refuse,
+            (unsigned long long) ggml_cpu_t9_execute);
 }
 
 static bool ggml_cpu_barrier_stats_enabled(void) {
@@ -3790,6 +3803,240 @@ static int ggml_cpu_try_fuse_rope(
     return ggml_cpu_rope_match(cgraph, node_n, params);
 }
 
+// ---- A1: {MUL_MAT, <free view>, ADD} ------------------------------------------------------------//
+// Measured shapes on the production graph (56 sites), two forms:
+//     MUL_MAT[384,3]    -> RESHAPE[384,1,3,1]   -> ADD[384,361,3,1]   (broadcast along S)
+//     MUL_MAT[192,1083] -> RESHAPE[192,361,3,1] -> ADD[192,361,3,1]   (pure relabel)
+// The fusion skips the free view AND the ADD, so it removes ONE non-empty node per site (the ADD); the
+// view is already free. Barrier cost is proportional to node count (BARRIER-SPIN-QUANTIFIED.md), and the
+// denominator to quote is computed_nodes_per_walk (640), not nonempty_nodes (800).
+//
+// NOTE ON SCOPE: this is CPU-local and does NOT touch the shared judgement layer (ggml_can_fuse_ext in
+// ggml-impl.h). See-through is implemented here instead, so the upstream matcher is unchanged. Vulkan's
+// MUL_MAT_ADD is the ADJACENT form only (GV:20175), so this see-through is new on both backends.
+//
+// The three counters are deliberately separate from the first line of code: hit (predicate matched),
+// refuse (matched but rejected by a guard), executed (the kernel actually ran). This project has already
+// lost time to "logged 40 hits when 1 site fused".
+// The three A1 counters live near the other barrier counters at the top of this file.
+
+static int ggml_cpu_t9_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("KATAGO_CPU_T9_FUSE");
+        on = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    return on;
+}
+
+// A free layout op: ggml_op_is_empty skips these, so they cost no barrier and can be stepped over.
+static int ggml_cpu_is_free_op(enum ggml_op op) {
+    return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+           op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE || op == GGML_OP_NONE;
+}
+
+// Returns the number of nodes to skip (2) on success. `node_n` indexes the MUL_MAT.
+static int ggml_cpu_t9_match(
+        const struct ggml_cgraph * cgraph,
+        const int node_n,
+        const struct ggml_compute_params * params) {
+
+    // Every rejection is counted and (under KATAGO_CPU_T9_TRACE=1) named. "hit=0" with no reason is exactly
+    // the failure mode this project keeps losing time to, so the reason is recorded at each return.
+    const char * why = NULL;
+    #define T9_NO(r) do { why = (r); __atomic_fetch_add(&ggml_cpu_t9_refuse, 1, __ATOMIC_RELAXED); \
+                          goto t9_done; } while (0)
+
+    if (cgraph->n_nodes - node_n < 3) {
+        T9_NO("not enough nodes");
+    }
+    if (cgraph->nodes[node_n]->op != GGML_OP_MUL_MAT) {
+        T9_NO("anchor is not MUL_MAT");
+    }
+
+    const struct ggml_tensor * mid = cgraph->nodes[node_n + 1];
+    const struct ggml_tensor * add = cgraph->nodes[node_n + 2];
+
+    if (!ggml_cpu_is_free_op(mid->op)) {
+        T9_NO("mid is not a free op");
+    }
+    if (add->op != GGML_OP_ADD) {
+        T9_NO("tail is not ADD");
+    }
+    if (mid->src[0] != cgraph->nodes[node_n]) {
+        T9_NO("free op does not consume the MUL_MAT");
+    }
+    const int mid_in_add = (add->src[0] == mid) ? 0 : ((add->src[1] == mid) ? 1 : -1);
+    if (mid_in_add < 0) {
+        T9_NO("ADD does not consume the free op");
+    }
+    if (!ggml_can_repeat(mid, add)) {
+        T9_NO("view cannot be broadcast to the ADD's shape");
+    }
+    if (add->type != GGML_TYPE_F32 || mid->type != GGML_TYPE_F32 ||
+        cgraph->nodes[node_n]->type != GGML_TYPE_F32) {
+        T9_NO("not all F32 (gemm/view/add)");
+    }
+    if (!ggml_is_contiguous(add) || !ggml_is_contiguous(mid) || !ggml_is_contiguous(cgraph->nodes[node_n])) {
+        T9_NO("not all contiguous");
+    }
+    const struct ggml_tensor * other = add->src[1 - mid_in_add];
+    if (other == NULL || other->type != GGML_TYPE_F32) {
+        T9_NO("other operand missing or not F32");
+    }
+    if (ggml_nelements(cgraph->nodes[node_n]) != ggml_nelements(mid)) {
+        T9_NO("gemm output and view differ in element count");
+    }
+    // single-use checks last: they need the per-graph cache, which is expensive to build, so only a chain
+    // that already looks like A1 pays for it.
+    //
+    // NOTE the middle node IS a view by construction, so ggml_cpu_rope_uses_once (which mirrors
+    // ggml_node_has_n_uses and rejects any view) cannot be used for it. That rejection is over-strict here:
+    // the fused kernel reads the buffer the view aliases, so an existing view_src does not matter -- what
+    // matters is that nothing else consumes the view. Hence the raw use-count check below.
+    {
+        const ggml_cpu_rope_uses * cache = ggml_cpu_rope_use_counts(cgraph);
+        if (!ggml_cpu_rope_uses_ok(cache, cgraph, node_n)) {
+            T9_NO("MUL_MAT has more than one use");
+        }
+        if (cgraph->nodes[node_n + 1]->op & GGML_TENSOR_FLAG_OUTPUT) {
+            T9_NO("view is a graph output");
+        }
+        {
+            int32_t n_uses = 0;
+            if (cgraph->use_counts != NULL) {
+                const size_t hp = ggml_hash_find(&cgraph->visited_hash_set, mid);
+                if (ggml_bitset_get(cgraph->visited_hash_set.used, hp)) {
+                    n_uses = cgraph->use_counts[hp];
+                }
+            }
+            if (n_uses != 1) {
+                T9_NO("view is used more than once");
+            }
+        }
+    }
+
+    __atomic_fetch_add(&ggml_cpu_t9_hit, 1, __ATOMIC_RELAXED);
+    ggml_compute_forward_add_fused_epilogue(params, add, mid, other);
+    __atomic_fetch_add(&ggml_cpu_t9_execute, 1, __ATOMIC_RELAXED);
+
+    // KATAGO_CPU_T9_NOSKIP=1 runs the fused kernel but still lets the stock chain run afterwards. Used
+    // together with the (generic) shadow harness to diff the two paths INSIDE one run: the stock ADD will
+    // call ggml_cpu_rope_shadow_cmp against whatever the fused kernel published. This is the same
+    // independent-reference instrument that settled the RoPE question, reused as intended.
+    {
+        static int t9_noskip = -1;
+        if (t9_noskip < 0) {
+            t9_noskip = (getenv("KATAGO_CPU_T9_NOSKIP") != NULL) ? 1 : 0;
+        }
+        if (t9_noskip) {
+            #undef T9_NO
+            return 0;
+        }
+    }
+
+    #undef T9_NO
+    return 2;
+
+t9_done:
+    #undef T9_NO
+    {
+        static int n_rep = 0;
+        if (getenv("KATAGO_CPU_T9_TRACE") != NULL && params->ith == 0 && n_rep < 24) {
+            n_rep++;
+            fprintf(stderr, "[t9-blk] node=%d rejected: %s\n", node_n, why ? why : "?");
+        }
+    }
+    return 0;
+}
+
+// A1 kernel: dst = mid + other, where `mid` is the free view over the MUL_MAT output and may be BROADCAST
+// to the ADD's shape (measured: MM[384,3] -> RESHAPE[384,1,3,1] -> ADD[384,361,3,1]).
+//
+// Generic shadow publisher, defined in ops.cpp. Used to diff the fused result against the stock ADD inside
+// one run (KATAGO_CPU_ROPE_SHADOW=1 + KATAGO_CPU_T9_NOSKIP=1). The instrument is method-level so that any
+// "skip nodes" fusion can be validated with the same reference.
+void ggml_cpu_shadow_publish(const float * src, int64_t ne0, int64_t ne1);
+//
+// The reduction and the buffer mapping are taken from the stock paths, deliberately:
+//   * the row->(i1,i2,i3) decomposition and the `%` reductions are apply_binary_op's broadcast rule, which
+//     is what makes this equal the stock ADD;
+//   * `mid` is contiguous, so its element order equals the MUL_MAT buffer's element order; reading it with
+//     the same (i1 % ne1, i2 % ne2, i3 % ne3) map therefore lands on exactly the element the stock MUL_MAT's
+//     dst would have held. No gather is involved here (unlike the RoPE chain), which is why this kernel does
+//     not carry that failure mode.
+void ggml_compute_forward_add_fused_epilogue(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * mid,
+        const struct ggml_tensor * other) {
+
+    GGML_ASSERT(dst != NULL && mid != NULL && other != NULL);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && mid->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_can_repeat(mid, dst));
+    GGML_ASSERT(ggml_can_repeat(other, dst));   // same broadcast rule the stock ADD path asserts
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(mid) && ggml_is_contiguous(other));
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne1 = dst->ne[1];
+    const int64_t ne2 = dst->ne[2];
+    const int64_t ne3 = dst->ne[3];
+
+    const int64_t s_ne0 = mid->ne[0],   s_ne1 = mid->ne[1],   s_ne2 = mid->ne[2],   s_ne3 = mid->ne[3];
+    const int64_t o_ne0 = other->ne[0], o_ne1 = other->ne[1], o_ne2 = other->ne[2], o_ne3 = other->ne[3];
+
+    // The fast dimension is never broadcast by the stock path (it asserts ne0 == ne00 there); require the
+    // same here so the per-row loop below can walk the row linearly.
+    GGML_ASSERT(s_ne0 == ne0 && o_ne0 == ne0);
+
+    const int64_t nr = ne1*ne2*ne3;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir/(ne2*ne1);
+        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
+        const int64_t i1 = (ir - i3*ne2*ne1 - i2*ne1);
+
+        // Row offsets. Derived from the measured chain, not from a rule of thumb:
+        //   stock apply_binary_op uses src0_ptr = base + (i03%nb03) + (i02%nb02) + (i01%nb01) where those
+        //   nb/ne come from SRC0's own shape. Here the fused "src0" is the free view, whose ne is
+        //   [384,1,3,1] (measured) -- so the row offset is (i2 % 3) rows of the view, i.e. reducing by the
+        //   VIEW's ne, and both operands reduce the same way.
+        // The first version reduced by the view's ne but then composed the offset with the wrong stride
+        // factors, which read the wrong rows.
+        const int64_t v1 = i1 % s_ne1, v2 = i2 % s_ne2, v3 = i3 % s_ne3;
+        const int64_t o1 = i1 % o_ne1, o2 = i2 % o_ne2, o3 = i3 % o_ne3;
+
+        const int64_t s_row = v1 + s_ne1*v2 + s_ne1*s_ne2*v3;
+        const int64_t o_row = o1 + o_ne1*o2 + o_ne1*o_ne2*o3;
+
+        const float * s = (const float *) ((const char *) mid->data + s_row*s_ne0*sizeof(float));
+        const float * o = (const float *) ((const char *) other->data + o_row*o_ne0*sizeof(float));
+        float * d = (float *) ((char *) dst->data + ir*ne0*sizeof(float));
+
+        for (int64_t c = 0; c < ne0; ++c) {
+            d[c] = s[c] + o[c];
+        }
+    }
+
+    // Publish for the generic shadow harness (only active under KATAGO_CPU_ROPE_SHADOW=1), so the stock ADD
+    // can diff against this result in the same run. Thread 0 only owns the scratch buffer.
+    if (params->ith == 0 && ne1*ne2*ne3 > 0) {
+        const size_t need = (size_t) ne0*(size_t)(ne1*ne2*ne3);
+        float * tmp = (float *) malloc(need * sizeof(float));
+        if (tmp != NULL) {
+            memcpy(tmp, dst->data, need * sizeof(float));
+            ggml_cpu_shadow_publish(tmp, ne0, ne1*ne2*ne3);
+            free(tmp);
+        }
+    }
+}
+
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
@@ -3843,6 +4090,15 @@ static int ggml_cpu_try_fuse_ops(
                 ggml_compute_forward_rms_norm_mul_fused(params, node, mul_node);
                 return 1;
             }
+        }
+    }
+
+    if (ggml_cpu_t9_enabled()) {
+        // A1: {MUL_MAT, <free view>, ADD} -- see the block comment above ggml_cpu_t9_match. Called for every
+        // node (not just MUL_MAT) so the refusal counters and the trace name the real reason.
+        const int t9 = ggml_cpu_t9_match(cgraph, node_n, params);
+        if (t9 > 0) {
+            return t9;
         }
     }
 
