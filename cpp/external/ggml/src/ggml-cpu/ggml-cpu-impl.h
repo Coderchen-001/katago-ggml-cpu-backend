@@ -531,6 +531,39 @@ static __m256 __lasx_xvreplfr2vr_s(const float val) {
 // TODO: move to ggml-threading
 void ggml_barrier(struct ggml_threadpool * tp);
 
+// --- barrier SITE tagging (diagnostic; only read when KATAGO_CPU_BARRIER_STATS=1) ---------------------
+// The SITE answers "which barrier is being waited at", a different question from "which node was running".
+// The node histogram showed that 35% of ALL barrier events on b10c384 happen inside kernels (4 call sites in
+// llamafile/sgemm.cpp, 2 in ggml-cpu.c's mul_mat, 2 in ops.cpp's flash attention), and that every one of the
+// other 23 sites in ops.cpp belongs to a kernel KataGo's graph never executes. Without this key the in-kernel
+// pool cannot be split into "the GEMM's tile-loop entry", "its write-publish exit", "the chunk reset" and
+// "flash attention" -- which is the whole question: which of them is actually being waited at.
+//
+// Cost, stated so it can be checked: ONE thread-local store per barrier, done by the barrier's own caller.
+// On b10c384 that is 1165 stores per walk per thread, about 1e-5 of a walk; not a getenv, not per-node work.
+// The value is read once inside the barrier's existing `if (stats)` block.
+#if defined(_MSC_VER)
+#  define GGML_CPU_BAR_TLS __declspec(thread)
+#else
+#  define GGML_CPU_BAR_TLS __thread
+#endif
+
+enum ggml_cpu_bar_site {
+    GGML_CPU_BAR_SITE_LOOP = 0,       // the node loop's barrier, ggml_graph_compute_thread
+    GGML_CPU_BAR_SITE_GRAPH_END,      // the graph-end barrier
+    GGML_CPU_BAR_SITE_SGEMM_START,    // llamafile/sgemm.cpp, the tile-loop entry (both code paths)
+    GGML_CPU_BAR_SITE_SGEMM_END,      // llamafile/sgemm.cpp, the exit that publishes the writes
+    GGML_CPU_BAR_SITE_MULMAT_CHUNK,   // ggml-cpu.c mul_mat, reset current_chunk
+    GGML_CPU_BAR_SITE_MULMATID_CHUNK, // ggml-cpu.c mul_mat_id (not in KataGo's graph)
+    GGML_CPU_BAR_SITE_FA_EXT_1,       // ops.cpp flash_attn_ext_f16
+    GGML_CPU_BAR_SITE_FA_EXT_2,
+    GGML_CPU_BAR_SITE_OTHER,          // anything unmarked, e.g. the A1 EXTRABAR probe
+    GGML_CPU_BAR_SITE_COUNT
+};
+
+extern GGML_CPU_BAR_TLS int ggml_cpu_bar_site_cur;
+#define GGML_CPU_BAR_SITE(id) do { ggml_cpu_bar_site_cur = (id); } while (0)
+
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
 

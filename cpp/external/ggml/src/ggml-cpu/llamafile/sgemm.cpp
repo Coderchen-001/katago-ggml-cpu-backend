@@ -624,6 +624,7 @@ class tinyBLAS {
             ggml_threadpool_chunk_set(params->threadpool, params->nth);
         }
 
+        GGML_CPU_BAR_SITE(GGML_CPU_BAR_SITE_SGEMM_START);
         ggml_barrier(params->threadpool);
 
         int64_t job = params->ith;
@@ -653,6 +654,7 @@ class tinyBLAS {
             job = ggml_threadpool_chunk_add(params->threadpool, 1);
         }
 
+        GGML_CPU_BAR_SITE(GGML_CPU_BAR_SITE_SGEMM_END);
         ggml_barrier(params->threadpool);
         ggml_cpu_tb_note_writes_published();
         return;
@@ -1191,6 +1193,7 @@ class tinyBLAS_RVV {
             ggml_threadpool_chunk_set(params->threadpool, params->nth);
         }
 
+        GGML_CPU_BAR_SITE(GGML_CPU_BAR_SITE_SGEMM_START);
         ggml_barrier(params->threadpool);
 
         int64_t job = params->ith;
@@ -1220,6 +1223,7 @@ class tinyBLAS_RVV {
             job = ggml_threadpool_chunk_add(params->threadpool, 1);
         }
 
+        GGML_CPU_BAR_SITE(GGML_CPU_BAR_SITE_SGEMM_END);
         ggml_barrier(params->threadpool);
         return;
     }

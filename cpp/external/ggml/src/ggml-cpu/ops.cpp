@@ -9642,6 +9642,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             }
         }
 
+        GGML_CPU_BAR_SITE(GGML_CPU_BAR_SITE_FA_EXT_1);
         ggml_barrier(params->threadpool);
         ggml_flash_attn_ext_reduce_partials(params, dst, nth, chunk_size);
     } else {
@@ -9665,6 +9666,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             ggml_threadpool_chunk_set(params->threadpool, nth);
         }
 
+        GGML_CPU_BAR_SITE(GGML_CPU_BAR_SITE_FA_EXT_2);
         ggml_barrier(params->threadpool);
 
         const int64_t dr = (nr + nchunk - 1) / nchunk;
