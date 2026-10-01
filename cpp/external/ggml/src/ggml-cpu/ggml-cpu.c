@@ -1368,6 +1368,20 @@ static void ggml_cpu_t9_pass_in_chunk(const struct ggml_compute_params * params,
 // which is cheaper to compute than the GEMM's dynamic chunking and adds no barrier.
 static void ggml_cpu_t9_pass_after_sgemm(const struct ggml_compute_params * params,
                                          const struct ggml_tensor * mm) {
+    // Redundant-barrier probe (KATAGO_CPU_T9_EXTRABAR=1, user's third candidate). The hypothesis it tests is
+    // counterintuitive but cheap: removing the ADD node's barrier may have turned eight synchronised threads
+    // into eight threads that all immediately read data their peers have just written, bouncing cache lines
+    // between cores. If deliberately ADDING a barrier makes the fused arm FASTER, that is proven -- and it
+    // would mean the barrier being saved was never the expensive part, the memory ownership was.
+    {
+        static int t9_extrabar = -1;
+        if (t9_extrabar < 0) {
+            t9_extrabar = (getenv("KATAGO_CPU_T9_EXTRABAR") != NULL) ? 1 : 0;
+        }
+        if (t9_extrabar) {
+            ggml_barrier(params->threadpool);
+        }
+    }
     const int64_t nth = params->nth;
     const int64_t dr  = (ggml_cpu_t9_pend.nr_rows + nth - 1) / nth;
     const int64_t r0  = dr * params->ith;
@@ -3969,6 +3983,19 @@ static int ggml_cpu_t9_enabled(void) {
     return on;
 }
 
+// Trace switch, read ONCE. This used to be a raw getenv() on the refusal path, which the matcher reaches for
+// every node that is not a match -- i.e. several hundred times per walk, on every thread, and getenv on
+// Windows walks the whole environment block with string compares. Measured cost of the detection alone was
+// +9.01% against the baseline (T=8 B=6), MORE than the whole fusion costs (+7.31%), which is what pointed
+// here. Caching it also lets the caller short-circuit before doing any work.
+static int ggml_cpu_t9_trace(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = (getenv("KATAGO_CPU_T9_TRACE") != NULL) ? 1 : 0;
+    }
+    return v;
+}
+
 // Timing-only ablation switch, read once. See the call site: it keeps the fusion's structure and its write
 // stream and removes the pass's read streams, so it splits a structural cost from a kernel cost.
 static int ggml_cpu_t9_nopass(void) {
@@ -4116,6 +4143,29 @@ static int ggml_cpu_t9_match(
     ggml_cpu_t9_pend.armed  = 1;
     ggml_cpu_t9_pend.pass_ran = 0;
 
+    // TWO-WAY SPLIT before any per-region timer (user's cheaper division). MATCHONLY runs the WHOLE
+    // predicate -- including its use-count lookups -- and then does nothing else: no GEMM here, no skipped
+    // nodes. The node loop computes everything exactly as the baseline does, so the difference from the
+    // baseline is the COST OF LOOKING, and nothing else. That separates the two classes of cause, which
+    // have completely different fixes:
+    //   MATCHONLY also ~+7%  => the account is per-node detection / relocating the GEMM call site
+    //                           (fixable: short-circuit the preconditions, hoist the decision into
+    //                           ggml_graph_plan -- the TODO at the plan site)
+    //   MATCHONLY back at 0  => the account is the anchor/skip structure at the 52 sites
+    // Do NOT reuse T9_NOSKIP for this: NOSKIP runs the GEMM in the matcher AND lets the node loop run it
+    // again, doubling the GEMM and drowning the effect being measured.
+    {
+        static int t9_matchonly = -1;
+        if (t9_matchonly < 0) {
+            t9_matchonly = (getenv("KATAGO_CPU_T9_MATCHONLY") != NULL) ? 1 : 0;
+        }
+        if (t9_matchonly) {
+            ggml_cpu_t9_pend.armed = 0;
+            #undef T9_NO
+            return 0;
+        }
+    }
+
     ggml_compute_forward_mul_mat(params, cgraph->nodes[node_n]);
 
     const int pass_ran = ggml_cpu_t9_pend.pass_ran;
@@ -4171,7 +4221,7 @@ static int ggml_cpu_t9_match(
 
 t9_done:
     #undef T9_NO
-    {
+    if (ggml_cpu_t9_trace() && params->ith == 0) {
         static int n_rep = 0;
         // Report only the refusals that MATTER: a chain that already looks like A1 (MUL_MAT -> free -> ADD).
         // The matcher runs for every node, so without this filter the first 24 refusals are all
@@ -4185,7 +4235,7 @@ t9_done:
                              (cgraph->nodes[node_n]->op == GGML_OP_MUL_MAT) &&
                              ggml_cpu_is_free_op(cgraph->nodes[node_n + 1]->op) &&
                              (cgraph->nodes[node_n + 2]->op == GGML_OP_ADD);
-        if (getenv("KATAGO_CPU_T9_TRACE") != NULL && params->ith == 0 && looks_a1 && n_rep < 40) {
+        if (looks_a1 && n_rep < 40) {
             n_rep++;
             fprintf(stderr, "[t9-a1blk] node=%d rejected: %s\n", node_n, why ? why : "?");
         }
