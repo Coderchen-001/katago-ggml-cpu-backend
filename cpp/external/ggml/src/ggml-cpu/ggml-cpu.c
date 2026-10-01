@@ -618,6 +618,83 @@ static void ggml_cpu_barrier_backoff_init(void) {
 static __declspec(thread) uint64_t ggml_cpu_tls_spin_iters = 0;
 static __declspec(thread) uint64_t ggml_cpu_tls_waits      = 0;
 
+// --- Task 3: attribute barrier spin to the NODE the barrier was waiting for ---------------------------
+// One number is wanted: the share of all barrier spin that belongs to the element-wise chain family
+// (MUL/ADD/SUB/DIV/SCALE). That share decides whether "fuse element-wise chains" is worth a project.
+//
+// The counters above cannot answer it: ggml_barrier() knows nothing about the node, and it is called AFTER the
+// kernels finish, not before. So each thread accumulates spin in TLS and drains it into its own row at the
+// barrier that ends the node -- the spin at a barrier is caused by the slowest thread finishing the node just
+// computed, so that is the honest label.
+//
+// Design constraints, each one a mistake that was considered and rejected:
+//  * NOT an atexit aggregate over TLS: the pool's workers never exit individually, and every barrier zeroes the
+//    TLS spin field, so nothing is left to read at teardown.
+//  * NOT a thread-0 aggregate: that needs either a second barrier (which changes what is being measured) or a
+//    lock on the critical path.
+//  * One row PER THREAD, written only by the thread that owns it: no atomics, no barrier, no pointer swap,
+//    nothing new on the critical path. Rows are padded to a cache line so no two threads share one.
+//  * ACCUMULATE, do not overwrite. The kernels themselves call ggml_barrier() (23 sites in ops.cpp, 4 in
+//    sgemm.cpp), so keeping only "the last barrier's spin" would silently discard every in-kernel wait.
+//    Everything a thread waited on since its previous drain is charged to the node that drains it.
+#define GGML_CPU_BAR_OP_SLOTS (GGML_OP_COUNT + 1)                 // +1 = the graph-end barrier column
+#define GGML_CPU_BAR_ROW      ((GGML_CPU_BAR_OP_SLOTS + 7) & ~7)  // pad a row to a 64-byte multiple
+static uint64_t ggml_cpu_bar_spin_by_op [GGML_MAX_N_THREADS][GGML_CPU_BAR_ROW];
+static uint64_t ggml_cpu_bar_waits_by_op[GGML_MAX_N_THREADS][GGML_CPU_BAR_ROW];
+static uint64_t ggml_cpu_bar_spin_unattr  = 0; // slot/ith out of range; must stay 0
+static uint64_t ggml_cpu_bar_waits_unattr = 0;
+static int      ggml_cpu_bar_nth          = 0; // poll size, only for the "sites" column
+
+// Spin measured in CYCLES, and the compute phase measured in cycles by the same clock.
+//
+// This is the part that must not be assumed. Turning "spin iterations" into "share of runtime" needs a
+// conversion, and every published conversion for this project is unusable here:
+//   26%  is an identity (1.78% / 6.85%), not a measurement  (NUMBER-RECONCILIATION.md 5.7)
+//   31%  was back-solved from the withdrawn -O0 build
+//   15.7% is `ggml_barrier` 2.22% + `ggml_graph_compute_thread` SELF 12.03% -- and the self time of the node
+//         loop is dispatch overhead, not waiting. The spin loop is inlined into ggml_barrier, so a frame
+//         attribution cannot separate them either.
+// So measure both halves with rdtsc in the same process: spin cycles, and the span each thread spends inside
+// the node loop. Their ratio is the mean fraction of a thread's compute time spent waiting at barriers --
+// no external constant, and directly comparable to the profiler's number as a cross-check.
+static uint64_t ggml_cpu_bar_cycles_by_op[GGML_MAX_N_THREADS][GGML_CPU_BAR_ROW];
+static uint64_t ggml_cpu_bar_span_cycles   = 0; // sum over threads and graphs of (node-loop end - start)
+
+static __declspec(thread) uint64_t ggml_cpu_tls_pending_cycles = 0;
+
+static inline uint64_t ggml_cpu_bar_tsc(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __rdtsc();
+#else
+    return 0; // no cycle counter here; the iteration counters stay valid and the cycle share reads 0
+#endif
+}
+
+static __declspec(thread) uint64_t ggml_cpu_tls_pending_spin  = 0;
+static __declspec(thread) uint64_t ggml_cpu_tls_pending_waits = 0;
+
+// Drain everything this thread has waited on since its last drain into its own row. slot is node->op, or
+// GGML_OP_COUNT for the graph-end barrier.
+static inline void ggml_cpu_bar_spin_drain(int ith, int slot) {
+    const uint64_t spin   = ggml_cpu_tls_pending_spin;
+    const uint64_t waits  = ggml_cpu_tls_pending_waits;
+    const uint64_t cycles = ggml_cpu_tls_pending_cycles;
+    if (spin == 0 && waits == 0) {
+        return;
+    }
+    ggml_cpu_tls_pending_spin   = 0;
+    ggml_cpu_tls_pending_waits  = 0;
+    ggml_cpu_tls_pending_cycles = 0;
+    if ((unsigned) ith < GGML_MAX_N_THREADS && (unsigned) slot < GGML_CPU_BAR_OP_SLOTS) {
+        ggml_cpu_bar_spin_by_op  [ith][slot] += spin;
+        ggml_cpu_bar_waits_by_op [ith][slot] += waits;
+        ggml_cpu_bar_cycles_by_op[ith][slot] += cycles;
+    } else {
+        ggml_cpu_bar_spin_unattr  += spin;
+        ggml_cpu_bar_waits_unattr += waits;
+    }
+}
+
 // Node-visit accounting, to settle why the barrier count (1344) exceeds the number of nodes that should pay a
 // barrier. ggml_op_is_empty skips NONE/RESHAPE/TRANSPOSE/VIEW/PERMUTE, and a second continue skips nodes
 // without GGML_TENSOR_FLAG_COMPUTE, so the loop should only reach ggml_barrier for the remainder. If the
@@ -647,6 +724,163 @@ static uint64_t ggml_cpu_t9_path_chunk      = 0;
 static uint64_t ggml_cpu_t9_path_early      = 0;
 static uint64_t ggml_cpu_t9_path_fallback   = 0;
 
+// Task 3: turn the per-thread rows into one table and one verdict.
+//
+// The verdict is printed ONLY when the attribution invariant holds: every spin iteration the barrier counted
+// must land in exactly one row. If it does not, the table is not a measurement and the honest output is the
+// residual, not a percentage.
+//
+// The spin share of runtime is MEASURED here (spin cycles / node-loop span cycles), not assumed. The three
+// external numbers are kept only as a cross-check, because all three are unusable as the conversion:
+//   15.7% -- profile: ggml_barrier 2.22% + node-loop SELF 12.03%; the self time is dispatch, not waiting
+//   26%   -- an identity (1.78%/6.85%), not an independent measurement (NUMBER-RECONCILIATION.md 5.7)
+//   31%   -- WITHDRAWN: back-solved from the -O0 build
+#define GGML_CPU_BAR_SHARE_LB 15.7
+#define GGML_CPU_BAR_SHARE_MID 26.0
+#define GGML_CPU_BAR_SHARE_UB 31.0
+#define GGML_CPU_BAR_VERDICT_GATE 1.0
+
+static void ggml_cpu_bar_spin_report(void) {
+    uint64_t spin_by_op  [GGML_CPU_BAR_OP_SLOTS];
+    uint64_t waits_by_op [GGML_CPU_BAR_OP_SLOTS];
+    uint64_t cycles_by_op[GGML_CPU_BAR_OP_SLOTS];
+    uint64_t spin_by_thr [GGML_MAX_N_THREADS];
+    int      order       [GGML_CPU_BAR_OP_SLOTS];
+
+    memset(spin_by_op,   0, sizeof(spin_by_op));
+    memset(waits_by_op,  0, sizeof(waits_by_op));
+    memset(cycles_by_op, 0, sizeof(cycles_by_op));
+    memset(spin_by_thr,  0, sizeof(spin_by_thr));
+
+    uint64_t row_spin = 0;
+    uint64_t row_waits = 0;
+    for (int t = 0; t < GGML_MAX_N_THREADS; t++) {
+        for (int s = 0; s < GGML_CPU_BAR_OP_SLOTS; s++) {
+            spin_by_op  [s] += ggml_cpu_bar_spin_by_op  [t][s];
+            waits_by_op [s] += ggml_cpu_bar_waits_by_op [t][s];
+            cycles_by_op[s] += ggml_cpu_bar_cycles_by_op[t][s];
+            spin_by_thr [t] += ggml_cpu_bar_spin_by_op  [t][s];
+        }
+        row_spin  += spin_by_thr[t];
+    }
+    for (int s = 0; s < GGML_CPU_BAR_OP_SLOTS; s++) {
+        row_waits += waits_by_op[s];
+    }
+
+    const int64_t spin_resid = (int64_t) ggml_cpu_n_spin_iters - (int64_t) (row_spin + ggml_cpu_bar_spin_unattr);
+    const int64_t wait_resid = (int64_t) ggml_cpu_n_barriers   - (int64_t) (row_waits + ggml_cpu_bar_waits_unattr);
+
+    fprintf(stderr, "[bar-spin-by-op] nth=%d spin_iters=%llu waits=%llu sum_rows=%llu unattr=%llu residual=%lld\n",
+            ggml_cpu_bar_nth,
+            (unsigned long long) ggml_cpu_n_spin_iters,
+            (unsigned long long) ggml_cpu_n_barriers,
+            (unsigned long long) row_spin,
+            (unsigned long long) ggml_cpu_bar_spin_unattr,
+            (long long) spin_resid);
+
+    // Per-thread totals: a thread that consistently waits far less than its peers is the thread that arrives
+    // last, and that is what a load imbalance looks like in this data. Printed compactly, one line.
+    fprintf(stderr, "[bar-spin-by-op] per-thread spin:");
+    for (int t = 0; t < GGML_MAX_N_THREADS && t < 64; t++) {
+        if (spin_by_thr[t] != 0) {
+            fprintf(stderr, " t%d=%llu", t, (unsigned long long) spin_by_thr[t]);
+        }
+    }
+    fprintf(stderr, "\n");
+
+    if (spin_resid != 0 || wait_resid != 0) {
+        fprintf(stderr, "[bar-spin-by-op] INVARIANT FAILED: rows+unattr != global "
+                        "(spin residual=%lld, waits residual=%lld, unattr_waits=%llu)\n",
+                (long long) spin_resid, (long long) wait_resid,
+                (unsigned long long) ggml_cpu_bar_waits_unattr);
+        fprintf(stderr, "[bar-spin-by-op] NO TABLE AND NO VERDICT -- attribution is not self-consistent\n");
+        return;
+    }
+
+    for (int s = 0; s < GGML_CPU_BAR_OP_SLOTS; s++) {
+        order[s] = s;
+    }
+    for (int i = 1; i < GGML_CPU_BAR_OP_SLOTS; i++) { // insertion sort by spin, descending
+        const int key = order[i];
+        int j = i - 1;
+        while (j >= 0 && spin_by_op[order[j]] < spin_by_op[key]) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = key;
+    }
+
+    const double total = (double) ggml_cpu_n_spin_iters;
+    const int n_waiters = (ggml_cpu_bar_nth > 1) ? (ggml_cpu_bar_nth - 1) : 1;
+
+    fprintf(stderr, "[bar-spin-by-op] %-22s %14s %9s %16s %12s %10s\n",
+            "op", "spin", "spin%", "cycles", "waits", "sites");
+    for (int i = 0; i < GGML_CPU_BAR_OP_SLOTS; i++) {
+        const int s = order[i];
+        if (spin_by_op[s] == 0 && waits_by_op[s] == 0) {
+            continue;
+        }
+        const char * name = (s == GGML_OP_COUNT) ? "graph-end" : ggml_op_name((enum ggml_op) s);
+        fprintf(stderr, "[bar-spin-by-op] %-22s %14llu %8.2f%% %16llu %12llu %10llu\n",
+                name,
+                (unsigned long long) spin_by_op[s],
+                total > 0.0 ? 100.0 * (double) spin_by_op[s] / total : 0.0,
+                (unsigned long long) cycles_by_op[s],
+                (unsigned long long) waits_by_op[s],
+                (unsigned long long) (waits_by_op[s] / (uint64_t) n_waiters));
+    }
+
+    // The one number this exercise exists for. The gate list is the pre-registered class; ADD1 is reported
+    // next to it because a bias add is element-wise too but was not in the pre-registered definition.
+    static const enum ggml_op ew_ops[] = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_SUB, GGML_OP_DIV, GGML_OP_SCALE };
+    uint64_t ew_spin = 0;
+    uint64_t ew_cycles = 0;
+    for (size_t i = 0; i < sizeof(ew_ops) / sizeof(ew_ops[0]); i++) {
+        ew_spin   += spin_by_op  [ew_ops[i]];
+        ew_cycles += cycles_by_op[ew_ops[i]];
+    }
+    const uint64_t ew_spin_w_add1 = ew_spin + spin_by_op[GGML_OP_ADD1];
+
+    uint64_t total_cycles = 0;
+    for (int s = 0; s < GGML_CPU_BAR_OP_SLOTS; s++) {
+        total_cycles += cycles_by_op[s];
+    }
+
+    // MEASURED conversion: spin cycles over the cycles the threads actually spent inside the node loop. Both
+    // halves come from the same clock in the same process, so this is a share of runtime and not a projection.
+    const double spin_share = (ggml_cpu_bar_span_cycles > 0)
+                            ? 100.0 * (double) total_cycles / (double) ggml_cpu_bar_span_cycles : 0.0;
+    const double cyc_per_iter = (ggml_cpu_n_spin_iters > 0)
+                            ? (double) total_cycles / (double) ggml_cpu_n_spin_iters : 0.0;
+
+    const double ew_spin_pct = total > 0.0 ? 100.0 * (double) ew_spin / total : 0.0;
+    const double ew_add1_pct = total > 0.0 ? 100.0 * (double) ew_spin_w_add1 / total : 0.0;
+    const double ew_measured = 100.0 * (double) ew_cycles / (double) (ggml_cpu_bar_span_cycles > 0
+                                                                     ? ggml_cpu_bar_span_cycles : 1);
+    const double rt_lb  = ew_spin_pct * GGML_CPU_BAR_SHARE_LB  / 100.0;
+    const double rt_mid = ew_spin_pct * GGML_CPU_BAR_SHARE_MID / 100.0;
+    const double rt_ub  = ew_spin_pct * GGML_CPU_BAR_SHARE_UB  / 100.0;
+
+    fprintf(stderr, "[bar-spin-by-op] MEASURED total_spin_cycles=%llu thread_span_cycles=%llu "
+                    "=> spin is %.3f%% of thread time (%.1f cycles/spin-iter)\n",
+            (unsigned long long) total_cycles, (unsigned long long) ggml_cpu_bar_span_cycles,
+            spin_share, cyc_per_iter);
+    fprintf(stderr, "[bar-spin-by-op] ELEMENTWISE(MUL/ADD/SUB/DIV/SCALE) spin_pct=%.2f%%  ADD1_incl=%.2f%%\n",
+            ew_spin_pct, ew_add1_pct);
+    fprintf(stderr, "[bar-spin-by-op]   => MEASURED %.2f%% of runtime | cross-checks vs external shares: "
+                    "%.2f%% (LB 15.7) / %.2f%% (identity 26) / %.2f%% (withdrawn 31)\n",
+            ew_measured, rt_lb, rt_mid, rt_ub);
+
+    // Each branch tests and prints the SAME variable (G-13): a verdict can never disagree with its number.
+    if (ew_measured >= GGML_CPU_BAR_VERDICT_GATE) {
+        fprintf(stderr, "[bar-spin-by-op] VERDICT: PROJECT -- measured %.2f%% of runtime clears the %.2f%% gate\n",
+                ew_measured, GGML_CPU_BAR_VERDICT_GATE);
+    } else {
+        fprintf(stderr, "[bar-spin-by-op] VERDICT: OUT -- measured %.2f%% of runtime misses the %.2f%% gate; "
+                        "the anchor table is the whole story\n", ew_measured, GGML_CPU_BAR_VERDICT_GATE);
+    }
+}
+
 static void ggml_cpu_barrier_stats_report(void) {
     if (!ggml_cpu_barrier_stats_on) {
         return;
@@ -671,6 +905,7 @@ static void ggml_cpu_barrier_stats_report(void) {
             (unsigned long long) ggml_cpu_t9_path_chunk,
             (unsigned long long) ggml_cpu_t9_path_early,
             (unsigned long long) ggml_cpu_t9_path_fallback);
+    ggml_cpu_bar_spin_report();
 }
 
 static bool ggml_cpu_barrier_stats_enabled(void) {
@@ -679,7 +914,14 @@ static bool ggml_cpu_barrier_stats_enabled(void) {
         ggml_cpu_barrier_stats_env = (e != NULL && e[0] == '1') ? 1 : 0;
         ggml_cpu_barrier_stats_on  = ggml_cpu_barrier_stats_env;
         if (ggml_cpu_barrier_stats_on) {
-            atexit(ggml_cpu_barrier_stats_report);
+            // Register ONCE. All threads of the pool reach this function on the first barrier of the first
+            // graph, and the guard above is not atomic, so several of them used to register the same handler
+            // and the report printed six times with identical numbers -- harmless, but it looks exactly like
+            // "six measurements were taken".
+            static int registered = 0;
+            if (__atomic_exchange_n(&registered, 1, __ATOMIC_RELAXED) == 0) {
+                atexit(ggml_cpu_barrier_stats_report);
+            }
         }
     }
     return ggml_cpu_barrier_stats_on != 0;
@@ -719,10 +961,20 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     if (stats) {
         ggml_cpu_tls_waits++;
         ggml_cpu_tls_spin_iters = 0;
+        const uint64_t spin_t0 = ggml_cpu_bar_tsc();
         while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
             ggml_cpu_tls_spin_iters++;
             ggml_thread_cpu_relax();
         }
+        const uint64_t spin_t1 = ggml_cpu_bar_tsc();
+        ggml_cpu_tls_pending_cycles += spin_t1 - spin_t0;
+
+        // Bank this wait for per-op attribution as well. It stays in TLS (thread-private) and is only written
+        // into the per-op table when the node loop drains it, so this adds no shared traffic -- the two
+        // shared atomics below are the only cross-thread cost, exactly as before.
+        ggml_cpu_tls_pending_spin  += ggml_cpu_tls_spin_iters;
+        ggml_cpu_tls_pending_waits += ggml_cpu_tls_waits;
+
         // one shared update per barrier, never one per iteration and never two per barrier
         __atomic_fetch_add(&ggml_cpu_n_barriers,   ggml_cpu_tls_waits,      __ATOMIC_RELAXED);
         __atomic_fetch_add(&ggml_cpu_n_spin_iters, ggml_cpu_tls_spin_iters, __ATOMIC_RELAXED);
@@ -4181,7 +4433,7 @@ static int ggml_cpu_t9_match(
         __atomic_fetch_add(&ggml_cpu_t9_path_fallback, 1, __ATOMIC_RELAXED);
         {
             static int n_rep = 0;
-            if (getenv("KATAGO_CPU_T9_TRACE") != NULL && params->ith == 0 && n_rep < 8) {
+            if (ggml_cpu_t9_trace() && params->ith == 0 && n_rep < 8) {
                 n_rep++;
                 const int * d = ggml_cpu_t9_pend.diag;
                 fprintf(stderr, "[t9-path] node=%d FALLBACK exit=%d src0=%s src1=%s vec_dot=%s\n",
@@ -4425,7 +4677,7 @@ static int ggml_cpu_try_fuse_ops(
                 // so the same question is asked directly against the graph's use-count table.
                 ggml_cpu_t9_uses_once(cgraph, v->src[0]) &&
                 ggml_cpu_t9_uses_once(cgraph, v)) {
-                if (getenv("KATAGO_CPU_T9_TRACE") != NULL && params->ith == 0) {
+                if (ggml_cpu_t9_trace() && params->ith == 0) {
                     static int n_rep = 0;
                     if (n_rep < 40) {
                         n_rep++;
@@ -4521,6 +4773,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     // value rather than lazily initialising it mid-loop.
     (void) ggml_cpu_barrier_stats_enabled();
     ggml_cpu_barrier_backoff_init();
+    if (ggml_cpu_barrier_stats_on) {
+        // Every thread writes the same value, once per graph. Only used to turn waits into barrier sites.
+        ggml_cpu_bar_nth = params.nth;
+    }
+
+    // One rdtsc pair per graph per thread: the denominator for the spin share. Deliberately always taken (not
+    // only when the diagnostic is on) because it is once per graph, and the branch it would save is worth less
+    // than the clarity of an unconditional span.
+    const uint64_t span_t0 = ggml_cpu_bar_tsc();
 
     ggml_cpu_rope_dump_census(cgraph, params.ith);
 
@@ -4571,6 +4832,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 __atomic_fetch_add(&ggml_cpu_n_nodes_barr, 1, __ATOMIC_RELAXED);
             }
             ggml_barrier(state->threadpool);
+            // Attribute this barrier's spin to `node`, captured BEFORE the fusion advance above. For a plain
+            // node that is simply "the node whose kernel just ran". For a fused group it is the group's ANCHOR,
+            // which is deliberate: the fused pass lives inside the anchor's kernel, and it is what makes the ADD
+            // row collapse under KATAGO_CPU_T9_FUSE=1 -- that collapse is the built-in positive control.
+            if (ggml_cpu_barrier_stats_on) {
+                ggml_cpu_bar_spin_drain(params.ith, (int) node->op);
+            }
         }
     }
 
@@ -4583,6 +4851,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+
+    // The graph-end barrier waits on no node; it gets its own column so the attribution invariant stays exact.
+    if (ggml_cpu_barrier_stats_on) {
+        ggml_cpu_bar_spin_drain(params.ith, GGML_OP_COUNT);
+        __atomic_fetch_add(&ggml_cpu_bar_span_cycles, ggml_cpu_bar_tsc() - span_t0, __ATOMIC_RELAXED);
+    }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
