@@ -3969,10 +3969,35 @@ static int ggml_cpu_t9_enabled(void) {
     return on;
 }
 
+// Timing-only ablation switch, read once. See the call site: it keeps the fusion's structure and its write
+// stream and removes the pass's read streams, so it splits a structural cost from a kernel cost.
+static int ggml_cpu_t9_nopass(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = (getenv("KATAGO_CPU_T9_NOPASS") != NULL) ? 1 : 0;
+    }
+    return v;
+}
+
 // A free layout op: ggml_op_is_empty skips these, so they cost no barrier and can be stepped over.
 static int ggml_cpu_is_free_op(enum ggml_op op) {
     return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
            op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE || op == GGML_OP_NONE;
+}
+
+// Raw single-use test for a REAL tensor. cgraph->use_counts is keyed by the tensor's hash slot; this is the
+// same question ggml_cpu_rope_uses_ok answers from a node index, asked directly because a caller that starts
+// from a tensor (the ADDONLY diagnostic) has no node index for it. Returns 0 when the count cannot be read,
+// so an unreadable graph refuses rather than proceeding.
+static int ggml_cpu_t9_uses_once(const struct ggml_cgraph * cgraph, const struct ggml_tensor * t) {
+    if (cgraph->use_counts == NULL) {
+        return 0;
+    }
+    const size_t hp = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (!ggml_bitset_get(cgraph->visited_hash_set.used, hp)) {
+        return 0;
+    }
+    return cgraph->use_counts[hp] == 1;
 }
 
 // Returns the number of nodes to skip (2) on success. `node_n` indexes the MUL_MAT.
@@ -4148,9 +4173,21 @@ t9_done:
     #undef T9_NO
     {
         static int n_rep = 0;
-        if (getenv("KATAGO_CPU_T9_TRACE") != NULL && params->ith == 0 && n_rep < 24) {
+        // Report only the refusals that MATTER: a chain that already looks like A1 (MUL_MAT -> free -> ADD).
+        // The matcher runs for every node, so without this filter the first 24 refusals are all
+        // "anchor is not MUL_MAT" and "tail is not ADD" from unrelated nodes, and the reasons for the sites
+        // we actually care about are never printed. That is exactly what happened when this trace was first
+        // used to explain why 67 A1-shaped sites yield only 52 hits.
+        const int looks_a1 = (node_n + 2 < cgraph->n_nodes) &&
+                             (cgraph->nodes[node_n]     != NULL) &&
+                             (cgraph->nodes[node_n + 1] != NULL) &&
+                             (cgraph->nodes[node_n + 2] != NULL) &&
+                             (cgraph->nodes[node_n]->op == GGML_OP_MUL_MAT) &&
+                             ggml_cpu_is_free_op(cgraph->nodes[node_n + 1]->op) &&
+                             (cgraph->nodes[node_n + 2]->op == GGML_OP_ADD);
+        if (getenv("KATAGO_CPU_T9_TRACE") != NULL && params->ith == 0 && looks_a1 && n_rep < 40) {
             n_rep++;
-            fprintf(stderr, "[t9-blk] node=%d rejected: %s\n", node_n, why ? why : "?");
+            fprintf(stderr, "[t9-a1blk] node=%d rejected: %s\n", node_n, why ? why : "?");
         }
     }
     return 0;
@@ -4220,8 +4257,18 @@ static void ggml_cpu_t9_anchor_epilogue(
                     const int64_t ir    = i1 + a_ne1 * (i2 + a_ne2 * i3);
                     float * d           = (float *) ((char *) add->data + ir * ne0 * sizeof(float));
 
-                    for (int64_t c = c_begin; c < c_end; ++c) {
-                        d[c] = s[c] + o[c];
+                    // Timing-only ablation (KATAGO_CPU_T9_NOPASS=1). Keeps the shell, the row fan-out, the
+                    // partition and the WRITE stream, and drops the two READ streams plus the add. It writes
+                    // zeros rather than leaving the buffer untouched, so nothing downstream can see a denormal
+                    // or a NaN and charge its own cost to this experiment. The output is WRONG by
+                    // construction: this exists to split "the fusion structure costs something" from "the
+                    // pass's memory traffic costs something", which is the difference between a structural
+                    // problem and a kernel problem.
+                    if (ggml_cpu_t9_nopass()) {
+                        memset(d + c_begin, 0, (size_t) (c_end - c_begin) * sizeof(float));
+                    } else {
+                        // Use the SAME primitive the stock ADD path uses (vec.h:89, explicit AVX2 path).
+                        ggml_vec_add_f32((int) (c_end - c_begin), d + c_begin, s + c_begin, o + c_begin);
                     }
                 }
             }
@@ -4284,6 +4331,78 @@ static int ggml_cpu_try_fuse_ops(
 
                 ggml_compute_forward_rms_norm_mul_fused(params, node, mul_node);
                 return 1;
+            }
+        }
+    }
+
+    // A1 BISECT (diagnostic, KATAGO_CPU_T9_ADDONLY=1): run the fused pass IN PLACE OF the stock ADD kernel,
+    // with the GEMM and the view left completely alone. This isolates ONE variable -- my pass versus
+    // ggml_compute_forward_add_non_quantized -- at the same position in the same barrier interval, so it
+    // separates "the pass is slower than the kernel it replaces" from "moving the work into the GEMM's
+    // interval costs something". The A1 fusion measured ~-7% at T=8 B=6 three times; this says which part.
+    // Correctness is preserved (the pass computes the same values, which the bit gate independently proves),
+    // so any timing difference here is attributable to the kernel alone.
+    {
+        static int t9_addonly = -1;
+        if (t9_addonly < 0) {
+            t9_addonly = (getenv("KATAGO_CPU_T9_ADDONLY") != NULL) ? 1 : 0;
+        }
+        if (t9_addonly && node->op == GGML_OP_ADD) {
+            const struct ggml_tensor * v = NULL;
+            const struct ggml_tensor * o = NULL;
+            for (int k = 0; k < 2; ++k) {
+                const struct ggml_tensor * s = node->src[k];
+                if (s != NULL && ggml_cpu_is_free_op(s->op) && s->src[0] != NULL &&
+                    s->src[0]->op == GGML_OP_MUL_MAT) {
+                    v = s;
+                    o = node->src[1 - k];
+                }
+            }
+            if (v != NULL && o != NULL &&
+                v->type == GGML_TYPE_F32 && o->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                v->src[0]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(node) && ggml_is_contiguous(v) && ggml_is_contiguous(o) &&
+                ggml_is_contiguous(v->src[0]) &&
+                ggml_nelements(v) == ggml_nelements(v->src[0]) &&
+                ggml_nelements(v) > 0 && ggml_nelements(node) > 0 &&
+                v->ne[0] == v->src[0]->ne[0] && v->ne[0] == node->ne[0] && o->ne[0] == node->ne[0] &&
+                ggml_can_repeat(v, node) && ggml_can_repeat(o, node) &&
+                !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                // The same single-use guards the matcher applies. Without them the ADDONLY diagnostic matched
+                // about 15 more sites than the matcher does, wrote them with a predicate it had not checked,
+                // and produced a different network hash -- which is why its first timing number could not be
+                // believed. The matcher reaches these through a node index; here the producer has no index,
+                // so the same question is asked directly against the graph's use-count table.
+                ggml_cpu_t9_uses_once(cgraph, v->src[0]) &&
+                ggml_cpu_t9_uses_once(cgraph, v)) {
+                if (getenv("KATAGO_CPU_T9_TRACE") != NULL && params->ith == 0) {
+                    static int n_rep = 0;
+                    if (n_rep < 40) {
+                        n_rep++;
+                        fprintf(stderr, "[t9-addonly] node=%d mm#? ne=[%lld,%lld,%lld,%lld] "
+                                        "v.ne=[%lld,%lld,%lld,%lld] o.ne=[%lld,%lld,%lld,%lld] "
+                                        "v.nb=[%lld,%lld,%lld,%lld] o.nb=[%lld,%lld,%lld,%lld]\n",
+                                node_n,
+                                (long long) v->src[0]->ne[0], (long long) v->src[0]->ne[1],
+                                (long long) v->src[0]->ne[2], (long long) v->src[0]->ne[3],
+                                (long long) v->ne[0], (long long) v->ne[1], (long long) v->ne[2], (long long) v->ne[3],
+                                (long long) o->ne[0], (long long) o->ne[1], (long long) o->ne[2], (long long) o->ne[3],
+                                (long long) v->nb[0], (long long) v->nb[1], (long long) v->nb[2], (long long) v->nb[3],
+                                (long long) o->nb[0], (long long) o->nb[1], (long long) o->nb[2], (long long) o->nb[3]);
+                    }
+                }
+                ggml_cpu_t9_pend.mm       = v->src[0];
+                ggml_cpu_t9_pend.view     = v;
+                ggml_cpu_t9_pend.add      = node;
+                ggml_cpu_t9_pend.other    = o;
+                ggml_cpu_t9_pend.s_ne1    = v->ne[1];
+                ggml_cpu_t9_pend.s_ne2    = v->ne[2];
+                ggml_cpu_t9_pend.s_ne3    = v->ne[3];
+                ggml_cpu_t9_pend.nr_rows  = v->ne[1] * v->ne[2] * v->ne[3];
+                ggml_cpu_t9_pend.armed    = 0;      // armed stays 0: this must NOT make the GEMM fuse
+                ggml_cpu_t9_pend.pass_ran = 0;
+                ggml_cpu_t9_pass_after_sgemm(params, v->src[0]);
+                return 1;                           // the ADD is done; skip just this node
             }
         }
     }
