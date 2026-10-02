@@ -1044,6 +1044,30 @@ ComputeContext* NeuralNet::createComputeContext(
   // config key is the same one Setup used to build the server threads, so read it here.
   ctx->tpc.numHandles = cfg.contains("numNNServerThreadsPerModel")
     ? cfg.getInt("numNNServerThreadsPerModel", 1, 1024) : 1;
+  // ---- WORKER BUDGET GUARD ------------------------------------------------------------------------------
+  // Total worker threads = numHandles * threadsPerHandle, and threadsPerHandle DEFAULTS TO THE PHYSICAL CORE
+  // COUNT. So raising numNNServerThreadsPerModel alone MULTIPLIES the workers instead of dividing them: the
+  // measured cost of getting this wrong was handles=8 with the default on an 8-core machine, i.e. 64 worker
+  // threads, which ran for 28 minutes, burned 13404 s of CPU across 69 threads and never finished.
+  // The rule ("sum of handles x T <= physical cores") was written down but never enforced, and the startup log
+  // printed the two factors separately without their product. This prints the derivation AND the action, the
+  // way assert-release-build.ps1 does, because "not qualified" is not a report.
+  // A warning rather than a hard error on purpose: this is the production engine's path, and an operator may
+  // have a reason to oversubscribe deliberately. The kit's preflight is where it becomes a hard failure.
+  {
+    const int workers = ctx->tpc.numHandles * threadsPerHandle;
+    const int phys    = getNumMathCores();
+    if(logger != NULL && phys > 0 && workers > phys) {
+      const int suggest = (phys / ctx->tpc.numHandles >= 1) ? (phys / ctx->tpc.numHandles) : 1;
+      logger->write("CPU backend: *** WORKER OVERSUBSCRIPTION *** numNNServerThreadsPerModel(" +
+                    Global::intToString(ctx->tpc.numHandles) + ") x threadsPerHandle(" +
+                    Global::intToString(threadsPerHandle) + ") = " + Global::intToString(workers) +
+                    " worker threads on " + Global::intToString(phys) + " physical math cores. The product is "
+                    "what has to fit, not either factor. FIX: set cpuggmlThreadsPerModel=" +
+                    Global::intToString(suggest) + " (or lower numNNServerThreadsPerModel). Expect thrashing "
+                    "and near-zero progress rather than parallelism.");
+    }
+  }
   if(logger != NULL) {
     const CpuTopology& topo = cpuTopology();
     logger->write("CPU backend: creating compute context for " +
