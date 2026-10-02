@@ -670,6 +670,12 @@ static uint64_t ggml_cpu_bar_site_cycles[GGML_MAX_N_THREADS][GGML_CPU_BAR_SITE_C
 // Did the F32->vec_dot repack run, per MUL_MAT node? Once per node, so a plain relaxed atomic is fine.
 static uint64_t ggml_cpu_mm_repack_done = 0;
 static uint64_t ggml_cpu_mm_repack_skip = 0;
+// The repack is WORK, not waiting: it reads all of src1 and writes the converted copy, and that cost lands in
+// MUL_MAT's own row where no waiting-type instrument can see it. Per-thread rows, like everything else here.
+static uint64_t ggml_cpu_bar_repack_elems [GGML_MAX_N_THREADS];
+static uint64_t ggml_cpu_bar_repack_cycles[GGML_MAX_N_THREADS];
+static __declspec(thread) uint64_t ggml_cpu_tls_repack_elems  = 0;
+static __declspec(thread) uint64_t ggml_cpu_tls_repack_cycles = 0;
 // ggml_barrier() receives no ith, so the thread index is stashed once per graph by the node loop.
 static __declspec(thread) int ggml_cpu_tls_bar_ith = 0;
 GGML_CPU_BAR_TLS int ggml_cpu_bar_site_cur = 0;
@@ -698,6 +704,16 @@ static __declspec(thread) uint64_t ggml_cpu_tls_pending_waits = 0;
 // Drain everything this thread has waited on since its last drain into its own row. slot is node->op, or
 // GGML_OP_COUNT for the graph-end barrier.
 static inline void ggml_cpu_bar_spin_drain(int ith, int slot) {
+    // Fold the repack accounting FIRST: a node can carry a repack and produce no wait at all (the thread that
+    // is always last arrives with waits == 0), and the early return below would then drop its bytes.
+    if (ggml_cpu_tls_repack_elems || ggml_cpu_tls_repack_cycles) {
+        if ((unsigned) ith < GGML_MAX_N_THREADS) {
+            ggml_cpu_bar_repack_elems [ith] += ggml_cpu_tls_repack_elems;
+            ggml_cpu_bar_repack_cycles[ith] += ggml_cpu_tls_repack_cycles;
+        }
+        ggml_cpu_tls_repack_elems  = 0;
+        ggml_cpu_tls_repack_cycles = 0;
+    }
     const uint64_t spin   = ggml_cpu_tls_pending_spin;
     const uint64_t waits  = ggml_cpu_tls_pending_waits;
     const uint64_t cycles = ggml_cpu_tls_pending_cycles;
@@ -905,9 +921,34 @@ static void ggml_cpu_bar_spin_report(void) {
     }
 
     // Did the F32->vec_dot repack run? It decides whether the pre-GEMM barrier waits on a memory copy or just
-    // on entry spread -- the question section 12.1 could not settle from the source.
-    fprintf(stderr, "[bar-spin-by-op] MUL_MAT F32->vec_dot repack: done=%llu skipped=%llu\n",
-            (unsigned long long) ggml_cpu_mm_repack_done, (unsigned long long) ggml_cpu_mm_repack_skip);
+    // on entry spread -- the question section 12.1 could not settle from the source. It RUNS (1056 of 1064).
+    // And the second line prices the repack itself, which is WORK: two published estimates of its cost differ
+    // by an order of magnitude (this project's own benchgemm A/B bounded it at ~2%; a traffic count puts it
+    // higher), so this number replaces both.
+    {
+        uint64_t rp_elems = 0, rp_cyc = 0;
+        for (int t = 0; t < GGML_MAX_N_THREADS; t++) {
+            rp_elems += ggml_cpu_bar_repack_elems [t];
+            rp_cyc   += ggml_cpu_bar_repack_cycles[t];
+        }
+        const double mb_in  = 4.0 * (double) rp_elems / (1024.0*1024.0);
+        const double mb_out = 2.0 * (double) rp_elems / (1024.0*1024.0);
+        fprintf(stderr, "[bar-spin-by-op] MUL_MAT F32->vec_dot repack: done=%llu skipped=%llu  "
+                        "elems=%llu (read %.1f MB + write %.1f MB = %.1f MB)  "
+                        "cycles=%llu = %.3f%% of thread span",
+                (unsigned long long) ggml_cpu_mm_repack_done,
+                (unsigned long long) ggml_cpu_mm_repack_skip,
+                (unsigned long long) rp_elems, mb_in, mb_out, mb_in + mb_out,
+                (unsigned long long) rp_cyc,
+                ggml_cpu_bar_span_cycles ? 100.0 * (double) rp_cyc / (double) ggml_cpu_bar_span_cycles : 0.0);
+        if (rp_cyc > 0) {
+            fprintf(stderr, "  (%.2f elems/cycle, %.2f GB/s read+write at 4 GHz)\n",
+                    (double) rp_elems / (double) rp_cyc,
+                    ((mb_in + mb_out) / 1024.0) / ((double) rp_cyc / 4.0e9));
+        } else {
+            fprintf(stderr, "\n");
+        }
+    }
 
     // ---- site table: WHICH barrier, not which node. This is the key that reaches into the kernels. ----
     uint64_t site_spin_total = 0, site_wait_total = 0;
@@ -1960,11 +2001,21 @@ UseGgmlGemm1:;
 
     if (src1->type != vec_dot_type) {
         // Does the F32->vec_dot repack actually run on this model? That decides what the barrier ~40 lines below
-        // waits for: the repack (a memory-copy phase) or merely entry/dispatch spread. The probe says the
-        // weights are plain f16 and the run uses useFP16 auto, which WOULD make src1->type == vec_dot_type and
-        // skip this block entirely -- but "would" is not "does". Counted once per node; relaxed atomic.
+        // waits for: the repack (a memory-copy phase) or merely entry/dispatch spread. It DOES run: measured
+        // done=1056 skipped=8 per process on b10c384.
+        //
+        // And the wait is only the visible half. The repack ITSELF is a full read of src1 + write of src1',
+        // and its cost sits in MUL_MAT's own work -- invisible to a waiting-type instrument. Two published
+        // estimates of that cost disagree by an order of magnitude, so measure it instead of arguing:
+        //   * this project's own benchgemm A/B (f16f32 -> f16f16, which removes the repack entirely) differed
+        //     by <=2% on six shapes (cpu-ggml-design.md:1498), bounding it there;
+        //   * a traffic estimate from the byte count (src1 is [576,1083] f32 for the shape this model's probe
+        //     prints, so ~3.75 MB of read+write per repacked node, times 132 nodes per walk) puts it an order
+        //     of magnitude higher.
+        // bytes and cycles per walk decide which is right, and they cost three counters.
         if (ith == 0) { __atomic_fetch_add(&ggml_cpu_mm_repack_done, 1, __ATOMIC_RELAXED); }
         char * wdata = params->wdata;
+        const uint64_t repack_t0 = ggml_cpu_bar_tsc();
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
         const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
@@ -1991,6 +2042,10 @@ UseGgmlGemm1:;
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                    // Elements this thread converts, into TLS: one add per ROW, no shared counter (a shared one
+                    // would be ~1000 contended atomics per node). mul_mat_id has the identical loop and is
+                    // counted too; it never runs in KataGo's graph, so it contributes zero.
+                    ggml_cpu_tls_repack_elems += (uint64_t) (ne10_block_end - ne10_block_start) * bs;
                     from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
                                (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
                                (ne10_block_end - ne10_block_start) * bs);
@@ -1998,6 +2053,7 @@ UseGgmlGemm1:;
             }
         }
     #endif
+        ggml_cpu_tls_repack_cycles += ggml_cpu_bar_tsc() - repack_t0;
     } else {
         if (ith == 0) { __atomic_fetch_add(&ggml_cpu_mm_repack_skip, 1, __ATOMIC_RELAXED); }
     }
@@ -2282,6 +2338,10 @@ static void ggml_compute_forward_mul_mat_id(
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                    // Elements this thread converts, into TLS: one add per ROW, no shared counter (a shared one
+                    // would be ~1000 contended atomics per node). mul_mat_id has the identical loop and is
+                    // counted too; it never runs in KataGo's graph, so it contributes zero.
+                    ggml_cpu_tls_repack_elems += (uint64_t) (ne10_block_end - ne10_block_start) * bs;
                     from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
                                (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
                                (ne10_block_end - ne10_block_start) * bs);
