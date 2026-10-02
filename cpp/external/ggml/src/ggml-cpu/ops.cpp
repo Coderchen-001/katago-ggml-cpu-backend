@@ -1557,7 +1557,14 @@ static void ggml_compute_forward_sum_rows_f32(
     const int nth = params->nth;
     const int64_t nrows = ne01*ne02*ne03;
 
-    for (int64_t ir = ith; ir < nrows; ir += nth) {
+    // Ablation: with KATAGO_CPU_REDUCE_SERIAL=1 only thread 0 walks every row, which is what this kernel did
+    // before the split. Same rows, same sums, same output -- so the two arms do identical WORK and any wall
+    // difference is the parallelism. (Declared in ggml-cpu.c; read once.)
+    if (ggml_cpu_reduce_serial() && ith != 0) {
+        return;
+    }
+
+    for (int64_t ir = ggml_cpu_reduce_serial() ? 0 : ith; ir < nrows; ir += ggml_cpu_reduce_serial() ? 1 : nth) {
         const int64_t i1 = ir % ne01;
         const int64_t i2 = (ir / ne01) % ne02;
         const int64_t i3 = ir / (ne01*ne02);
@@ -1615,7 +1622,12 @@ static void ggml_compute_forward_mean_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    for (int64_t ir = ith; ir < ne01*ne02*ne03; ir += nth) {
+    // Ablation: KATAGO_CPU_REDUCE_SERIAL=1 restores the pre-split single-threaded walk (same rows, same work).
+    if (ggml_cpu_reduce_serial() && ith != 0) {
+        return;
+    }
+
+    for (int64_t ir = ggml_cpu_reduce_serial() ? 0 : ith; ir < ne01*ne02*ne03; ir += ggml_cpu_reduce_serial() ? 1 : nth) {
         const int64_t i01 = ir % ne01;
         const int64_t i02 = (ir / ne01) % ne02;
         const int64_t i03 = ir / (ne01*ne02);

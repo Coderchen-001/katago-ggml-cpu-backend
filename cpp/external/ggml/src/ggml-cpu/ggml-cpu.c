@@ -685,6 +685,20 @@ static int ggml_cpu_mm_norepack(void) {
     return v;
 }
 
+// Ablation that restores the OLD single-threaded form of the two reduction kernels (MEAN / SUM_ROWS), so the
+// row split's gain can be measured at all. The split is now default-ON work, and a default-ON change with no
+// way back is unfalsifiable: this switch is the way back, and it is the same shape as the A1 rule inverted
+// (there, the diagnostic is default-off ahead of the change; here, it is default-off behind it).
+// Work is IDENTICAL in both arms -- every row is summed by exactly one thread either way -- so this is a
+// WorkRelation=equal A/B, not a fusion one.
+int ggml_cpu_reduce_serial(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = (getenv("KATAGO_CPU_REDUCE_SERIAL") != NULL) ? 1 : 0;
+    }
+    return v;
+}
+
 static __declspec(thread) uint64_t ggml_cpu_tls_repack_elems  = 0;
 static __declspec(thread) uint64_t ggml_cpu_tls_repack_cycles = 0;
 // ggml_barrier() receives no ith, so the thread index is stashed once per graph by the node loop.

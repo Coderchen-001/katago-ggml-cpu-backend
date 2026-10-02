@@ -564,6 +564,11 @@ enum ggml_cpu_bar_site {
 extern GGML_CPU_BAR_TLS int ggml_cpu_bar_site_cur;
 #define GGML_CPU_BAR_SITE(id) do { ggml_cpu_bar_site_cur = (id); } while (0)
 
+// Ablation switch for the MEAN / SUM_ROWS row split (defined in ggml-cpu.c, read once). With it set, only
+// thread 0 sums every row -- the behaviour before the split -- so the split's gain becomes measurable. Both
+// arms do identical work, which makes this a work-EQUAL A/B rather than a fusion one (see G-19).
+int ggml_cpu_reduce_serial(void);
+
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
 
