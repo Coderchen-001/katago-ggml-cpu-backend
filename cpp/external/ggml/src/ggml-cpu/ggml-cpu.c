@@ -679,6 +679,9 @@ static float    ggml_cpu_bar_act_maxabs[GGML_MAX_N_THREADS];
 static uint64_t ggml_cpu_bar_act_over  [GGML_MAX_N_THREADS];
 static uint64_t ggml_cpu_bar_act_denorm[GGML_MAX_N_THREADS];
 static uint64_t ggml_cpu_bar_act_n     [GGML_MAX_N_THREADS];
+// Which PRODUCER op the f16-denormal values come from, so a margin failure points at a site instead of at the
+// whole graph. Atomics are fine here: one add per node, and only while the flag is on.
+static uint64_t ggml_cpu_act_denorm_by_op[GGML_OP_COUNT + 1];
 // Timing-only ablation switch, read ONCE (the established form: no getenv on a hot path). Its purpose is in
 // G-19: a work-type counter does not automatically sit on the critical path, so the repack's cost has to be
 // priced by a wall-clock ablation whose operands stay finite and whose work is provably equal.
@@ -718,6 +721,141 @@ int ggml_cpu_act_range(void) {
         v = (getenv("KATAGO_CPU_ACT_RANGE") != NULL) ? 1 : 0;
     }
     return v;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// ACTIVATION CONSUMER CENSUS (KATAGO_CPU_ACT_CENSUS=1). This decides HOW the "store the activations as f16"
+// work must be split, and it is the difference between a free win and a three-model margin run:
+//
+//   * A tensor whose consumers are ALL GEMM is BIT-EQUAL when stored as f16: the GEMM then reads exactly the
+//     value from_float would have produced (same function, same rounding mode), so the bit gate settles it and
+//     no margin is needed.
+//   * A tensor with even one non-GEMM consumer (ADD / MUL / RMS_NORM / CONT / ...) changes what that consumer
+//     sees, which is a precision-class change: full-tier non-bit-identical, three-model margin.
+//
+// The only question that matters for planning is how much of the repack's VOLUME sits in the first class, so
+// this counts elements with the same expression the repack counter uses (ne10*ne11*ne12*ne13, summed over the
+// MUL_MAT consumers of each base tensor), not tensor counts.
+//
+// Tensors are keyed by their BASE (views resolved), because making a view f16 means making its base f16, and
+// a node that consumes the base directly is just as much a consumer as one that consumes a view of it.
+// Read-only, one-shot, and off unless the flag is set, so it cannot affect a measured arm.
+// ---------------------------------------------------------------------------------------------------------
+static int ggml_cpu_census_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = (getenv("KATAGO_CPU_ACT_CENSUS") != NULL) ? 1 : 0;
+    }
+    return v;
+}
+static int ggml_cpu_census_done = 0;
+
+static struct ggml_tensor * ggml_cpu_base_tensor(struct ggml_tensor * t) {
+    while (t && t->view_src) { t = t->view_src; }
+    return t;
+}
+
+// LAYOUT-TRANSPARENT ops: they rewrite how a tensor is addressed, not what values it holds, so a GEMM behind
+// one still sees the same numbers. Counting them as "a non-GEMM consumer" was the first version's mistake and
+// it forced every tensor into the margin class by construction -- the census reported 0% bit-equal while the
+// graph quite plainly contains norm outputs whose only consumer is a GEMM. Follow them instead of stopping.
+static int ggml_cpu_op_layout_transparent(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+        case GGML_OP_CONT:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static void ggml_cpu_act_consumer_census(struct ggml_cgraph * cgraph) {
+    int64_t  mm_nodes = 0, tens_bit = 0, tens_margin = 0, tens_leaf = 0;
+    uint64_t el_all = 0, el_bit = 0, el_margin = 0, el_leaf = 0;
+    // per-producer-op element totals, so the report says WHICH op's output to flip first
+    uint64_t el_bit_by_op[GGML_OP_COUNT + 1];
+    memset(el_bit_by_op, 0, sizeof(el_bit_by_op));
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * n = cgraph->nodes[i];
+        if (n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_MUL_MAT_ID) { continue; }
+        struct ggml_tensor * a = ggml_cpu_base_tensor(n->src[1]);
+        if (a == NULL) { continue; }
+        mm_nodes++;
+        const uint64_t el = (uint64_t) ggml_nelements(a);
+
+        // Value-consumer closure: walk through layout-transparent nodes instead of stopping at them.
+        struct ggml_tensor * stack[1024];
+        struct ggml_tensor * seen_t[1024];
+        int nst = 0, nseen = 0, n_val = 0;
+        int all_gemm = 1;
+        stack[nst++] = a;
+        while (nst > 0 && nseen < 1024) {
+            struct ggml_tensor * t = stack[--nst];
+            int dup = 0;
+            for (int k = 0; k < nseen; k++) { if (seen_t[k] == t) { dup = 1; break; } }
+            if (dup) { continue; }
+            seen_t[nseen++] = t;
+            for (int k = 0; k < cgraph->n_nodes; k++) {
+                struct ggml_tensor * m = cgraph->nodes[k];
+                int consumes = 0;
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    if (m->src[j] != NULL && ggml_cpu_base_tensor(m->src[j]) == t) { consumes = 1; break; }
+                }
+                if (!consumes) { continue; }
+                if (ggml_cpu_op_layout_transparent(m->op)) {
+                    if (nst < 1024) { stack[nst++] = m; }
+                } else {
+                    n_val++;
+                    if (m->op != GGML_OP_MUL_MAT && m->op != GGML_OP_MUL_MAT_ID) { all_gemm = 0; }
+                }
+            }
+        }
+
+        el_all += el;
+        const int prod_op = (a->src[0] != NULL) ? (int) a->src[0]->op : GGML_OP_COUNT;
+        if (n_val == 0 || a->src[0] == NULL) {
+            tens_leaf++; el_leaf += el;         // a leaf/input: not ours to retype
+        } else if (all_gemm) {
+            tens_bit++;  el_bit += el;
+            el_bit_by_op[prod_op] += el;
+        } else {
+            tens_margin++; el_margin += el;
+            // Name the margin-class tensors: this is the entire margin exposure of the f16-activation plan, and
+            // if that margin ever fails, this is the list to start from -- not the whole graph.
+            fprintf(stderr, "[act-census]   MARGIN CLASS: tensor \"%s\"  (%lld elements)  produced by %s  "
+                            "consumed by more than GEMM\n",
+                    a->name, (long long) ggml_nelements(a),
+                    (a->src[0] != NULL) ? ggml_op_name(a->src[0]->op) : "(leaf)");
+        }
+    }
+
+    fprintf(stderr, "[act-census] MUL_MAT nodes in this graph = %lld\n", (long long) mm_nodes);
+    fprintf(stderr, "[act-census] activation volume by consumer class (elements, and %% of all repacked):\n");
+    fprintf(stderr, "[act-census]   BIT-EQUAL  (all consumers GEMM) : %8lld tensors  %14llu  %5.1f%%\n",
+            (long long) tens_bit, (unsigned long long) el_bit,
+            el_all ? 100.0 * (double) el_bit / (double) el_all : 0.0);
+    fprintf(stderr, "[act-census]   MARGIN     (a non-GEMM consumer): %8lld tensors  %14llu  %5.1f%%\n",
+            (long long) tens_margin, (unsigned long long) el_margin,
+            el_all ? 100.0 * (double) el_margin / (double) el_all : 0.0);
+    fprintf(stderr, "[act-census]   LEAF/input (not an activation) : %8lld tensors  %14llu  %5.1f%%\n",
+            (long long) tens_leaf, (unsigned long long) el_leaf,
+            el_all ? 100.0 * (double) el_leaf / (double) el_all : 0.0);
+    fprintf(stderr, "[act-census]   TOTAL                          : %8lld tensors  %14llu\n",
+            (long long) (tens_bit + tens_margin + tens_leaf), (unsigned long long) el_all);
+    // which producer op would have to emit f16 for the bit-equal class
+    for (int op = 0; op < GGML_OP_COUNT + 1; op++) {
+        if (el_bit_by_op[op] == 0) { continue; }
+        fprintf(stderr, "[act-census]   bit-equal volume produced by %-18s : %14llu  %5.1f%% of repacked\n",
+                (op == GGML_OP_COUNT) ? "(no producer)" : ggml_op_name((enum ggml_op) op),
+                (unsigned long long) el_bit_by_op[op],
+                el_all ? 100.0 * (double) el_bit_by_op[op] / (double) el_all : 0.0);
+    }
+    fprintf(stderr, "[act-census] => the BIT-EQUAL share is what can be taken with a bit gate alone; the rest is\n");
+    fprintf(stderr, "[act-census]    a margin-class change. Quote this with the model and the DLL identity.\n");
 }
 
 static __declspec(thread) uint64_t ggml_cpu_tls_repack_elems  = 0;
@@ -1039,6 +1177,15 @@ static void ggml_cpu_bar_spin_report(void) {
                     (a_over == 0) ? "mechanically SAFE on range" : "*** BLOCKED: values exceed f16's range ***",
                     a_n ? 100.0 * (double) a_over / (double) a_n : 0.0,
                     a_n ? 100.0 * (double) a_den  / (double) a_n : 0.0);
+            // WHICH producer op the denormal values come from: 0.35% of 283M is a lot of values but only a
+            // handful of sites, and if the margin fails this is where to look first.
+            for (int op = 0; op < GGML_OP_COUNT + 1; op++) {
+                if (ggml_cpu_act_denorm_by_op[op] == 0) { continue; }
+                fprintf(stderr, "[bar-spin-by-op]   f16-denormal values produced by %-18s : %12llu  (%.4f%% of all)\n",
+                        (op == GGML_OP_COUNT) ? "(leaf/input)" : ggml_op_name((enum ggml_op) op),
+                        (unsigned long long) ggml_cpu_act_denorm_by_op[op],
+                        a_n ? 100.0 * (double) ggml_cpu_act_denorm_by_op[op] / (double) a_n : 0.0);
+            }
         }
     }
 
@@ -2162,6 +2309,9 @@ UseGgmlGemm1:;
             // measured arm, so it cannot move a timing either.
             const size_t bs2 = ggml_blck_size(vec_dot_type);
             const int64_t r_b0 = (ith * ne10/bs2) / nth, r_b1 = ((ith + 1) * ne10/bs2) / nth;
+            struct ggml_tensor * r_base = ggml_cpu_base_tensor(src1);
+            const int r_prod = (r_base != NULL && r_base->src[0] != NULL) ? (int) r_base->src[0]->op : GGML_OP_COUNT;
+            uint64_t r_den = 0;
             for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
             for (int64_t i11 = 0; i11 < ne11; i11++) {
@@ -2170,10 +2320,11 @@ UseGgmlGemm1:;
                     const float v = fabsf(p[k]);
                     if (v > ggml_cpu_tls_act_maxabs) { ggml_cpu_tls_act_maxabs = v; }
                     if (v > 65504.0f)                 { ggml_cpu_tls_act_over++; }
-                    else if (v > 0.0f && v < 6.103515625e-5f) { ggml_cpu_tls_act_denorm++; }
+                    else if (v > 0.0f && v < 6.103515625e-5f) { ggml_cpu_tls_act_denorm++; r_den++; }
                     ggml_cpu_tls_act_n++;
                 }
             }
+            if (r_den) { __atomic_fetch_add(&ggml_cpu_act_denorm_by_op[r_prod], r_den, __ATOMIC_RELAXED); }
         }
         ggml_cpu_tls_repack_cycles += ggml_cpu_bar_tsc() - repack_t0;
     } else {
@@ -5418,6 +5569,13 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
+
+    // One-shot activation-consumer census, before any timing and outside every measured arm (G-22: a
+    // flag-gated, read-only report that answers how the f16-activation work must be SPLIT).
+    if (ggml_cpu_census_enabled() && !ggml_cpu_census_done) {
+        ggml_cpu_census_done = 1;
+        ggml_cpu_act_consumer_census(cgraph);
+    }
 
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
