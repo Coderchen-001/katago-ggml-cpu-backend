@@ -1535,10 +1535,6 @@ static void ggml_compute_forward_sum_rows_f32(
 
     const ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
-        return;
-    }
-
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(dst->nb[0] == sizeof(float));
 
@@ -1549,16 +1545,27 @@ static void ggml_compute_forward_sum_rows_f32(
     GGML_ASSERT(ne2 == ne02);
     GGML_ASSERT(ne3 == ne03);
 
-    for (int64_t i3 = 0; i3 < ne03; i3++) {
-        for (int64_t i2 = 0; i2 < ne02; i2++) {
-            for (int64_t i1 = 0; i1 < ne01; i1++) {
-                float * src_row = (float *) ((char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
-                float * dst_row = (float *) ((char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3);
-                float row_sum = 0;
-                ggml_vec_sum_f32(ne00, &row_sum, src_row);
-                dst_row[0] = row_sum;
-            }
-        }
+    // ROW-SPLIT. This kernel used to `return` for ith != 0, so one thread summed every row while the other
+    // nth-1 waited at the node barrier -- pure serialisation, not peer imbalance. Measured on b10c384 at the
+    // production thread count (T=6, quiet 5900X): SUM_ROWS 1.56% of all barrier spin = 0.075% of runtime, and
+    // for a serialised node the spin IS the recoverable amount (spin = (nth-1)*T and the wall saving is
+    // T - T/nth = spin/nth, so the two agree after normalising by the span).
+    // SAFE BY CONSTRUCTION: rows are independent (each writes only its own dst_row[0]), each row's sum keeps
+    // its original order, and no row is visited twice -- so the output is bit-identical. The flat stride also
+    // covers ne01 < nth without a special case: threads with ir >= nrows simply do nothing.
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t nrows = ne01*ne02*ne03;
+
+    for (int64_t ir = ith; ir < nrows; ir += nth) {
+        const int64_t i1 = ir % ne01;
+        const int64_t i2 = (ir / ne01) % ne02;
+        const int64_t i3 = ir / (ne01*ne02);
+        float * src_row = (float *) ((char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
+        float * dst_row = (float *) ((char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3);
+        float row_sum = 0;
+        ggml_vec_sum_f32(ne00, &row_sum, src_row);
+        dst_row[0] = row_sum;
     }
 }
 
@@ -1588,10 +1595,6 @@ static void ggml_compute_forward_mean_f32(
 
     const ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
-        return;
-    }
-
     assert(src0->nb[0] == sizeof(float));
 
     GGML_TENSOR_UNARY_OP_LOCALS
@@ -1606,16 +1609,22 @@ static void ggml_compute_forward_mean_f32(
     GGML_UNUSED(ne2);
     GGML_UNUSED(ne3);
 
-    for (int64_t i03 = 0; i03 < ne03; i03++) {
-        for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (int64_t i01 = 0; i01 < ne01; i01++) {
-                ggml_vec_sum_f32(ne00,
-                        (float *) ((char *)  dst->data + i01*nb1  + i02*nb2  + i03*nb3),
-                        (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03));
+    // ROW-SPLIT: see the identical note in ggml_compute_forward_sum_rows_f32. This kernel also used to return
+    // for ith != 0. MEAN was the largest single-threaded node in the b10c384 spin table at the production
+    // thread count (T=6, quiet 5900X): 4.12% of all barrier spin = 0.197% of runtime, all of it recoverable.
+    const int ith = params->ith;
+    const int nth = params->nth;
 
-                *(float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3) /= (float) ne00;
-            }
-        }
+    for (int64_t ir = ith; ir < ne01*ne02*ne03; ir += nth) {
+        const int64_t i01 = ir % ne01;
+        const int64_t i02 = (ir / ne01) % ne02;
+        const int64_t i03 = ir / (ne01*ne02);
+
+        ggml_vec_sum_f32(ne00,
+                (float *) ((char *)  dst->data + i01*nb1  + i02*nb2  + i03*nb3),
+                (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03));
+
+        *(float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3) /= (float) ne00;
     }
 }
 

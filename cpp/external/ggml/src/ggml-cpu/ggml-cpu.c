@@ -667,6 +667,9 @@ static uint64_t ggml_cpu_bar_nodes_by_op[GGML_MAX_N_THREADS][GGML_CPU_BAR_ROW];
 static uint64_t ggml_cpu_bar_site_spin  [GGML_MAX_N_THREADS][GGML_CPU_BAR_SITE_COUNT];
 static uint64_t ggml_cpu_bar_site_waits [GGML_MAX_N_THREADS][GGML_CPU_BAR_SITE_COUNT];
 static uint64_t ggml_cpu_bar_site_cycles[GGML_MAX_N_THREADS][GGML_CPU_BAR_SITE_COUNT];
+// Did the F32->vec_dot repack run, per MUL_MAT node? Once per node, so a plain relaxed atomic is fine.
+static uint64_t ggml_cpu_mm_repack_done = 0;
+static uint64_t ggml_cpu_mm_repack_skip = 0;
 // ggml_barrier() receives no ith, so the thread index is stashed once per graph by the node loop.
 static __declspec(thread) int ggml_cpu_tls_bar_ith = 0;
 GGML_CPU_BAR_TLS int ggml_cpu_bar_site_cur = 0;
@@ -868,7 +871,43 @@ static void ggml_cpu_bar_spin_report(void) {
                 (unsigned long long) sites,
                 (unsigned long long) nodes,
                 (long long) ((int64_t) sites - (int64_t) nodes));   // barriers inside this op's kernel
+
+        // Per-thread split of this op's spin, with the class it implies on the SAME line (verdict and evidence
+        // may not live in two places). The reading:
+        //   k = 1 -> exactly one thread never waited for this op: that thread did the work  => SERIAL kernel.
+        //            The spin IS the recoverable amount for that class: with a serial node taking T, the
+        //            waiting is (nth-1)*T and removing it saves T - T/nth = spin/nth, which after normalising
+        //            by the span is the same expression as this op's spin share.
+        //   k > 1 -> several threads idle: the node was fanned out wider than it had rows => OVERSPLIT.
+        //   k = 0 -> everybody waited: balanced, or a static split with a tail, or work stealing. Those three
+        //            are NOT separable from one run -- cross-round reproducibility separates them (a static
+        //            tail repeats to the row, a stolen tail does not).
+        // NOTE: "spin anti-correlates with one's own time" is spin_i = max_j(t_j) - t_i, an IDENTITY, so it
+        // can never be used as a criterion. Hence k and reproducibility, not correlation.
+        {
+            const int nt = ggml_cpu_bar_nth > 0 ? ggml_cpu_bar_nth : 1;
+            int k = 0;
+            uint64_t tmin = ~0ULL, tmax = 0;
+            for (int t = 0; t < nt; t++) {
+                const uint64_t v = ggml_cpu_bar_spin_by_op[t][s];
+                if (v == 0) { k++; }
+                if (v < tmin) { tmin = v; }
+                if (v > tmax) { tmax = v; }
+            }
+            const char * cls = (k == 1) ? "SERIAL" : (k > 1 ? "OVERSPLIT" : "-");
+            fprintf(stderr, "[bar-spin-by-op]   threads k=%d %-9s min=%llu max=%llu [",
+                    k, cls, (unsigned long long) tmin, (unsigned long long) tmax);
+            for (int t = 0; t < nt; t++) {
+                fprintf(stderr, "%s%llu", t ? " " : "", (unsigned long long) ggml_cpu_bar_spin_by_op[t][s]);
+            }
+            fprintf(stderr, "]\n");
+        }
     }
+
+    // Did the F32->vec_dot repack run? It decides whether the pre-GEMM barrier waits on a memory copy or just
+    // on entry spread -- the question section 12.1 could not settle from the source.
+    fprintf(stderr, "[bar-spin-by-op] MUL_MAT F32->vec_dot repack: done=%llu skipped=%llu\n",
+            (unsigned long long) ggml_cpu_mm_repack_done, (unsigned long long) ggml_cpu_mm_repack_skip);
 
     // ---- site table: WHICH barrier, not which node. This is the key that reaches into the kernels. ----
     uint64_t site_spin_total = 0, site_wait_total = 0;
@@ -1920,6 +1959,11 @@ UseGgmlGemm1:;
 #endif
 
     if (src1->type != vec_dot_type) {
+        // Does the F32->vec_dot repack actually run on this model? That decides what the barrier ~40 lines below
+        // waits for: the repack (a memory-copy phase) or merely entry/dispatch spread. The probe says the
+        // weights are plain f16 and the run uses useFP16 auto, which WOULD make src1->type == vec_dot_type and
+        // skip this block entirely -- but "would" is not "does". Counted once per node; relaxed atomic.
+        if (ith == 0) { __atomic_fetch_add(&ggml_cpu_mm_repack_done, 1, __ATOMIC_RELAXED); }
         char * wdata = params->wdata;
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
@@ -1954,6 +1998,8 @@ UseGgmlGemm1:;
             }
         }
     #endif
+    } else {
+        if (ith == 0) { __atomic_fetch_add(&ggml_cpu_mm_repack_skip, 1, __ATOMIC_RELAXED); }
     }
 
     if (ith == 0) {
