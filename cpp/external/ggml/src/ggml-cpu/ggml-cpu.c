@@ -674,6 +674,11 @@ static uint64_t ggml_cpu_mm_repack_skip = 0;
 // MUL_MAT's own row where no waiting-type instrument can see it. Per-thread rows, like everything else here.
 static uint64_t ggml_cpu_bar_repack_elems [GGML_MAX_N_THREADS];
 static uint64_t ggml_cpu_bar_repack_cycles[GGML_MAX_N_THREADS];
+// Activation-range pre-flight rows (f16 exponent window); see ggml_cpu_act_range().
+static float    ggml_cpu_bar_act_maxabs[GGML_MAX_N_THREADS];
+static uint64_t ggml_cpu_bar_act_over  [GGML_MAX_N_THREADS];
+static uint64_t ggml_cpu_bar_act_denorm[GGML_MAX_N_THREADS];
+static uint64_t ggml_cpu_bar_act_n     [GGML_MAX_N_THREADS];
 // Timing-only ablation switch, read ONCE (the established form: no getenv on a hot path). Its purpose is in
 // G-19: a work-type counter does not automatically sit on the critical path, so the repack's cost has to be
 // priced by a wall-clock ablation whose operands stay finite and whose work is provably equal.
@@ -699,8 +704,29 @@ int ggml_cpu_reduce_serial(void) {
     return v;
 }
 
+// PRE-FLIGHT for "store the activations as f16" (T3/T4). f16 has 10 mantissa bits but a NARROW exponent:
+// above 65504 a value becomes inf, below 6.1e-5 it lands in the denormal range and loses bits. If any
+// activation leaves that window, the f16 change fails for a MECHANICAL reason rather than a numerical one, and
+// that is worth knowing before spending three-model margin time on it. It is also the one measurement that can
+// make bf16 interesting: bf16 carries f32's exponent range with only 7 mantissa bits, so it is strictly worse
+// than f16 on precision and strictly better on range. Which of the two matters here is an empirical question
+// about this model, not a matter of opinion. Read-only and flag-gated, so the default path (and the output
+// hash) cannot move.
+int ggml_cpu_act_range(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = (getenv("KATAGO_CPU_ACT_RANGE") != NULL) ? 1 : 0;
+    }
+    return v;
+}
+
 static __declspec(thread) uint64_t ggml_cpu_tls_repack_elems  = 0;
 static __declspec(thread) uint64_t ggml_cpu_tls_repack_cycles = 0;
+// Activation-range pre-flight (f16 exponent window), per thread. See ggml_cpu_act_range().
+static __declspec(thread) float    ggml_cpu_tls_act_maxabs = 0.0f;
+static __declspec(thread) uint64_t ggml_cpu_tls_act_over   = 0;   // |x| > 65504  -> inf in f16
+static __declspec(thread) uint64_t ggml_cpu_tls_act_denorm = 0;   // 0 < |x| < 6.1e-5 -> f16 denormal
+static __declspec(thread) uint64_t ggml_cpu_tls_act_n      = 0;
 // ggml_barrier() receives no ith, so the thread index is stashed once per graph by the node loop.
 static __declspec(thread) int ggml_cpu_tls_bar_ith = 0;
 GGML_CPU_BAR_TLS int ggml_cpu_bar_site_cur = 0;
@@ -738,6 +764,21 @@ static inline void ggml_cpu_bar_spin_drain(int ith, int slot) {
         }
         ggml_cpu_tls_repack_elems  = 0;
         ggml_cpu_tls_repack_cycles = 0;
+    }
+    // Same reason for the activation-range pre-flight: fold it before the early return below.
+    if (ggml_cpu_tls_act_n) {
+        if ((unsigned) ith < GGML_MAX_N_THREADS) {
+            ggml_cpu_bar_act_n     [ith] += ggml_cpu_tls_act_n;
+            ggml_cpu_bar_act_over  [ith] += ggml_cpu_tls_act_over;
+            ggml_cpu_bar_act_denorm[ith] += ggml_cpu_tls_act_denorm;
+            if (ggml_cpu_tls_act_maxabs > ggml_cpu_bar_act_maxabs[ith]) {
+                ggml_cpu_bar_act_maxabs[ith] = ggml_cpu_tls_act_maxabs;
+            }
+        }
+        ggml_cpu_tls_act_n      = 0;
+        ggml_cpu_tls_act_over   = 0;
+        ggml_cpu_tls_act_denorm = 0;
+        ggml_cpu_tls_act_maxabs = 0.0f;
     }
     const uint64_t spin   = ggml_cpu_tls_pending_spin;
     const uint64_t waits  = ggml_cpu_tls_pending_waits;
@@ -972,6 +1013,32 @@ static void ggml_cpu_bar_spin_report(void) {
                     ((mb_in + mb_out) / 1024.0) / ((double) rp_cyc / 4.0e9));
         } else {
             fprintf(stderr, "\n");
+        }
+    }
+
+    // Activation-range pre-flight (only when KATAGO_CPU_ACT_RANGE=1). This is the measurement that decides
+    // whether "activations in f16" is mechanically possible at all, and it is also the only thing that could
+    // make bf16 interesting: bf16 trades 3 mantissa bits for f32's exponent range.
+    {
+        uint64_t a_n = 0, a_over = 0, a_den = 0;
+        float    a_max = 0.0f;
+        for (int t = 0; t < GGML_MAX_N_THREADS; t++) {
+            a_n    += ggml_cpu_bar_act_n     [t];
+            a_over += ggml_cpu_bar_act_over  [t];
+            a_den  += ggml_cpu_bar_act_denorm[t];
+            if (ggml_cpu_bar_act_maxabs[t] > a_max) { a_max = ggml_cpu_bar_act_maxabs[t]; }
+        }
+        if (a_n > 0) {
+            fprintf(stderr, "[bar-spin-by-op] ACTIVATION RANGE (KATAGO_CPU_ACT_RANGE): max|x| = %.6g  "
+                            "elements=%llu  over f16 max (|x|>65504) = %llu  f16-denormal (0<|x|<6.1e-5) = %llu\n",
+                    (double) a_max, (unsigned long long) a_n,
+                    (unsigned long long) a_over, (unsigned long long) a_den);
+            fprintf(stderr, "[bar-spin-by-op]   => storing the activations as f16 is %s (%.4f%% of values would "
+                            "saturate to inf, %.4f%% would lose bits to the denormal range). bf16 would fix the "
+                            "range but costs 3 mantissa bits.\n",
+                    (a_over == 0) ? "mechanically SAFE on range" : "*** BLOCKED: values exceed f16's range ***",
+                    a_n ? 100.0 * (double) a_over / (double) a_n : 0.0,
+                    a_n ? 100.0 * (double) a_den  / (double) a_n : 0.0);
         }
     }
 
@@ -2090,6 +2157,24 @@ UseGgmlGemm1:;
             }
         }
     #endif
+        if (ggml_cpu_act_range()) {
+            // Scalar and flag-gated: read-only, so it cannot move the output hash, and it is off in every
+            // measured arm, so it cannot move a timing either.
+            const size_t bs2 = ggml_blck_size(vec_dot_type);
+            const int64_t r_b0 = (ith * ne10/bs2) / nth, r_b1 = ((ith + 1) * ne10/bs2) / nth;
+            for (int64_t i13 = 0; i13 < ne13; i13++)
+            for (int64_t i12 = 0; i12 < ne12; i12++)
+            for (int64_t i11 = 0; i11 < ne11; i11++) {
+                const float * p = (const float *)((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+                for (int64_t k = r_b0*bs2; k < r_b1*bs2; k++) {
+                    const float v = fabsf(p[k]);
+                    if (v > ggml_cpu_tls_act_maxabs) { ggml_cpu_tls_act_maxabs = v; }
+                    if (v > 65504.0f)                 { ggml_cpu_tls_act_over++; }
+                    else if (v > 0.0f && v < 6.103515625e-5f) { ggml_cpu_tls_act_denorm++; }
+                    ggml_cpu_tls_act_n++;
+                }
+            }
+        }
         ggml_cpu_tls_repack_cycles += ggml_cpu_bar_tsc() - repack_t0;
     } else {
         if (ith == 0) { __atomic_fetch_add(&ggml_cpu_mm_repack_skip, 1, __ATOMIC_RELAXED); }
