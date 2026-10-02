@@ -777,7 +777,14 @@ static void ggml_cpu_act_consumer_census(struct ggml_cgraph * cgraph) {
     uint64_t el_all = 0, el_bit = 0, el_margin = 0, el_leaf = 0;
     // per-producer-op element totals, so the report says WHICH op's output to flip first
     uint64_t el_bit_by_op[GGML_OP_COUNT + 1];
+    // GEMM consumers per tensor, 1..4+. THE SAVING IS PROPORTIONAL TO (k-1): a boundary cast costs one read
+    // plus one write, which is exactly what one repack costs, so moving the conversion to a boundary is free
+    // only where it DEDUPLICATES -- one conversion serving k GEMMs instead of k separate conversions.
+    uint64_t el_bit_by_k[5];
+    uint64_t n_bit_by_k[5];
     memset(el_bit_by_op, 0, sizeof(el_bit_by_op));
+    memset(el_bit_by_k, 0, sizeof(el_bit_by_k));
+    memset(n_bit_by_k, 0, sizeof(n_bit_by_k));
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * n = cgraph->nodes[i];
@@ -790,7 +797,7 @@ static void ggml_cpu_act_consumer_census(struct ggml_cgraph * cgraph) {
         // Value-consumer closure: walk through layout-transparent nodes instead of stopping at them.
         struct ggml_tensor * stack[1024];
         struct ggml_tensor * seen_t[1024];
-        int nst = 0, nseen = 0, n_val = 0;
+        int nst = 0, nseen = 0, n_val = 0, n_gemm = 0;
         int all_gemm = 1;
         stack[nst++] = a;
         while (nst > 0 && nseen < 1024) {
@@ -810,7 +817,8 @@ static void ggml_cpu_act_consumer_census(struct ggml_cgraph * cgraph) {
                     if (nst < 1024) { stack[nst++] = m; }
                 } else {
                     n_val++;
-                    if (m->op != GGML_OP_MUL_MAT && m->op != GGML_OP_MUL_MAT_ID) { all_gemm = 0; }
+                    if (m->op == GGML_OP_MUL_MAT || m->op == GGML_OP_MUL_MAT_ID) { n_gemm++; }
+                    else { all_gemm = 0; }
                 }
             }
         }
@@ -822,6 +830,8 @@ static void ggml_cpu_act_consumer_census(struct ggml_cgraph * cgraph) {
         } else if (all_gemm) {
             tens_bit++;  el_bit += el;
             el_bit_by_op[prod_op] += el;
+            { const int kk = (n_gemm > 4) ? 4 : ((n_gemm < 1) ? 1 : n_gemm);
+              el_bit_by_k[kk] += el; n_bit_by_k[kk]++; }
         } else {
             tens_margin++; el_margin += el;
             // Name the margin-class tensors: this is the entire margin exposure of the f16-activation plan, and
@@ -853,6 +863,20 @@ static void ggml_cpu_act_consumer_census(struct ggml_cgraph * cgraph) {
                 (op == GGML_OP_COUNT) ? "(no producer)" : ggml_op_name((enum ggml_op) op),
                 (unsigned long long) el_bit_by_op[op],
                 el_all ? 100.0 * (double) el_bit_by_op[op] / (double) el_all : 0.0);
+    }
+    fprintf(stderr, "[act-census] bit-equal volume by GEMM-consumer count (the saving is (k-1)/k of it):\n");
+    for (int k = 1; k <= 4; k++) {
+        fprintf(stderr, "[act-census]   k=%s : %6lld tensors  %14llu  %5.1f%% of repacked\n",
+                (k == 4) ? "4+" : (k == 1 ? "1 " : (k == 2 ? "2 " : "3 ")),
+                (long long) n_bit_by_k[k], (unsigned long long) el_bit_by_k[k],
+                el_all ? 100.0 * (double) el_bit_by_k[k] / (double) el_all : 0.0);
+    }
+    {
+        double dedup = 0.0;
+        for (int k = 1; k <= 4; k++) { const int kk = (k == 4) ? 4 : k; dedup += (double) el_bit_by_k[k] * (double)(kk - 1) / (double) kk; }
+        fprintf(stderr, "[act-census]   => a boundary cast costs one read plus one write, which is exactly one\n");
+        fprintf(stderr, "[act-census]      repack, so the only saving available is deduplication: %.1f%% of the volume\n",
+                el_all ? 100.0 * dedup / (double) el_all : 0.0);
     }
     fprintf(stderr, "[act-census] => the BIT-EQUAL share is what can be taken with a bit gate alone; the rest is\n");
     fprintf(stderr, "[act-census]    a margin-class change. Quote this with the model and the DLL identity.\n");
