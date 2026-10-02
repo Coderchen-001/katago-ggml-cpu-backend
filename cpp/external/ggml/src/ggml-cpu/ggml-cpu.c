@@ -2005,14 +2005,17 @@ UseGgmlGemm1:;
         // done=1056 skipped=8 per process on b10c384.
         //
         // And the wait is only the visible half. The repack ITSELF is a full read of src1 + write of src1',
-        // and its cost sits in MUL_MAT's own work -- invisible to a waiting-type instrument. Two published
-        // estimates of that cost disagree by an order of magnitude, so measure it instead of arguing:
-        //   * this project's own benchgemm A/B (f16f32 -> f16f16, which removes the repack entirely) differed
-        //     by <=2% on six shapes (cpu-ggml-design.md:1498), bounding it there;
-        //   * a traffic estimate from the byte count (src1 is [576,1083] f32 for the shape this model's probe
-        //     prints, so ~3.75 MB of read+write per repacked node, times 132 nodes per walk) puts it an order
-        //     of magnitude higher.
-        // bytes and cycles per walk decide which is right, and they cost three counters.
+        // and its cost sits in MUL_MAT's own work -- invisible to a waiting-type instrument. The counter below
+        // measures it directly. Two other readings are on record and they DISAGREE, so this number is not a
+        // confirmation of either:
+        //   * benchgemm's f16f32 -> f16f16 A/B (which does time the whole mul_mat, repack included) came out at
+        //     a median of -0.35% over twelve shapes with the sign split 5/5 -- i.e. about zero;
+        //   * a traffic estimate from the byte count (300-400 MB per walk) put it at 5-9%, but that used DRAM
+        //     bandwidth for bytes that are cache-hot: 202 MB per walk against ~1 ms of wall is an aggregate of
+        //     about 200 GB/s, which no DRAM delivers (G-18).
+        // A correct ablation (zero-fill instead of convert, finite operands, work-equal, paired) decides which
+        // is right. It is NOT built yet: the first attempt skipped the write entirely, produced non-finite
+        // activations, and made KataGo stop printing raw-nn after 1.3 KB instead of 58.6 KB -- see G-19.
         if (ith == 0) { __atomic_fetch_add(&ggml_cpu_mm_repack_done, 1, __ATOMIC_RELAXED); }
         char * wdata = params->wdata;
         const uint64_t repack_t0 = ggml_cpu_bar_tsc();
