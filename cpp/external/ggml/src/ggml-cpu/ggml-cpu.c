@@ -674,6 +674,17 @@ static uint64_t ggml_cpu_mm_repack_skip = 0;
 // MUL_MAT's own row where no waiting-type instrument can see it. Per-thread rows, like everything else here.
 static uint64_t ggml_cpu_bar_repack_elems [GGML_MAX_N_THREADS];
 static uint64_t ggml_cpu_bar_repack_cycles[GGML_MAX_N_THREADS];
+// Timing-only ablation switch, read ONCE (the established form: no getenv on a hot path). Its purpose is in
+// G-19: a work-type counter does not automatically sit on the critical path, so the repack's cost has to be
+// priced by a wall-clock ablation whose operands stay finite and whose work is provably equal.
+static int ggml_cpu_mm_norepack(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = (getenv("KATAGO_CPU_MM_NOREPACK") != NULL) ? 1 : 0;
+    }
+    return v;
+}
+
 static __declspec(thread) uint64_t ggml_cpu_tls_repack_elems  = 0;
 static __declspec(thread) uint64_t ggml_cpu_tls_repack_cycles = 0;
 // ggml_barrier() receives no ith, so the thread index is stashed once per graph by the node loop.
@@ -2045,13 +2056,22 @@ UseGgmlGemm1:;
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    // Elements this thread converts, into TLS: one add per ROW, no shared counter (a shared one
-                    // would be ~1000 contended atomics per node). mul_mat_id has the identical loop and is
-                    // counted too; it never runs in KataGo's graph, so it contributes zero.
                     ggml_cpu_tls_repack_elems += (uint64_t) (ne10_block_end - ne10_block_start) * bs;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+                    void * wdst = (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0);
+                    if (ggml_cpu_mm_norepack()) {
+                        // ABLATION (KATAGO_CPU_MM_NOREPACK=1): identical loop, identical write volume, no F32
+                        // read and no conversion arithmetic. Zeros keep the operands FINITE, which is the whole
+                        // reason this form is used instead of "skip it": skipping produced non-finite
+                        // activations, made KataGo stop printing raw-nn after 1.3 KB instead of 58.6 KB, and a
+                        // single unpaired wall reading then looked like a 2.2x win (G-19).
+                        // The fill's own cost is INSIDE this measurement, so full-vs-ablation is a LOWER BOUND
+                        // on the read+convert half; if even that shows ~0, the repack overlaps and can close.
+                        memset(wdst, 0, (size_t) (ne10_block_end - ne10_block_start) * bs * ggml_type_size(vec_dot_type));
+                    } else {
+                        from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                                   wdst,
+                                   (ne10_block_end - ne10_block_start) * bs);
+                    }
                 }
             }
         }
@@ -2341,13 +2361,22 @@ static void ggml_compute_forward_mul_mat_id(
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    // Elements this thread converts, into TLS: one add per ROW, no shared counter (a shared one
-                    // would be ~1000 contended atomics per node). mul_mat_id has the identical loop and is
-                    // counted too; it never runs in KataGo's graph, so it contributes zero.
                     ggml_cpu_tls_repack_elems += (uint64_t) (ne10_block_end - ne10_block_start) * bs;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+                    void * wdst = (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0);
+                    if (ggml_cpu_mm_norepack()) {
+                        // ABLATION (KATAGO_CPU_MM_NOREPACK=1): identical loop, identical write volume, no F32
+                        // read and no conversion arithmetic. Zeros keep the operands FINITE, which is the whole
+                        // reason this form is used instead of "skip it": skipping produced non-finite
+                        // activations, made KataGo stop printing raw-nn after 1.3 KB instead of 58.6 KB, and a
+                        // single unpaired wall reading then looked like a 2.2x win (G-19).
+                        // The fill's own cost is INSIDE this measurement, so full-vs-ablation is a LOWER BOUND
+                        // on the read+convert half; if even that shows ~0, the repack overlaps and can close.
+                        memset(wdst, 0, (size_t) (ne10_block_end - ne10_block_start) * bs * ggml_type_size(vec_dot_type));
+                    } else {
+                        from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                                   wdst,
+                                   (ne10_block_end - ne10_block_start) * bs);
+                    }
                 }
             }
         }
