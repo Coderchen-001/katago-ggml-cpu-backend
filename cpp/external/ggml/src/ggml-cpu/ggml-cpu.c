@@ -824,7 +824,9 @@ static void ggml_cpu_act_consumer_census(struct ggml_cgraph * cgraph) {
         }
 
         el_all += el;
-        const int prod_op = (a->src[0] != NULL) ? (int) a->src[0]->op : GGML_OP_COUNT;
+        // a is the view ROOT, so a->op is the op whose kernel WRITES these values: that is the op whose output
+        // has to become f16. a->src[0]->op is the op that produced a's INPUT -- one generation too early.
+        const int prod_op = (int) a->op;
         if (n_val == 0 || a->src[0] == NULL) {
             tens_leaf++; el_leaf += el;         // a leaf/input: not ours to retype
         } else if (all_gemm) {
@@ -839,23 +841,27 @@ static void ggml_cpu_act_consumer_census(struct ggml_cgraph * cgraph) {
             fprintf(stderr, "[act-census]   MARGIN CLASS: tensor \"%s\"  (%lld elements)  produced by %s  "
                             "consumed by more than GEMM\n",
                     a->name, (long long) ggml_nelements(a),
-                    (a->src[0] != NULL) ? ggml_op_name(a->src[0]->op) : "(leaf)");
+                    ggml_op_name(a->op));
         }
     }
 
     fprintf(stderr, "[act-census] MUL_MAT nodes in this graph = %lld\n", (long long) mm_nodes);
-    fprintf(stderr, "[act-census] activation volume by consumer class (elements, and %% of all repacked):\n");
-    fprintf(stderr, "[act-census]   BIT-EQUAL  (all consumers GEMM) : %8lld tensors  %14llu  %5.1f%%\n",
+    fprintf(stderr, "[act-census] activation volume by consumer class (elements, and %% of all repacked).\n");
+    fprintf(stderr, "[act-census] the count column is MUL_MAT NODES, not tensors: a base tensor consumed by k\n");
+    fprintf(stderr, "[act-census] GEMMs is visited k times here. The volume column is per node, so it is exactly\n");
+    fprintf(stderr, "[act-census] the repack counter's expression and the percentages do sum to 100%%.\n");
+    fprintf(stderr, "[act-census]   BIT-EQUAL  (all consumers GEMM) : %8lld nodes  %14llu  %5.1f%%\n",
             (long long) tens_bit, (unsigned long long) el_bit,
             el_all ? 100.0 * (double) el_bit / (double) el_all : 0.0);
-    fprintf(stderr, "[act-census]   MARGIN     (a non-GEMM consumer): %8lld tensors  %14llu  %5.1f%%\n",
+    fprintf(stderr, "[act-census]   MARGIN     (a non-GEMM consumer): %8lld nodes  %14llu  %5.1f%%\n",
             (long long) tens_margin, (unsigned long long) el_margin,
             el_all ? 100.0 * (double) el_margin / (double) el_all : 0.0);
-    fprintf(stderr, "[act-census]   LEAF/input (not an activation) : %8lld tensors  %14llu  %5.1f%%\n",
+    fprintf(stderr, "[act-census]   LEAF/input (not an activation) : %8lld nodes  %14llu  %5.1f%%\n",
             (long long) tens_leaf, (unsigned long long) el_leaf,
             el_all ? 100.0 * (double) el_leaf / (double) el_all : 0.0);
-    fprintf(stderr, "[act-census]   TOTAL                          : %8lld tensors  %14llu\n",
+    fprintf(stderr, "[act-census]   TOTAL                          : %8lld nodes  %14llu\n",
             (long long) (tens_bit + tens_margin + tens_leaf), (unsigned long long) el_all);
+    fprintf(stderr, "[act-census]   (distinct bit-equal TENSORS = sum over k of nodes/k, below)\n");
     // which producer op would have to emit f16 for the bit-equal class
     for (int op = 0; op < GGML_OP_COUNT + 1; op++) {
         if (el_bit_by_op[op] == 0) { continue; }
@@ -864,12 +870,20 @@ static void ggml_cpu_act_consumer_census(struct ggml_cgraph * cgraph) {
                 (unsigned long long) el_bit_by_op[op],
                 el_all ? 100.0 * (double) el_bit_by_op[op] / (double) el_all : 0.0);
     }
-    fprintf(stderr, "[act-census] bit-equal volume by GEMM-consumer count (the saving is (k-1)/k of it):\n");
+    fprintf(stderr, "[act-census] bit-equal volume by GEMM-consumer count k. This table is the PRICE of the plan:\n");
+    fprintf(stderr, "[act-census] a tensor with k consumers is converted k times today, so the conversion volume\n");
+    fprintf(stderr, "[act-census] here is k*elements and the saving from converting ONCE is (k-1)/k of it.\n");
     for (int k = 1; k <= 4; k++) {
-        fprintf(stderr, "[act-census]   k=%s : %6lld tensors  %14llu  %5.1f%% of repacked\n",
+        fprintf(stderr, "[act-census]   k=%s : %6lld nodes  %14llu  %5.1f%% of repacked\n",
                 (k == 4) ? "4+" : (k == 1 ? "1 " : (k == 2 ? "2 " : "3 ")),
                 (long long) n_bit_by_k[k], (unsigned long long) el_bit_by_k[k],
                 el_all ? 100.0 * (double) el_bit_by_k[k] / (double) el_all : 0.0);
+    }
+    {
+        // nodes/k is exact for a bucket that holds only one k; the "4+" bucket mixes k>=4, so it is excluded.
+        long long td = 0;
+        for (int k = 1; k <= 3; k++) { td += n_bit_by_k[k] / k; }
+        fprintf(stderr, "[act-census]   => distinct bit-equal TENSORS (k=1..3) = %lld  (k=4+ bucket not separable)\n", td);
     }
     {
         double dedup = 0.0;
