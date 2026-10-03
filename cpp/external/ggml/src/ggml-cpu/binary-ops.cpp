@@ -161,6 +161,12 @@ static void binary_op(const ggml_compute_params * params, ggml_tensor * dst) {
 
     /*  */ if (src0->type == GGML_TYPE_F32  && src1->type == GGML_TYPE_F32  && dst->type == GGML_TYPE_F32) { // all f32
         apply_binary_op<op, float, float, float>(params, dst);
+    } else if (src0->type == GGML_TYPE_F32  && src1->type == GGML_TYPE_F32  && dst->type == GGML_TYPE_F16) {
+        // KATAGO_CPU_MUL_F16 (R2 batch 1): f32 inputs, f16 STORE. The op still runs in f32 and only the
+        // store rounds -- through type_conversion_table<ggml_fp16_t>::from_f32, i.e. the very conversion
+        // mul_mat applies when it converts this activation to its vec_dot_type. A GEMM that reads this
+        // tensor as src1 therefore gets the exact bits it used to compute for itself.
+        apply_binary_op<op, float, float, ggml_fp16_t>(params, dst);
     } else if (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F16  && dst->type == GGML_TYPE_F16) { // all f16
         apply_binary_op<op, ggml_fp16_t, ggml_fp16_t, ggml_fp16_t>(params, dst);
     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) { // all bf16

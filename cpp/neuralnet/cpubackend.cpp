@@ -1146,6 +1146,171 @@ static void forceF32AccOnF16MulMats(ggml_cgraph* g, bool global,
   }
 }
 
+//--------------------------------------------------------------
+// KATAGO_CPU_MUL_F16=1 -- R2 batch 1: store the output of a MUL whose every consumer is a GEMM as F16.
+//
+// BIT-IDENTICAL, and deliberately NOT a precision change. The MUL keeps its F32 inputs and still
+// computes in F32; only the STORE rounds. binary_op<op_mul> dispatches on (src0,src1,dst), and the
+// f32,f32->f16 case stores through type_conversion_table<ggml_fp16_t>::from_f32, which is
+// GGML_CPU_FP32_TO_FP16 -- the same conversion mul_mat applies when it converts this very activation
+// to its vec_dot_type. So the GEMM reads exactly the bits it used to compute for itself.
+//
+// WHAT it buys: with src1 already F16, `if (src1->type != vec_dot_type)` in ggml-cpu's mul_mat is
+// skipped outright. The conversion does not move somewhere else, it stops happening -- which is the
+// distinction that the repack's first pricing got wrong (a cast at the boundary costs a read plus a
+// write, i.e. exactly one repack, so it only ever saved deduplication).
+//
+// The predicate is the activation census's predicate, evaluated on the BUILT graph, so it cannot drift
+// from the volume the census measured: every value-consumer of the tensor must be a GEMM. That is
+// exactly what stops any arithmetic op from seeing the rounded value, which is why a bit gate settles
+// this and no margin run is owed.
+//
+// CONSERVATIVE ON PURPOSE: a consumer that VIEWS or COPIES the tensor captured nb[] and type from it at
+// creation time, so retyping underneath it would corrupt addressing rather than convert data. Only
+// consumers that read the tensor DIRECTLY as a GEMM's src1 are accepted; a view, a CONT or an
+// element-wise op disqualifies the tensor, and the reason is counted so the log says how much of the
+// census's volume this rule actually reached instead of implying it reached all of it.
+// The VOLUME decomposition matters more than the count. The census attributes a tensor to its PRODUCER
+// (a MUL), but that says nothing about what stands between that MUL's store and the GEMM. Four cases,
+// and only the first is what this pass can take today:
+//   direct  -- the GEMM reads t itself                         -> retyped here
+//   viaView -- the GEMM reads a pure reindexing of t           -> reachable, but the view chain's nb[]
+//                                                                 was captured from F32 and must be
+//                                                                 rescaled in step with t
+//   viaCopy -- a CONT/materialised copy sits in between        -> the copy is a real F32 pass; retyping t
+//                                                                 beneath it would corrupt, so it is the
+//                                                                 COPY that has to convert -- that is R1
+//                                                                 (a boundary cast), not R2
+//   other   -- an arithmetic consumer sees the value           -> NOT bit-equal, must stay F32
+struct MulF16Stats {
+  int candidates = 0;
+  int retyped = 0;
+  int64_t elems = 0;
+  int64_t elemsDirect = 0;
+  int64_t elemsViaView = 0;
+  int64_t elemsViaCopy = 0;
+  int64_t elemsOther = 0;
+  int64_t elemsNoConsumer = 0;
+};
+
+static MulF16Stats retypeGemmOnlyMulOutputsToF16(ggml_cgraph* g, bool dbg) {
+  MulF16Stats st;
+  const int n = ggml_graph_n_nodes(g);
+  for(int i = 0; i < n; i++) {
+    ggml_tensor* t = ggml_graph_node(g, i);
+    if(t->op != GGML_OP_MUL || t->type != GGML_TYPE_F32 || t->view_src != NULL)
+      continue;
+    st.candidates++;
+
+    // Consumer closure over PURE VIEWS. The GEMM almost never reads the MUL's output itself: the
+    // emitter transposes/reshapes it first (matmul() transposes and only materialises a CONT when the
+    // transpose is not contiguous). So the walk has to FOLLOW views to find the GEMMs, and the retype
+    // has to move the whole chain together.
+    ggml_tensor* work[64];
+    int nw = 0;
+    work[nw++] = t;
+    int nGemm = 0, nCopy = 0, nOther = 0, nSrc0Gemm = 0;
+    const char* firstOtherOp = "-";
+    const char* firstCopyOp  = "-";
+    for(int wi = 0; wi < nw; wi++) {
+      ggml_tensor* cur = work[wi];
+      for(int j = 0; j < n; j++) {
+        ggml_tensor* m = ggml_graph_node(g, j);
+        for(int s = 0; s < GGML_MAX_SRC; s++) {
+          if(m->src[s] == NULL)
+            break;
+          if(m->src[s] != cur)
+            continue;
+          if(m->op == GGML_OP_MUL_MAT || m->op == GGML_OP_MUL_MAT_ID) {
+            // src0 is the weight; the activation we want to retype has to be src1
+            if(s != 1) nSrc0Gemm++; else nGemm++;
+          }
+          else if(m->op == GGML_OP_CONT || m->op == GGML_OP_CPY || m->op == GGML_OP_DUP) {
+            nCopy++;
+            if(firstCopyOp[0] == '-') firstCopyOp = ggml_op_name(m->op);
+          }
+          else if(m->op == GGML_OP_RESHAPE || m->op == GGML_OP_VIEW ||
+                  m->op == GGML_OP_PERMUTE || m->op == GGML_OP_TRANSPOSE) {
+            if(nw < 64) work[nw++] = m;
+            else nOther++;   // closure overflow: treat as disqualifying rather than silently truncate
+          }
+          else {
+            nOther++;
+            if(firstOtherOp[0] == '-') firstOtherOp = ggml_op_name(m->op);
+          }
+          break;
+        }
+      }
+    }
+    const int64_t el = ggml_nelements(t);
+    if(nOther > 0 || nSrc0Gemm > 0) {
+      st.elemsOther += el;
+      if(dbg && st.candidates <= 20)
+        fprintf(stderr, "[mul-f16]   \"%s\" ne=%lldx%lld -> OTHER (%d consumers, first=%s)\n",
+                t->name, (long long)t->ne[0], (long long)t->ne[1], nOther + nSrc0Gemm,
+                nOther > 0 ? firstOtherOp : "gemm-src0");
+      continue;
+    }
+    if(nCopy > 0) {
+      st.elemsViaCopy += el;
+      if(dbg && st.candidates <= 20)
+        fprintf(stderr, "[mul-f16]   \"%s\" ne=%lldx%lld -> COPY (%d, first=%s), %d GEMMs\n",
+                t->name, (long long)t->ne[0], (long long)t->ne[1], nCopy, firstCopyOp, nGemm);
+      continue;
+    }
+    if(nGemm == 0) {
+      st.elemsNoConsumer += el;
+      if(dbg && st.candidates <= 20)
+        fprintf(stderr, "[mul-f16]   \"%s\" ne=%lldx%lld -> NO CONSUMER\n",
+                t->name, (long long)t->ne[0], (long long)t->ne[1]);
+      continue;
+    }
+    if(nw > 1)
+      st.elemsViaView += el;
+    else
+      st.elemsDirect += el;
+
+    // Validate BEFORE mutating: a half-converted chain is worse than an unconverted one.
+    bool ok = ggml_is_contiguous(t) && t->nb[0] == sizeof(float);
+    for(int wi = 1; wi < nw && ok; wi++) {
+      if(work[wi]->view_offs % 2 != 0)
+        ok = false;
+      for(int d = 0; d < GGML_MAX_DIMS; d++) {
+        if(work[wi]->nb[d] % 2 != 0)
+          ok = false;
+      }
+    }
+    if(!ok)
+      continue;
+
+    // t: contiguous F32 -> contiguous F16, nb[] recomputed exactly as ggml_new_tensor would.
+    t->type = GGML_TYPE_F16;
+    {
+      size_t nb = ggml_type_size(GGML_TYPE_F16);
+      for(int d = 0; d < GGML_MAX_DIMS; d++) {
+        t->nb[d] = nb;
+        nb *= (size_t)t->ne[d];
+      }
+    }
+    // Views: every nb[] and view_offs is a BYTE quantity linear in the element size, so halving each of
+    // them is exactly the same view expressed in F16 -- no reindexing, no offset arithmetic to redo.
+    // mul_mat then asserts that src1's fastest stride equals the element size, so a mistake here aborts
+    // instead of quietly reading the wrong half of the buffer.
+    for(int wi = 1; wi < nw; wi++) {
+      work[wi]->type = GGML_TYPE_F16;
+      work[wi]->view_offs /= 2;
+      for(int d = 0; d < GGML_MAX_DIMS; d++)
+        work[wi]->nb[d] /= 2;
+    }
+    st.retyped++;
+    st.elems += el;
+    if(dbg)
+      fprintf(stderr, "[mul-f16]   RETYPE \"%s\" ne=%lldx%lld  (%d GEMM consumers, %d views in chain)\n",
+              t->name, (long long)t->ne[0], (long long)t->ne[1], nGemm, nw - 1);
+  }
+  return st;
+}
+
 // ggml-cpu has exactly ONE graph fusion: {RMS_NORM, MUL} (ggml-cpu.c:3087-3104), and it is a
 // runtime pattern match with a hard predicate -- the Mul must directly follow the RMS_NORM in the
 // cgraph, all three tensors must be F32, and the weight view must be contiguous F32 with the same
@@ -1680,6 +1845,29 @@ struct ComputeHandle {
     const char* precClass = precF32Acc ? "f32acc"
                           : (precMixed ? "mixed(env subset)"
                                        : "ggml-default(f16acc on fp16 devices)");
+
+    // KATAGO_CPU_MUL_F16=1 -- R2 batch 1 (MUL only). Off by default, so the A/B arm IS the env:
+    // run-knob-ab.ps1 -Knob KATAGO_CPU_MUL_F16. It must run after the graph is built and before gallocr
+    // allocates, because it changes a tensor's type and nb[] in place.
+    if(getenv("KATAGO_CPU_MUL_F16") != nullptr && getenv("KATAGO_CPU_MUL_F16")[0] == '1') {
+      const bool mfDbg = getenv("KATAGO_CPU_MUL_F16_DBG") != nullptr;
+      MulF16Stats mfs = retypeGemmOnlyMulOutputsToF16(graph, mfDbg);
+      // stderr, not the logger: this is the instrument's own line and it must be visible in every
+      // configuration, including the ones that pass no logger at all.
+      fprintf(stderr, "[mul-f16] MUL outputs: %d candidates, %d retyped (%lld elements). Volume by what "
+                      "stands between the MUL store and the GEMM: direct=%lld  viaView=%lld  viaCopy=%lld  "
+                      "other=%lld  noConsumer=%lld\n",
+              mfs.candidates, mfs.retyped, (long long)mfs.elems,
+              (long long)mfs.elemsDirect, (long long)mfs.elemsViaView, (long long)mfs.elemsViaCopy,
+              (long long)mfs.elemsOther, (long long)mfs.elemsNoConsumer);
+      if(logger != NULL)
+        logger->write(string("CPU backend: MUL->F16 (KATAGO_CPU_MUL_F16): retyped ") +
+          Global::intToString(mfs.retyped) + "/" + Global::intToString(mfs.candidates) +
+          " MUL outputs; volume direct=" + Global::intToString((int)mfs.elemsDirect) +
+          " viaView=" + Global::intToString((int)mfs.elemsViaView) +
+          " viaCopy=" + Global::intToString((int)mfs.elemsViaCopy) +
+          " other=" + Global::intToString((int)mfs.elemsOther));
+    }
 
     // --- Allocate and upload weights ---
     // Weights get their own buffers first (either per-tensor in the debug
