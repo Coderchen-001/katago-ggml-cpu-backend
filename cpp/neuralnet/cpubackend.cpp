@@ -1305,8 +1305,21 @@ static MulF16Stats retypeGemmOnlyMulOutputsToF16(ggml_cgraph* g, bool dbg) {
     st.retyped++;
     st.elems += el;
     if(dbg)
-      fprintf(stderr, "[mul-f16]   RETYPE \"%s\" ne=%lldx%lld  (%d GEMM consumers, %d views in chain)\n",
-              t->name, (long long)t->ne[0], (long long)t->ne[1], nGemm, nw - 1);
+      // THREE-WAY DIAGNOSTIC. The conversion pass was doing TWO things: its own work (priced at +1.66% by the
+      // zero-fill control) and MATERIALISING the layout the GEMM wants to read. This line says which case each
+      // retyped tensor falls into, so the next route is picked from a mechanism and not from the derived
+      // -4.03% (which rests on two assumptions: linearity in volume, and additivity):
+      //   (a) nb1 != ne0*2                 -> the repack was transposing/densifying. The stride has to live
+      //                                       somewhere, and on x86 a scatter-write usually costs more than a
+      //                                       gather-read, so moving it to the producer is not free either.
+      //   (b) nb1 == ne0*2, data%32 != 0    -> unaligned vector loads; the fix is cheap (pad to 32B).
+      //   (c) dense AND aligned             -> neither: temporal locality (the converted buffer is written
+      //                                       immediately before it is read) or a different sgemm entry.
+      fprintf(stderr, "[mul-f16]   RETYPE \"%s\" ne=%lldx%lld (%d GEMM consumers, %d views) "
+                      "nb1=%lld %s ne0*2=%lld  data%%32=%lld\n",
+              t->name, (long long)t->ne[0], (long long)t->ne[1], nGemm, nw - 1,
+              (long long)t->nb[1], (t->nb[1] == (size_t)t->ne[0]*2 ? "==" : "!="),
+              (long long)t->ne[0]*2, (long long)(((uintptr_t)t->data) % 32));
   }
   return st;
 }
