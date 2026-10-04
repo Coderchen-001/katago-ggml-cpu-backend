@@ -1462,6 +1462,58 @@ static void reportMulF16Layout() {
 // ggml-cpu has exactly ONE graph fusion: {RMS_NORM, MUL} (ggml-cpu.c:3087-3104), and it is a
 // runtime pattern match with a hard predicate -- the Mul must directly follow the RMS_NORM in the
 // cgraph, all three tensors must be F32, and the weight view must be contiguous F32 with the same
+// ---------------------------------------------------------------------------------------------------
+// CHUNK-SPLIT AUDIT (KATAGO_CPU_CHUNK_DBG=1) -- how many nodes CANNOT even fill the pool?
+//
+// Every element-wise op (ADD/SUB/MUL/DIV, all unaries, cumsum/fill/tri) splits its work with
+// get_thread_range() (ggml-cpu/common.h:74):
+//     const int64_t dr  = (nr + nth - 1)/nth;    // ceil
+//     const int64_t ir0 = dr*ith;
+//     const int64_t ir1 = MIN(ir0 + dr, nr);     // nr < nth  =>  ir0 >= nr  =>  THIS THREAD DOES NOTHING
+// a static contiguous block split that (a) always hands the LAST thread the short remainder and (b) gives
+// threads NOTHING AT ALL when nr < nth. That second case is the interesting one, and it is worth
+// measuring before touching the function, because its fix is provably bit-identical: each output row is
+// computed by exactly one thread either way, so no accumulation order can move.
+//
+// WHY NOT THE BAR-SPIN TABLE: that table attributes waiting to the op that OWNS the barrier, and a pool
+// waiting after a node whose work sat on one thread looks exactly like a pool waiting after a balanced
+// node -- the k=0 column says so itself ("balanced, a static split with a tail, or work stealing; those
+// three are NOT separable from one run"). What separates them is the SHAPE DISTRIBUTION, which is a
+// property of the graph: no timing, no counters, no quiet machine, no load sensitivity.
+//
+// The output is one line per (op, nrows) pair rather than a verdict, so the reader applies its own nth:
+// an op is at risk for a thread count exactly when nrows < nth.
+static void auditThreadSplit(ggml_cgraph* g) {
+  struct Row { int op; int64_t nrows; int64_t nodes; int64_t elems; };
+  std::vector<Row> rows;
+  const int n = ggml_graph_n_nodes(g);
+  for(int i = 0; i < n; i++) {
+    ggml_tensor* node = ggml_graph_node(g, i);
+    // The argument get_thread_range actually receives at every call site: src0 for the element-wise and
+    // unary ops, dst for fill. For element-wise ops the two agree, so this is the right quantity.
+    ggml_tensor* basis = (node->src[0] != NULL) ? node->src[0] : node;
+    const int64_t nr = ggml_nrows(basis);
+    const int64_t el = ggml_nelements(node);
+    size_t r = 0;
+    for(; r < rows.size(); r++)
+      if(rows[r].op == (int)node->op && rows[r].nrows == nr)
+        break;
+    if(r == rows.size()) {
+      Row nw; nw.op = (int)node->op; nw.nrows = nr; nw.nodes = 0; nw.elems = 0;
+      rows.push_back(nw);
+    }
+    rows[r].nodes++;
+    rows[r].elems += el;
+  }
+  fprintf(stderr, "[chunk-audit] (op, nrows) distribution over %d graph nodes. An op under-splits when "
+                  "nrows < nth; get_thread_range gives such a thread an EMPTY range (common.h:74). "
+                  "nth is the production thread count from the config.\n", n);
+  for(size_t r = 0; r < rows.size(); r++)
+    fprintf(stderr, "[chunk-audit] op=%-18s nrows=%-8lld nodes=%-6lld elems=%lld\n",
+            ggml_op_name((enum ggml_op)rows[r].op), (long long)rows[r].nrows,
+            (long long)rows[r].nodes, (long long)rows[r].elems);
+}
+
 // ne[0]. Whether OUR graph satisfies it is not obvious (weights are F16 everywhere else), so this
 // reports the necessary conditions it can check with public APIs. ggml's own fuser additionally
 // requires the RMS_NORM result to have exactly one use; the src-use count below is that check in
@@ -1990,6 +2042,10 @@ struct ComputeHandle {
       // to hide the request above: it only means "the env named no class".
       precSource = "env(no class named)";
     }
+    // Shape audit, independent of every knob above and of the MUL->F16 pass: it only reads ne[], so it
+    // runs on the plain graph and needs no allocation, no counters and no timing.
+    if(getenv("KATAGO_CPU_CHUNK_DBG") != nullptr && getenv("KATAGO_CPU_CHUNK_DBG")[0] == '1')
+      auditThreadSplit(graph);
     const char* precClass = precF32Acc ? "f32acc"
                           : (precMixed ? "mixed(env subset)"
                                        : "ggml-default(f16acc on fp16 devices)");
