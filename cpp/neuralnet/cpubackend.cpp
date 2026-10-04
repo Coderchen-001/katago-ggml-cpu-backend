@@ -1191,10 +1191,50 @@ struct MulF16Stats {
   int64_t elemsViaCopy = 0;
   int64_t elemsOther = 0;
   int64_t elemsNoConsumer = 0;
+  // WHICH GEMM PATH each consumer will take, counted over the retyped tensors. This is decidable from
+  // nb[]/ne[] alone, i.e. before the allocator runs, and it is not an opinion: ggml-cpu.c:2249 gates the
+  // FIRST llamafile sgemm on `ggml_is_contiguous(src1)`, and when src1->type == vec_dot_type the repack
+  // (2279) and the SECOND sgemm (2381) are both skipped as well, so a non-contiguous src1 falls all the
+  // way through to the generic chunk kernel at 2410. Reading 664 f16 activations with identical strides
+  // and a different kernel is the difference between "the conversion was redundant work" and "the
+  // conversion was the thing that made the fast kernel applicable".
+  int     gemmTotal          = 0;
+  int     gemmContiguous     = 0;
+  int64_t elemsGemmSite1     = 0;
+  int64_t elemsGemmGeneric   = 0;
 };
+
+// One GEMM consumer of a retyped tensor. Kept because the diagnostic has TWO halves: the path is decidable
+// before allocation (nb[]/ne[]), but the ADDRESS is not -- before gallocr every graph tensor's data is NULL,
+// so `(uintptr_t)t->data % 32` evaluates to 0 and prints a comfortable, meaningless "aligned" for every
+// tensor in the graph. That is what the first version of this print did.
+struct MulF16Plan {
+  ggml_tensor* gemm   = NULL;
+  ggml_tensor* src1   = NULL;   // the closure node the GEMM reads; == gemm->src[1]
+  int64_t      elems  = 0;      // the VIEW's elements, which is what the GEMM actually reads (a split
+                                // view can be a fraction of the MUL output)
+  int64_t      dist   = 0;      // GEMM node index - MUL node index, a locality proxy
+  bool         contiguous = false;
+};
+
+struct MulF16Entry {
+  std::string name;
+  ggml_tensor* t = NULL;
+  int64_t ne0 = 0, ne1 = 0, elems = 0;
+  int views = 0;
+  std::vector<MulF16Plan> plans;
+};
+
+static std::vector<MulF16Entry> g_mulF16Entries;
+static bool g_mulF16Dbg      = false;
+static bool g_mulF16Reported = false;   // process lifetime: the report describes a graph SHAPE, and the
+                                        // shape is the same on every rebuild, so one report is the whole
+                                        // evidence (60 identical copies would be 6 MB of stderr).
 
 static MulF16Stats retypeGemmOnlyMulOutputsToF16(ggml_cgraph* g, bool dbg) {
   MulF16Stats st;
+  g_mulF16Dbg = dbg;
+  g_mulF16Entries.clear();
   const int n = ggml_graph_n_nodes(g);
   for(int i = 0; i < n; i++) {
     ggml_tensor* t = ggml_graph_node(g, i);
@@ -1210,6 +1250,9 @@ static MulF16Stats retypeGemmOnlyMulOutputsToF16(ggml_cgraph* g, bool dbg) {
     int nw = 0;
     work[nw++] = t;
     int nGemm = 0, nCopy = 0, nOther = 0, nSrc0Gemm = 0;
+    int nGemmNonCont = 0;
+    int64_t gemmDistMin = -1;
+    std::vector<MulF16Plan> plans;
     const char* firstOtherOp = "-";
     const char* firstCopyOp  = "-";
     for(int wi = 0; wi < nw; wi++) {
@@ -1223,7 +1266,24 @@ static MulF16Stats retypeGemmOnlyMulOutputsToF16(ggml_cgraph* g, bool dbg) {
             continue;
           if(m->op == GGML_OP_MUL_MAT || m->op == GGML_OP_MUL_MAT_ID) {
             // src0 is the weight; the activation we want to retype has to be src1
-            if(s != 1) nSrc0Gemm++; else nGemm++;
+            if(s != 1)
+              nSrc0Gemm++;
+            else {
+              nGemm++;
+              if(!ggml_is_contiguous(cur))
+                nGemmNonCont++;
+              // Recorded for THIS consumer, not for the tensor: one MUL output can feed several GEMMs
+              // (and a split view reads only a fraction of it), and the path is chosen per GEMM.
+              MulF16Plan pl;
+              pl.gemm       = m;
+              pl.src1       = cur;
+              pl.elems      = ggml_nelements(cur);
+              pl.dist       = (int64_t)j - (int64_t)i;
+              pl.contiguous = ggml_is_contiguous(cur);
+              plans.push_back(pl);
+              if(gemmDistMin < 0 || pl.dist < gemmDistMin)
+                gemmDistMin = pl.dist;
+            }
           }
           else if(m->op == GGML_OP_CONT || m->op == GGML_OP_CPY || m->op == GGML_OP_DUP) {
             nCopy++;
@@ -1304,24 +1364,99 @@ static MulF16Stats retypeGemmOnlyMulOutputsToF16(ggml_cgraph* g, bool dbg) {
     }
     st.retyped++;
     st.elems += el;
-    if(dbg)
-      // THREE-WAY DIAGNOSTIC. The conversion pass was doing TWO things: its own work (priced at +1.66% by the
-      // zero-fill control) and MATERIALISING the layout the GEMM wants to read. This line says which case each
-      // retyped tensor falls into, so the next route is picked from a mechanism and not from the derived
-      // -4.03% (which rests on two assumptions: linearity in volume, and additivity):
-      //   (a) nb1 != ne0*2                 -> the repack was transposing/densifying. The stride has to live
-      //                                       somewhere, and on x86 a scatter-write usually costs more than a
-      //                                       gather-read, so moving it to the producer is not free either.
-      //   (b) nb1 == ne0*2, data%32 != 0    -> unaligned vector loads; the fix is cheap (pad to 32B).
-      //   (c) dense AND aligned             -> neither: temporal locality (the converted buffer is written
-      //                                       immediately before it is read) or a different sgemm entry.
-      fprintf(stderr, "[mul-f16]   RETYPE \"%s\" ne=%lldx%lld (%d GEMM consumers, %d views) "
-                      "nb1=%lld %s ne0*2=%lld  data%%32=%lld\n",
-              t->name, (long long)t->ne[0], (long long)t->ne[1], nGemm, nw - 1,
-              (long long)t->nb[1], (t->nb[1] == (size_t)t->ne[0]*2 ? "==" : "!="),
-              (long long)t->ne[0]*2, (long long)(((uintptr_t)t->data) % 32));
+    for(size_t pi = 0; pi < plans.size(); pi++) {
+      st.gemmTotal++;
+      if(plans[pi].contiguous) {
+        st.gemmContiguous++;
+        st.elemsGemmSite1 += plans[pi].elems;
+      }
+      else
+        st.elemsGemmGeneric += plans[pi].elems;
+    }
+    if(dbg) {
+      MulF16Entry e;
+      e.name  = t->name;
+      e.t     = t;
+      e.ne0   = t->ne[0];
+      e.ne1   = t->ne[1];
+      e.elems = el;
+      e.views = nw - 1;
+      e.plans = plans;
+      g_mulF16Entries.push_back(e);
+
+      // PER-TENSOR line: facts only, no branch letter. The first version of this print is worth recording
+      // because of how it failed: it printed `t->nb[1] == t->ne[0]*2` and `data%32` for the BASE tensor,
+      // and BOTH were constant by construction -- the pass only accepts a contiguous base (so nb1 is
+      // always ne0*2 after halving) and it runs BEFORE gallocr (so data is always NULL, and 0%32 is 0).
+      // A three-way diagnostic that can only ever report one of its three branches is not a measurement.
+      // The path is decided by the VIEW the GEMM reads, so that is what is printed here, and the address
+      // half waits for reportMulF16Layout() below.
+      fprintf(stderr, "[mul-f16]   RETYPE \"%s\" ne=%lldx%lld elems=%lld views=%d gemms=%d "
+                      "noncont_src1=%d gemm_dist=%lld src1nb1=%lld\n",
+              t->name, (long long)t->ne[0], (long long)t->ne[1], (long long)el, nw - 1, nGemm,
+              nGemmNonCont, (long long)gemmDistMin,
+              (long long)(plans.empty() ? (int64_t)t->nb[1] : (int64_t)plans[0].src1->nb[1]));
+    }
   }
   return st;
+}
+
+// SECOND HALF of the diagnostic, called after the allocator has assigned addresses and before the first
+// compute. It re-reads the SAME plan list the retype pass recorded, so the numbers printed here describe
+// the graph that is about to run, not a prediction about it.
+static void reportMulF16Layout() {
+  if(!g_mulF16Dbg || g_mulF16Reported || g_mulF16Entries.empty())
+    return;
+  g_mulF16Reported = true;
+
+  int     site1 = 0, generic = 0, bad32 = 0, bad64 = 0, baseBad = 0;
+  int     genericN1 = 0, genericNonCont = 0;
+  int64_t eSite1 = 0, eGeneric = 0, eBad32 = 0;
+  fprintf(stderr, "[mul-f16] LAYOUT (post-allocation): %zu retyped tensors. Path rule under test has TWO "
+                  "terms: ggml-cpu.c:2249 takes the FIRST llamafile sgemm only when ggml_is_contiguous(src1), "
+                  "and sgemm.cpp:3850 refuses outright when n < 2 ('only enable sgemm for prompt processing'). "
+                  "When neither holds and src1->type == vec_dot_type, no repack (2279) and no second sgemm "
+                  "(2381) run either, and the matmul lands on the generic chunk kernel (2410).\n",
+          g_mulF16Entries.size());
+  for(size_t i = 0; i < g_mulF16Entries.size(); i++) {
+    const MulF16Entry& e = g_mulF16Entries[i];
+    for(size_t pi = 0; pi < e.plans.size(); pi++) {
+      const MulF16Plan& pl = e.plans[pi];
+      const uintptr_t pad = (uintptr_t)pl.src1->data;
+      const int64_t m32 = (int64_t)(pad % 32), m64 = (int64_t)(pad % 64);
+      const int64_t nb1 = (int64_t)pl.src1->nb[1], n02 = (int64_t)pl.src1->ne[0]*2;
+      const int64_t b32 = (int64_t)(((uintptr_t)e.t->data) % 32);
+      const int64_t nrow = (int64_t)pl.src1->ne[1];
+      const bool n1 = (nrow < 2);
+      const bool takesSite1 = pl.contiguous && !n1;
+      if(takesSite1) { site1++; eSite1 += pl.elems; }
+      else {
+        generic++; eGeneric += pl.elems;
+        if(n1) genericN1++; else genericNonCont++;
+      }
+      if(m32 != 0) { bad32++; eBad32 += pl.elems; }
+      if(m64 != 0) bad64++;
+      if(b32 != 0) baseBad++;
+      fprintf(stderr, "[mul-f16]   PATH %-7s src1cont=%d n=%lld nb1=%lld %s ne0x2=%lld data%%32=%lld data%%64=%lld "
+                      "base%%32=%lld dist=%lld elems=%lld\n",
+              takesSite1 ? "site1" : (n1 ? "GEN-n<2" : "GENcont"), (int)pl.contiguous, (long long)nrow,
+              (long long)nb1, (nb1 == n02 ? "==" : (nb1 < n02 ? "<" : ">")), (long long)n02,
+              (long long)m32, (long long)m64, (long long)b32, (long long)pl.dist, (long long)pl.elems);
+    }
+  }
+  fprintf(stderr, "[mul-f16] PATH TOTALS: site1=%d (%lld elems)  GENERIC=%d (%lld elems; %d because n<2 "
+                  "-- those run the generic kernel in BOTH arms and are therefore arm-INVARIANT -- and %d "
+                  "because the src1 is not contiguous, which the retype itself caused)\n",
+          site1, (long long)eSite1, generic, (long long)eGeneric, genericN1, genericNonCont);
+  // The consequence to check against the instrument: the 664 GEMMs that return early at 2249 never reach
+  // the chunk barrier at 2377, so [bar-spin-by-op]'s `kern` column (sites-nodes, i.e. barriers inside the
+  // op) must drop by exactly the site1 count between the two arms. If it does not, this print and the
+  // instrument are describing different graphs and neither may be believed.
+  fprintf(stderr, "[mul-f16] ALIGNMENT: src1 data%%32!=0 in %d of %d consumers (%lld elems); data%%64!=0 in "
+                  "%d; retyped BASE tensors with data%%32!=0: %d/%zu (a graph tensor is 32-byte aligned by "
+                  "construction -- TENSOR_ALIGNMENT is the CPU buffer type's alignment -- while a view is "
+                  "at base+view_offs and is aligned only if the offset happens to be)\n",
+          bad32, site1 + generic, (long long)eBad32, bad64, baseBad, g_mulF16Entries.size());
 }
 
 // ggml-cpu has exactly ONE graph fusion: {RMS_NORM, MUL} (ggml-cpu.c:3087-3104), and it is a
@@ -1873,6 +2008,15 @@ struct ComputeHandle {
               mfs.candidates, mfs.retyped, (long long)mfs.elems,
               (long long)mfs.elemsDirect, (long long)mfs.elemsViaView, (long long)mfs.elemsViaCopy,
               (long long)mfs.elemsOther, (long long)mfs.elemsNoConsumer);
+      // The path split is printed even without DBG because it is ONE line and it is the number the whole
+      // route turns on: how many of the GEMMs this change touches keep the fast kernel, and how many lose
+      // it. A retype that sends a GEMM to the generic chunk kernel is not the change that was designed.
+      fprintf(stderr, "[mul-f16] GEMM consumers of retyped tensors: %d total, %d with a contiguous src1 "
+                      "(-> llamafile site 1, %lld elems) and %d without (-> GENERIC chunk kernel, %lld "
+                      "elems). Measured on the mulf16 gate: done 1056->384, skipped 8->16, MUL_MAT kern "
+                      "sites -664 -- 1064-(384+16)=664 went to site 1, so this predicate predicts that 8.\n",
+              mfs.gemmTotal, mfs.gemmContiguous, (long long)mfs.elemsGemmSite1,
+              mfs.gemmTotal - mfs.gemmContiguous, (long long)mfs.elemsGemmGeneric);
       if(logger != NULL)
         logger->write(string("CPU backend: MUL->F16 (KATAGO_CPU_MUL_F16): retyped ") +
           Global::intToString(mfs.retyped) + "/" + Global::intToString(mfs.candidates) +
@@ -2182,6 +2326,12 @@ void NeuralNet::getOutput(
   if(numMetaFeatures > 0 && gpuHandle->inputMeta != NULL)
     ggml_backend_tensor_set(gpuHandle->inputMeta, inputBuffers->metaInput.data(), 0,
                             inputBuffers->singleInputMetaElts * runBatchSize * sizeof(float));
+
+  // Diagnostic second half: THIS is the first point at which the graph's tensors have addresses (gallocr
+  // assigns them when the graph is allocated, not when it is built), so this is the first point at which
+  // "is the buffer the GEMM reads aligned" is a question with an answer. One-shot: the graph shape is the
+  // same on every rebuild and 60 identical copies of 672 lines is not evidence, it is log spam.
+  reportMulF16Layout();
 
   if(ggml_backend_graph_compute(gpuHandle->backend, gpuHandle->graph) != GGML_STATUS_SUCCESS)
     throw StringError("CPU backend: graph compute failed");
