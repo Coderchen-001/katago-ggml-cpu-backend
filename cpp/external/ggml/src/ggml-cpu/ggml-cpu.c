@@ -670,6 +670,10 @@ static uint64_t ggml_cpu_bar_site_cycles[GGML_MAX_N_THREADS][GGML_CPU_BAR_SITE_C
 // Did the F32->vec_dot repack run, per MUL_MAT node? Once per node, so a plain relaxed atomic is fine.
 static uint64_t ggml_cpu_mm_repack_done = 0;
 static uint64_t ggml_cpu_mm_repack_skip = 0;
+// Lead B's materialisation copy (KATAGO_CPU_MM_REPACK_F16): counted SEPARATELY from the F32->f16 repack,
+// because they are different work and gate 4 declares one number.
+static uint64_t ggml_cpu_mm_repack_f16_done  = 0;
+static uint64_t ggml_cpu_mm_repack_f16_elems = 0;
 // The repack is WORK, not waiting: it reads all of src1 and writes the converted copy, and that cost lands in
 // MUL_MAT's own row where no waiting-type instrument can see it. Per-thread rows, like everything else here.
 static uint64_t ggml_cpu_bar_repack_elems [GGML_MAX_N_THREADS];
@@ -689,6 +693,40 @@ static int ggml_cpu_mm_norepack(void) {
     static int v = -1;
     if (v < 0) {
         v = (getenv("KATAGO_CPU_MM_NOREPACK") != NULL) ? 1 : 0;
+    }
+    return v;
+}
+
+// KATAGO_CPU_MM_REPACK_F16=1 -- lead B: keep the MATERIALISATION, drop the CONVERSION.
+//
+// The R2 experiment (retype a GEMM's activation to f16 so mul_mat skips its F32->f16 repack) removes two
+// things at once, and its arithmetic cannot tell them apart:
+//     d(mulf16) = +1.035 - P - D
+// where P is the producer's f16 store and D is the GEMM reading a graph tensor instead of the scratch the
+// pool wrote one barrier earlier. P is bounded near zero by the disassembly of the store loop (three
+// packed instructions per 8 elements, half the store bytes), so D carries it -- but "carries it" is not
+// "measured", and the residual confound is that the retype also relays out the whole arena (15,023,376
+// fewer elements = 30 MB per graph, so every activation moves).
+//
+// This switch separates the two. With it on, a src1 that is ALREADY in vec_dot form is still copied into
+// wdata, so the layout change is the retype's (same f16 sizes), the GEMM reads a buffer the pool wrote one
+// barrier earlier (no D), and the copy is a pure ROW MEMCPY -- no conversion -- which reads half the bytes
+// the F32->f16 repack reads. That is what makes it a candidate optimisation and not merely a control:
+//     d(B) = +1.035 - M - P      =>      d(B) - d(mulf16) = D - M
+// P cancels in that difference, which is why pricing P with rdtsc confirms the story rather than gating
+// the decision. NOTE it only works if the three arms share one session: two separate gate runs carry a
+// session offset (+-0.6% floor, spin swings 12-20%) that would swamp D - M.
+//
+// The copy is a copy only under three conditions, and this REFUSES rather than guesses (G-8): the
+// destination type must be F16 (so nbw0 == 2), the source's fastest stride must be one element (asserted
+// above), and the block size must divide the row. When they do not hold the switch does NOTHING -- it
+// falls back to the retype's behaviour, never to from_float, because from_float on an f16 source would
+// convert wrong. Two separate counters: mixing the copy's elements into the F32 repack's volume would
+// make the one number that gate 4 declares unreadable.
+static int ggml_cpu_mm_repack_f16(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = (getenv("KATAGO_CPU_MM_REPACK_F16") != NULL) ? 1 : 0;
     }
     return v;
 }
@@ -1107,8 +1145,14 @@ static void ggml_cpu_bar_spin_report(void) {
     const double total = (double) ggml_cpu_n_spin_iters;
     const int n_waiters = (ggml_cpu_bar_nth > 1) ? (ggml_cpu_bar_nth - 1) : 1;
 
+    // The `cycles` column is NOT independent evidence: it is `spin * cyc_per_iter`, the same quantity as
+    // the spin column in different units (G-27). Measured per op, M cycles: MUL 263.7 vs 262.8, FA 210.4
+    // vs 207.9, ADD 105.5 vs 105.4, CONT 68.6 vs 68.2. The header says so, because one column printed
+    // twice is exactly how a derived quantity gets quoted as a second, corroborating measurement -- and
+    // "spin == cycles therefore the node ran on one thread" is a conclusion this column cannot support.
+    // (Relabelled, not removed: run-knob-ab.ps1's Get-OpStructure parses these columns positionally.)
     fprintf(stderr, "[bar-spin-by-op] %-22s %14s %9s %16s %12s %10s %8s %8s\n",
-            "op", "spin", "spin%", "cycles", "waits", "sites", "nodes", "kern");
+            "op", "spin", "spin%", "cycles:spin*c/i", "waits", "sites", "nodes", "kern");
     for (int i = 0; i < GGML_CPU_BAR_OP_SLOTS; i++) {
         const int s = order[i];
         if (spin_by_op[s] == 0 && waits_by_op[s] == 0) {
@@ -1189,6 +1233,17 @@ static void ggml_cpu_bar_spin_report(void) {
                     ((mb_in + mb_out) / 1024.0) / ((double) rp_cyc / 4.0e9));
         } else {
             fprintf(stderr, "\n");
+        }
+        if (ggml_cpu_mm_repack_f16_done) {
+            // Lead B (KATAGO_CPU_MM_REPACK_F16): the materialisation copy, counted APART from the converting
+            // repack because they are different work. Its element count is what proves the copy ran at all
+            // -- the same reason gate 5 exists, since an arm that does nothing is also an arm that is
+            // bit-identical.
+            const double mb = 2.0 * (double) ggml_cpu_mm_repack_f16_elems / (1024.0*1024.0);
+            fprintf(stderr, "[bar-spin-by-op] MUL_MAT f16->f16 MATERIALISE copy: done=%llu elems=%llu "
+                            "(read %.1f MB + write %.1f MB = %.1f MB, no conversion)\n",
+                    (unsigned long long) ggml_cpu_mm_repack_f16_done,
+                    (unsigned long long) ggml_cpu_mm_repack_f16_elems, mb, mb, mb + mb);
         }
     }
 
@@ -2248,7 +2303,14 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    if (src1_cont) {
+    // Lead B forces the materialisation, and that means site 1 must NOT take its shortcut: otherwise the
+    // copy below never runs, the arm is bit-identical to the retype arm while claiming to test the
+    // opposite hypothesis, and the A/B measures nothing (the exact failure that the first MUL->F16 landing
+    // shipped: 0 of 256 tensors retyped, both arms hashed the same, and only the counter noticed).
+    const bool force_mat = (src1->type == GGML_TYPE_F16 && vec_dot_type == GGML_TYPE_F16 &&
+                            ggml_cpu_mm_repack_f16() != 0);
+
+    if (src1_cont && !force_mat) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -2276,7 +2338,12 @@ void ggml_compute_forward_mul_mat(
 UseGgmlGemm1:;
 #endif
 
-    if (src1->type != vec_dot_type) {
+    // did_copy: lead B's switch (ggml_cpu_mm_repack_f16()). src1 is f16 and already in vec_dot form, so the
+    // block below copies rows into wdata instead of converting them -- and the second sgemm site further
+    // down is opened up so that the copy is actually READ. Copying without that second change would be
+    // pure added work: the GEMM would still read src1->data, or fall through to the generic chunk kernel.
+    const bool did_copy = force_mat;
+    if (src1->type != vec_dot_type || did_copy) {
         // Does the F32->vec_dot repack actually run on this model? That decides what the barrier ~40 lines below
         // waits for: the repack (a memory-copy phase) or merely entry/dispatch spread. It DOES run: measured
         // done=1056 skipped=8 per process on b10c384.
@@ -2293,9 +2360,12 @@ UseGgmlGemm1:;
         // A correct ablation (zero-fill instead of convert, finite operands, work-equal, paired) decides which
         // is right. It is NOT built yet: the first attempt skipped the write entirely, produced non-finite
         // activations, and made KataGo stop printing raw-nn after 1.3 KB instead of 58.6 KB -- see G-19.
-        if (ith == 0) { __atomic_fetch_add(&ggml_cpu_mm_repack_done, 1, __ATOMIC_RELAXED); }
+        // `done` counts CONVERTING repacks only. In lead B's arm the block is also entered for a copy, and
+        // counting those here would make done=1064 while done-copy_done=384 is the number gate 4 declares.
+        if (ith == 0 && !did_copy) { __atomic_fetch_add(&ggml_cpu_mm_repack_done, 1, __ATOMIC_RELAXED); }
         char * wdata = params->wdata;
         const uint64_t repack_t0 = ggml_cpu_bar_tsc();
+        uint64_t f16_elems_local = 0;   // lead B's copied elements, added to the shared counter once per node
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
         const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
@@ -2303,7 +2373,9 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        // The general repack converts F32. Lead B's variant copies f16 rows as they are; anything else (a
+        // quantised or bf16 activation) has no path here and must not pretend to have one.
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || (did_copy && src1->type == GGML_TYPE_F16));
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -2322,9 +2394,24 @@ UseGgmlGemm1:;
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    ggml_cpu_tls_repack_elems += (uint64_t) (ne10_block_end - ne10_block_start) * bs;
-                    void * wdst = (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0);
-                    if (ggml_cpu_mm_norepack()) {
+                        if (!did_copy) {
+                            // Only the CONVERTING repack counts as "repack elems": lead B's copy is
+                            // different work, and mixing it in would make the one volume that gate 4
+                            // declares unreadable.
+                            ggml_cpu_tls_repack_elems += (uint64_t) (ne10_block_end - ne10_block_start) * bs;
+                        }
+                        void * wdst = (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0);
+                        if (did_copy) {
+                            // Lead B: a pure row memcpy, no conversion, and the same destination layout as
+                            // the general repack (nbw0 == sizeof(f16), bs == 1), so the second sgemm's ldb
+                            // is unchanged. Same BITS in, so the GEMM's output bits cannot move.
+                            const size_t nbytes =
+                                (size_t) (ne10_block_end - ne10_block_start) * bs * ggml_type_size(GGML_TYPE_F16);
+                            memcpy(wdst,
+                                   (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10,
+                                   nbytes);
+                            f16_elems_local += (uint64_t) (ne10_block_end - ne10_block_start) * bs;
+                        } else if (ggml_cpu_mm_norepack()) {
                         // ABLATION (KATAGO_CPU_MM_NOREPACK=1): identical loop, identical write volume, no F32
                         // read and no conversion arithmetic. Zeros keep the operands FINITE, which is the whole
                         // reason this form is used instead of "skip it": skipping produced non-finite
@@ -2364,7 +2451,16 @@ UseGgmlGemm1:;
             }
             if (r_den) { __atomic_fetch_add(&ggml_cpu_act_denorm_by_op[r_prod], r_den, __ATOMIC_RELAXED); }
         }
-        ggml_cpu_tls_repack_cycles += ggml_cpu_bar_tsc() - repack_t0;
+        if (did_copy) {
+            // Lead B's own counters. Kept out of repack_elems/repack_cycles on purpose: those price the
+            // F32->f16 conversion, and this is a copy. The wall clock is the arbiter for the copy's cost.
+            if (ith == 0) { __atomic_fetch_add(&ggml_cpu_mm_repack_f16_done, 1, __ATOMIC_RELAXED); }
+            if (f16_elems_local) {
+                __atomic_fetch_add(&ggml_cpu_mm_repack_f16_elems, f16_elems_local, __ATOMIC_RELAXED);
+            }
+        } else {
+            ggml_cpu_tls_repack_cycles += ggml_cpu_bar_tsc() - repack_t0;
+        }
     } else {
         if (ith == 0) { __atomic_fetch_add(&ggml_cpu_mm_repack_skip, 1, __ATOMIC_RELAXED); }
     }
@@ -2378,8 +2474,11 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type) {
-        const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    if (src1->type != vec_dot_type || did_copy) {
+        // src1 is either F32 (converted into wdata above) or f16 that lead B copied into wdata; in both
+        // cases the buffer to read is the scratch. Without opening this site up, lead B's copy would be
+        // pure added work: the GEMM would still read src1->data, or fall through to the generic kernel.
+        const void* wdata = params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
         for (int64_t i13 = 0; i13 < ne13; i13++)
