@@ -57,6 +57,44 @@ static inline void vec_binary_op_non_contiguous(const int64_t n, const int64_t n
     }
 }
 
+// ---------------------------------------------------------------------------------------------------
+// PACKED f32 -> f16 store for the (float, float, ggml_fp16_t) case, used by KATAGO_CPU_MUL_F16.
+//
+// WHY this exists: the generic path stores through type_conversion_table<ggml_fp16_t>::from_f32, whose
+// definition depends on whether __F16C__ was in effect when simd-mappings.h was preprocessed. MEASURED:
+// binary-ops.cpp.obj held ZERO '2ph' instructions while ggml-cpu.c.obj -- where the repack's conversion
+// lives -- held seven. The same rounding operation therefore cost ~5 cycles/element here and ~nothing
+// there, and for the 15,023,376 elements this change retypes that is ~3.1 ms/batch against a total
+// saving of 0.6-1.2 ms. The conversion has to be PACKED, not merely present in the instruction set: the
+// loop below rounds eight elements per instruction.
+//
+// imm=0 is round-to-nearest-even, which is what GGML_CPU_FP32_TO_FP16 does, so this is bit-identical to
+// the conversion it replaces -- and the bit gate proves that, not this comment.
+// ---------------------------------------------------------------------------------------------------
+template <float (*op)(float, float)>
+static inline void vec_binary_op_contiguous_f16out(const int64_t n, ggml_fp16_t * z, const float * x, const float * y) {
+#if defined(__F16C__)
+#pragma message("KATAGO MUL->F16 store: PACKED (F16C)")
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        alignas(32) float r[8];
+        for (int k = 0; k < 8; k++) {
+            r[k] = op(x[i + k], y[i + k]);
+        }
+        const __m128i h = _mm256_cvtps_ph(_mm256_load_ps(r), 0);
+        _mm_storeu_si128((__m128i *)(z + i), h);
+    }
+    for (; i < n; i++) {
+        z[i] = type_conversion_table<ggml_fp16_t>::from_f32(op(x[i], y[i]));
+    }
+#else
+#pragma message("KATAGO MUL->F16 store: scalar fallback (no __F16C__ in this translation unit)")
+    for (int64_t i = 0; i < n; i++) {
+        z[i] = type_conversion_table<ggml_fp16_t>::from_f32(op(x[i], y[i]));
+    }
+#endif
+}
+
 template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>
 static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -145,7 +183,14 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
                     }
                 }
 #endif
-                vec_binary_op_contiguous<op>(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
+                if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> &&
+                              std::is_same_v<dst_t, ggml_fp16_t>) {
+                    // KATAGO_CPU_MUL_F16's store: packed, because the generic path's conversion is not.
+                    // See the note above vec_binary_op_contiguous_f16out.
+                    vec_binary_op_contiguous_f16out<op>(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
+                } else {
+                    vec_binary_op_contiguous<op>(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
+                }
             }
         } else {
             vec_binary_op_non_contiguous<op>(ne0, ne10, nb10, dst_ptr, src0_ptr, src1_ptr);
