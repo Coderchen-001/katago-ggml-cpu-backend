@@ -234,9 +234,33 @@ static inline void vec_binary_op_contiguous_f16out(const int64_t n, ggml_fp16_t 
 // It is applied only where the destination is f16 (the if-constexpr below): the f32 destination has its own
 // path and the earlier reading that the knob was "slightly negative" there was run-to-run scatter, since
 // this code cannot be reached with dst_t == float at all.
+// G-22 VALUE SEMANTICS, and the resolved value is PRINTED once. Unset leaves the fold ON; {0,false,no,off}
+// means "do not turn it off", i.e. the fold stays on; {1,true,yes,on} or anything unrecognised turns it off.
+// Accepting words without printing the result is how a config that says "false" gets found by reading source.
+static bool katago_env_word_is(const char * v, const char * w) {
+    if (v == NULL) { return false; }
+    size_t i = 0;
+    for (; v[i] != '\0' && w[i] != '\0'; i++) {
+        char a = v[i], b = w[i];
+        if (a >= 'A' && a <= 'Z') { a = (char) (a - 'A' + 'a'); }
+        if (b >= 'A' && b <= 'Z') { b = (char) (b - 'A' + 'a'); }
+        if (a != b) { return false; }
+    }
+    return v[i] == '\0' && w[i] == '\0';
+}
 static int katago_mul_bcast_off(void) {
     static int v = -1;
-    if (v < 0) { v = (getenv("KATAGO_CPU_MUL_BCAST_OFF") != NULL) ? 1 : 0; }
+    if (v < 0) {
+        const char * e = getenv("KATAGO_CPU_MUL_BCAST_OFF");
+        bool off = false;
+        if (e != NULL && e[0] != '\0') {
+            off = !(katago_env_word_is(e, "0") || katago_env_word_is(e, "false") ||
+                    katago_env_word_is(e, "no") || katago_env_word_is(e, "off"));
+        }
+        v = off ? 1 : 0;
+        fprintf(stderr, "[mul-bcast] effective: broadcast-mul specialisation = %s  (KATAGO_CPU_MUL_BCAST_OFF=%s)\n",
+                off ? "OFF" : "ON", e == NULL ? "unset" : e);
+    }
     return v;
 }
 

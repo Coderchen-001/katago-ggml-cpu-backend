@@ -1147,6 +1147,27 @@ static void forceF32AccOnF16MulMats(ggml_cgraph* g, bool global,
 }
 
 //--------------------------------------------------------------
+// G-22 VALUE SEMANTICS for an on/off env, and the caller PRINTS the resolved value. Unset means ON (this is
+// the default path now), {0,false,no,off} means OFF, and anything else is read as ON. Accepting words
+// without printing the result is how a config that says "false" gets discovered by reading the source.
+static bool katagoEnvWordIs(const char* v, const char* w) {
+  if(v == NULL)
+    return false;
+  size_t i = 0;
+  for(; v[i] != '\0' && w[i] != '\0'; i++) {
+    char a = v[i], b = w[i];
+    if(a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+    if(b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+    if(a != b)
+      return false;
+  }
+  return v[i] == '\0' && w[i] == '\0';
+}
+static bool katagoEnvIsOff(const char* v) {
+  return katagoEnvWordIs(v, "0") || katagoEnvWordIs(v, "false") ||
+         katagoEnvWordIs(v, "no") || katagoEnvWordIs(v, "off");
+}
+
 // KATAGO_CPU_MUL_F16=1 -- R2 batch 1: store the output of a MUL whose every consumer is a GEMM as F16.
 //
 // BIT-IDENTICAL, and deliberately NOT a precision change. The MUL keeps its F32 inputs and still
@@ -1373,7 +1394,9 @@ static MulF16Stats retypeGemmOnlyMulOutputsToF16(ggml_cgraph* g, bool dbg) {
       else
         st.elemsGemmGeneric += plans[pi].elems;
     }
-    if(dbg) {
+    // Recorded ALWAYS, not only under DBG: the verification at the end of the pass re-derives every retyped
+    // tensor's consumers independently, and that check has to run in the default build too.
+    {
       MulF16Entry e;
       e.name  = t->name;
       e.t     = t;
@@ -1383,6 +1406,9 @@ static MulF16Stats retypeGemmOnlyMulOutputsToF16(ggml_cgraph* g, bool dbg) {
       e.views = nw - 1;
       e.plans = plans;
       g_mulF16Entries.push_back(e);
+    }
+
+    if(dbg) {
 
       // PER-TENSOR line: facts only, no branch letter. The first version of this print is worth recording
       // because of how it failed: it printed `t->nb[1] == t->ne[0]*2` and `data%32` for the BASE tensor,
@@ -1398,6 +1424,68 @@ static MulF16Stats retypeGemmOnlyMulOutputsToF16(ggml_cgraph* g, bool dbg) {
               (long long)(plans.empty() ? (int64_t)t->nb[1] : (int64_t)plans[0].src1->nb[1]));
     }
   }
+  // ASSERT, DO NOT ASSUME -- and it runs in the default build, not only under DBG.
+  //
+  // The pass decided what to touch by walking each MUL output's consumer closure and refusing anything that
+  // is not a GEMM. Until this became the DEFAULT path that decision only had to be right for the graphs a bit
+  // gate happened to run; now it has to be right for every model and every user. A walk that forgot one
+  // consumer kind would retype a tensor whose value is then read as f16 by an arithmetic op -- silently,
+  // because the conversion is bit-identical wherever it is LEGAL -- and no bit gate can see that, since a bit
+  // gate covers the sites it runs.
+  //
+  // So this re-derives every retyped tensor's closure with its own code, after the rewrite, and compares
+  // against what the rewrite recorded. A disagreement is a hard failure, not a skip: a skipped disagreement
+  // is precisely the silent numeric change the check exists to prevent.
+  auto verifyRetype = [&]() {
+    const int nv = ggml_graph_n_nodes(g);
+    int checked = 0;
+    for(size_t i = 0; i < g_mulF16Entries.size(); i++) {
+      const MulF16Entry& e = g_mulF16Entries[i];
+      if(e.t == NULL || e.t->type != GGML_TYPE_F16)
+        continue;
+      ggml_tensor* work[64];
+      int nw = 0;
+      work[nw++] = e.t;
+      int nGemm = 0, nBad = 0;
+      const char* firstBad = "-";
+      for(int wi = 0; wi < nw; wi++) {
+        ggml_tensor* cur = work[wi];
+        for(int j = 0; j < nv; j++) {
+          ggml_tensor* m = ggml_graph_node(g, j);
+          for(int s = 0; s < GGML_MAX_SRC; s++) {
+            if(m->src[s] == NULL)
+              break;
+            if(m->src[s] != cur)
+              continue;
+            if((m->op == GGML_OP_MUL_MAT || m->op == GGML_OP_MUL_MAT_ID) && s == 1)
+              nGemm++;
+            else if(m->op == GGML_OP_RESHAPE || m->op == GGML_OP_VIEW ||
+                    m->op == GGML_OP_PERMUTE || m->op == GGML_OP_TRANSPOSE) {
+              if(nw < 64) work[nw++] = m; else nBad++;
+            }
+            else {
+              nBad++;
+              if(firstBad[0] == '-') firstBad = ggml_op_name(m->op);
+            }
+            break;
+          }
+        }
+      }
+      checked++;
+      if(nBad != 0 || nGemm != (int)e.plans.size()) {
+        throw StringError(
+          string("CPU backend: MUL->F16 retype VERIFICATION FAILED for \"") + e.name +
+          "\": an independent re-derivation found " + Global::intToString(nBad) + " non-GEMM consumer(s) (first=" +
+          string(firstBad) + ") and " + Global::intToString(nGemm) + " GEMM consumer(s), while the rewrite used " +
+          Global::intToString((int)e.plans.size()) + ". A retyped tensor whose consumer is not a GEMM would change "
+          "the numbers silently, and a bit gate only covers the sites it runs. Refusing to run.");
+      }
+    }
+    if(checked != 0)
+      fprintf(stderr, "[mul-f16] verification: %d retyped tensor(s) re-derived independently; every consumer is "
+                      "a GEMM (asserted, not assumed)\n", checked);
+  };
+  verifyRetype();
   return st;
 }
 
@@ -2102,7 +2190,14 @@ struct ComputeHandle {
     // KATAGO_CPU_MUL_F16=1 -- R2 batch 1 (MUL only). Off by default, so the A/B arm IS the env:
     // run-knob-ab.ps1 -Knob KATAGO_CPU_MUL_F16. It must run after the graph is built and before gallocr
     // allocates, because it changes a tensor's type and nb[] in place.
-    if(getenv("KATAGO_CPU_MUL_F16") != nullptr && getenv("KATAGO_CPU_MUL_F16")[0] == '1') {
+    // --- MUL->F16 retype (R2) : DEFAULT ON, with G-22 value semantics and a printed effective value -------
+    // Unset = ON. {0,false,no,off} = OFF, which is also what the A/B harness writes for the off arm now that
+    // the knob defaults on (-OffValue 0) -- clearing an env can no longer mean "off" once the default is on.
+    const char* mfEnv = getenv("KATAGO_CPU_MUL_F16");
+    const bool mfOn = !katagoEnvIsOff(mfEnv);
+    fprintf(stderr, "[mul-f16] effective: MUL->F16 retype = %s  (KATAGO_CPU_MUL_F16=%s)\n",
+            mfOn ? "ON" : "OFF", mfEnv == nullptr ? "unset" : mfEnv);
+    if(mfOn) {
       const bool mfDbg = getenv("KATAGO_CPU_MUL_F16_DBG") != nullptr;
       MulF16Stats mfs = retypeGemmOnlyMulOutputsToF16(graph, mfDbg);
       // stderr, not the logger: this is the instrument's own line and it must be visible in every
