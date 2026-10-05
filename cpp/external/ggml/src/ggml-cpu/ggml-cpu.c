@@ -5537,6 +5537,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     // KATAGO_CPU_WORKPROF=1: per-op WORK cycles, waiting excluded -- see ggml_cpu_workprof_report(). The
     // flag is read once per process inside ggml_cpu_workprof_on(), so this costs a static read and a
     // predictable branch per NODE (a few thousand per graph), not per element.
+#if KATAGO_WORKPROF_INSTRUMENT
     if (ggml_cpu_workprof_on()) {
         const uint64_t wp0 = ggml_cpu_bar_tsc();
         ggml_compute_forward(&params, node);
@@ -5544,6 +5545,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     } else {
         ggml_compute_forward(&params, node);
     }
+#else
+    ggml_compute_forward(&params, node);
+#endif
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
