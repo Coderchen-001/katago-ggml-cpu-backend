@@ -1401,32 +1401,59 @@ static void ggml_cpu_bar_spin_report(void) {
 // machine's operating point, and it would explain the 1.5 pp cross-DLL drift and the 2% session spread
 // in the OFF arm in one stroke. A slowdown concentrated in one op names the mechanism on the spot.
 // The environment is read ONCE per process (the established form), never per node or per element.
+// The wrap is a COMPILE-TIME instrument, following the P counter's precedent: the default build must be the
+// one that can be timed. Its per-node cost is one static read and a predictable branch (a few thousand per
+// graph, under 0.001%), and GATE 2 in workprof-ab.ps1 proves both arms wrap the same nodes -- but the rule
+// is about the principle, not the size: a timing build has to be free of the instrument BY CONSTRUCTION,
+// not by estimate. Measuring therefore takes -DKATAGO_WORKPROF_INSTRUMENT=1.
+#ifndef KATAGO_WORKPROF_INSTRUMENT
+#define KATAGO_WORKPROF_INSTRUMENT 0
+#endif
+
+#if KATAGO_WORKPROF_INSTRUMENT
 static uint64_t ggml_cpu_workprof_cyc [GGML_OP_COUNT + 1];
 static uint64_t ggml_cpu_workprof_call[GGML_OP_COUNT + 1];
+// ELEMENTS, not nodes. The check that motivated it: the specialised broadcast path reported a MUL row 46%
+// BELOW its own off arm, which on its face reads "adding an f16 conversion made the row half as cheap".
+// Before any recovery figure is quoted, the two sides have to be shown to have done the SAME work -- and
+// "the same number of wrapped nodes" is not that, because a path could measure fewer elements per node.
+static uint64_t ggml_cpu_workprof_elems[GGML_OP_COUNT + 1];
 static int ggml_cpu_workprof_on(void) {
     static int v = -1;
     if (v < 0) { v = (getenv("KATAGO_CPU_WORKPROF") != NULL) ? 1 : 0; }
     return v;
 }
 // Relaxed atomics per node: a few thousand per graph, so the cost is nothing next to what it measures.
-static inline void ggml_cpu_workprof_note(int op, uint64_t t0) {
+static inline void ggml_cpu_workprof_note(const struct ggml_tensor * node, uint64_t t0) {
+    const int op = (int) node->op;
     if (op < 0 || op > GGML_OP_COUNT) { return; }
-    __atomic_fetch_add(&ggml_cpu_workprof_cyc [op], ggml_cpu_bar_tsc() - t0, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&ggml_cpu_workprof_call[op], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&ggml_cpu_workprof_cyc  [op], ggml_cpu_bar_tsc() - t0, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&ggml_cpu_workprof_call [op], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&ggml_cpu_workprof_elems[op], (uint64_t) ggml_nelements(node), __ATOMIC_RELAXED);
 }
 static void ggml_cpu_workprof_report(void) {
     if (!ggml_cpu_workprof_on()) { return; }
     fprintf(stderr, "[workprof] per-op WORK cycles (dispatch entry to exit, waiting EXCLUDED). Compare the "
                     "two arms op by op: a uniform ratio is the machine's operating point, a single op is "
-                    "the mechanism.\n");
+                    "the mechanism. ELEMS must be EQUAL across arms -- if it is not, the arms did different "
+                    "work and no ratio below means anything.\n");
     for (int s = 0; s < GGML_OP_COUNT + 1; s++) {
         if (ggml_cpu_workprof_call[s] == 0) { continue; }
         const char * name = (s == GGML_OP_COUNT) ? "graph-end" : ggml_op_name((enum ggml_op) s);
-        fprintf(stderr, "[workprof] %-22s calls=%-8llu work_cycles=%llu\n", name,
+        fprintf(stderr, "[workprof] %-22s calls=%-8llu elems=%-12llu work_cycles=%llu\n", name,
                 (unsigned long long) ggml_cpu_workprof_call[s],
+                (unsigned long long) ggml_cpu_workprof_elems[s],
                 (unsigned long long) ggml_cpu_workprof_cyc[s]);
     }
 }
+#else
+// The clean build: the wrap compiles to nothing, so a timing build cannot carry the instrument even by
+// accident. Both symbols still exist so the call site and the teardown call need no #if of their own.
+static inline void ggml_cpu_workprof_note(const struct ggml_tensor * node, uint64_t t0) {
+    (void) node; (void) t0;
+}
+static void ggml_cpu_workprof_report(void) { }
+#endif
 
 static void ggml_cpu_barrier_stats_report(void) {
     if (!ggml_cpu_barrier_stats_on) {
@@ -5513,7 +5540,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     if (ggml_cpu_workprof_on()) {
         const uint64_t wp0 = ggml_cpu_bar_tsc();
         ggml_compute_forward(&params, node);
-        ggml_cpu_workprof_note((int) node->op, wp0);
+        ggml_cpu_workprof_note(node, wp0);
     } else {
         ggml_compute_forward(&params, node);
     }
@@ -6335,3 +6362,5 @@ void ggml_cpu_init(void) {
 
     ggml_critical_section_end();
 }
+
+
