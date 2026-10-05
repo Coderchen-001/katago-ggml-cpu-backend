@@ -219,9 +219,24 @@ static inline void vec_binary_op_contiguous_f16out(const int64_t n, ggml_fp16_t 
 // happened to pass through the 8-wide loop, and these broadcast tensors never did. The conversion is the
 // same round-to-nearest-even operation, so the expectation is that the hash does not move -- but the gate
 // has to be run on THIS population (and if it moves, subnormals are the first place to look).
-static int katago_mul_bcast(void) {
+// FOLDED INTO THE F16 WRITE-BACK PATH (landed). It is no longer a mode: with ne10 == 1 the loop below
+// degenerates into one call per ELEMENT, each running a one-iteration loop, and this replaces the whole
+// row-set with a single packed loop. Measured on the same arm, same DLL, with element totals verified
+// identical: MUL work 1,615,713,548 -> 565,797,374 cycles (-65.0%), and the wall-clock A/B that followed
+// turned the retype from -4.56% into +5.49% (6/6, every gate PASS, bit-identical on this population).
+//
+// Default ON, with a way back (G-22): KATAGO_CPU_MUL_BCAST_OFF=1 restores the per-element form. The old
+// opt-in name KATAGO_CPU_MUL_BCAST is still ACCEPTED and is now a no-op, deliberately: the A/B script that
+// measured it passes that name on the ON arm, and keeping it harmless means that script now measures the
+// retype with this fold already baked into BOTH arms -- which is exactly the confirmation run required
+// before the retype itself becomes the default.
+//
+// It is applied only where the destination is f16 (the if-constexpr below): the f32 destination has its own
+// path and the earlier reading that the knob was "slightly negative" there was run-to-run scatter, since
+// this code cannot be reached with dst_t == float at all.
+static int katago_mul_bcast_off(void) {
     static int v = -1;
-    if (v < 0) { v = (getenv("KATAGO_CPU_MUL_BCAST") != NULL) ? 1 : 0; }
+    if (v < 0) { v = (getenv("KATAGO_CPU_MUL_BCAST_OFF") != NULL) ? 1 : 0; }
     return v;
 }
 
@@ -330,11 +345,9 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
             // src1 is broadcastable across src0 and dst in i1, i2, i3
             const int64_t nr0 = ne00 / ne10;
 
-            // V4 of the ablation (KATAGO_CPU_MUL_BCAST=1): with ne10 == 1 the loop below degenerates into one
-            // call per ELEMENT, each of which runs a one-iteration loop. This replaces the whole row-set with
-            // a single packed loop. See the note above katago_mul_bcast_f16out for why this is a variant
-            // rather than a segmented instrument.
-            if (ne10 == 1 && katago_mul_bcast()) {
+            // Folded into the F16 write-back path -- no longer a mode. See the note above
+            // katago_mul_bcast_off(); KATAGO_CPU_MUL_BCAST_OFF=1 is the way back (G-22).
+            if (ne10 == 1 && !katago_mul_bcast_off()) {
                 if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<dst_t, ggml_fp16_t>) {
                     katago_mul_bcast_f16out<op>(ne00, dst_ptr, src0_ptr, src1_ptr);
                     continue;
