@@ -3,6 +3,90 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#if defined(_MSC_VER) || defined(__clang__)
+#include <intrin.h>
+#endif
+
+// ---------------------------------------------------------------------------------------------------
+// KATAGO_CPU_MUL_STORE_STATS=1 -- price the PRODUCER side of the f16 store, in situ, per element.
+//
+// Why in situ rather than by disassembly: the f16 contiguous loop compiles to three packed instructions
+// per 8 elements (vmovups + vmulps + vcvtps2ph writing 16 B straight to memory, no stack round-trip, the
+// alignas float[8] promoted into a register, the function-pointer `op` devirtualised). That bounds the
+// ARITHMETIC near zero and says nothing about what a half-width destination costs the MEMORY SYSTEM --
+// fewer bytes is a different write pattern, not obviously a cheaper one. The disassembly was read as
+// "P ~ 0"; this counter is the check on that reading, and P is the number lead B's arithmetic rests on
+// (d(mulf16) = +1.035 - P - D).
+//
+// Why this shape: BOTH contiguous store loops run in the SAME process, because the retype only touches
+// some of the MUL nodes -- the rest keep an f32 destination. So the f32 loop and the f16 loop can be timed
+// against each other with no cross-arm, cross-session or cross-DLL comparison anywhere, which is the only
+// kind of difference this project has been able to trust. Cycles per ELEMENT is what is reported, so node
+// sizes and thread counts cancel.
+// ---------------------------------------------------------------------------------------------------
+static inline uint64_t katago_mul_st_tsc(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __rdtsc();
+#else
+    return 0; // no cycle counter here; the element counts stay valid and the per-element cost reads 0
+#endif
+}
+static int katago_mul_store_stats(void) {
+    static int v = -1;
+    if (v < 0) { v = (getenv("KATAGO_CPU_MUL_STORE_STATS") != NULL) ? 1 : 0; }
+    return v;
+}
+// [mode][bucket] where mode 0 = f32 destination, 1 = f16, and bucket is the CALL LENGTH:
+//   1 = n == 1        (the scalar tail: the 8-wide loop never runs, every element converts through the
+//                      type-trait function pointer)
+//   2 = 2 <= n < 8    (the scalar tail again, a few elements at a time)
+//   3 = n >= 8        (the packed loop actually executes)
+// Bucketing is not decoration. The first version of this counter reported ONE number per mode and it
+// compared an all-n==1 population (every retyped tensor) against a mixed one (6.5 elements per call on
+// average), whose per-call overhead is amortised over six times more elements -- so the reported P was
+// mostly the difference in call shape, not in store cost. That is the same disease as reading the TU's
+// `2ph` count as if it were the hot loop: a population that is not the population in question.
+static uint64_t katago_mul_st_cyc  [2][4][GGML_MAX_N_THREADS];
+static uint64_t katago_mul_st_elems[2][4][GGML_MAX_N_THREADS];
+static uint64_t katago_mul_st_calls[2][4][GGML_MAX_N_THREADS];
+
+static inline int katago_mul_st_bucket(int64_t n) { return n <= 1 ? 1 : (n < 8 ? 2 : 3); }
+
+extern "C" void katago_mul_store_report(void) {
+    static const char * const mode_name[2] = { "f32 dst", "f16 dst" };
+    uint64_t c[2][4] = {{0}}, e[2][4] = {{0}}, k[2][4] = {{0}};
+    for (int t = 0; t < GGML_MAX_N_THREADS; t++) {
+        for (int m = 0; m < 2; m++) {
+            for (int b = 1; b < 4; b++) {
+                c[m][b] += katago_mul_st_cyc  [m][b][t];
+                e[m][b] += katago_mul_st_elems[m][b][t];
+                k[m][b] += katago_mul_st_calls[m][b][t];
+            }
+        }
+    }
+    if (k[0][1] + k[0][2] + k[0][3] + k[1][1] + k[1][2] + k[1][3] == 0) { return; }
+    fprintf(stderr, "[mul-store] contiguous store loops, ONE process, bucketed by CALL LENGTH "
+                    "(n==1 scalar tail | 2<=n<8 | n>=8 packed loop):\n");
+    for (int m = 0; m < 2; m++) {
+        for (int b = 1; b < 4; b++) {
+            if (k[m][b] == 0) { continue; }
+            fprintf(stderr, "[mul-store]   %s bucket %d: calls=%llu elems=%llu cycles=%llu (%.3f cyc/elem)\n",
+                    mode_name[m], b, (unsigned long long) k[m][b], (unsigned long long) e[m][b],
+                    (unsigned long long) c[m][b], e[m][b] ? (double) c[m][b] / (double) e[m][b] : 0.0);
+        }
+    }
+    // Like with like: the n==1 bucket on both sides. That is the pair the retyped MULs actually live in.
+    if (e[0][1] && e[1][1]) {
+        const double a = (double) c[0][1] / (double) e[0][1];
+        const double b = (double) c[1][1] / (double) e[1][1];
+        fprintf(stderr, "[mul-store] P (n==1 vs n==1) = %+.3f cyc/elem  =>  %+.1f Mcycles over the "
+                        "15,023,376 retyped elements  (11.9 Gcycles of thread span = 1%%)\n", b - a,
+                (b - a) * 15.023376);
+    } else {
+        fprintf(stderr, "[mul-store] P NOT READABLE: one side has no n==1 calls, so the like-for-like pair "
+                        "does not exist in this run\n");
+    }
+}
 
 // Debug-only hook, defined (with C linkage) in ops.cpp. With KATAGO_CPU_ROPE_HASH=1 the ADD kernel hashes
 // its own output block so it can be compared, inside a single run, against what the fused RoPE kernel wrote.
@@ -187,7 +271,29 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
                               std::is_same_v<dst_t, ggml_fp16_t>) {
                     // KATAGO_CPU_MUL_F16's store: packed, because the generic path's conversion is not.
                     // See the note above vec_binary_op_contiguous_f16out.
-                    vec_binary_op_contiguous_f16out<op>(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
+                    if (katago_mul_store_stats()) {
+                        const int stb = katago_mul_st_bucket(ne10);
+                        const uint64_t st0 = katago_mul_st_tsc();
+                        vec_binary_op_contiguous_f16out<op>(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
+                        katago_mul_st_cyc  [1][stb][params->ith] += katago_mul_st_tsc() - st0;
+                        katago_mul_st_elems[1][stb][params->ith] += (uint64_t) ne10;
+                        katago_mul_st_calls[1][stb][params->ith] ++;
+                    } else {
+                        vec_binary_op_contiguous_f16out<op>(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
+                    }
+                } else if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> &&
+                                     std::is_same_v<dst_t, float>) {
+                    // The f32 counterpart, timed by the same counter so P is a same-process difference.
+                    if (katago_mul_store_stats()) {
+                        const int stb = katago_mul_st_bucket(ne10);
+                        const uint64_t st0 = katago_mul_st_tsc();
+                        vec_binary_op_contiguous<op>(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
+                        katago_mul_st_cyc  [0][stb][params->ith] += katago_mul_st_tsc() - st0;
+                        katago_mul_st_elems[0][stb][params->ith] += (uint64_t) ne10;
+                        katago_mul_st_calls[0][stb][params->ith] ++;
+                    } else {
+                        vec_binary_op_contiguous<op>(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
+                    }
                 } else {
                     vec_binary_op_contiguous<op>(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
                 }

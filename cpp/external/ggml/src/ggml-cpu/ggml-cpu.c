@@ -674,6 +674,10 @@ static uint64_t ggml_cpu_mm_repack_skip = 0;
 // because they are different work and gate 4 declares one number.
 static uint64_t ggml_cpu_mm_repack_f16_done  = 0;
 static uint64_t ggml_cpu_mm_repack_f16_elems = 0;
+// Defined in binary-ops.cpp (this TU is C, so no extern "C" here), gated by KATAGO_CPU_MUL_STORE_STATS.
+// Declared up here because the report that calls it sits further down the file and this build treats an
+// implicit declaration as an error -- which is how the first attempt at this line failed to compile.
+void katago_mul_store_report(void);
 // The repack is WORK, not waiting: it reads all of src1 and writes the converted copy, and that cost lands in
 // MUL_MAT's own row where no waiting-type instrument can see it. Per-thread rows, like everything else here.
 static uint64_t ggml_cpu_bar_repack_elems [GGML_MAX_N_THREADS];
@@ -1246,6 +1250,13 @@ static void ggml_cpu_bar_spin_report(void) {
                     (unsigned long long) ggml_cpu_mm_repack_f16_elems, mb, mb, mb + mb);
         }
     }
+
+    // Producer-side store cost (KATAGO_CPU_MUL_STORE_STATS=1), defined in binary-ops.cpp. Both contiguous
+    // store loops are timed in ONE process -- the retype only touches some MUL nodes, so the rest keep an
+    // f32 destination -- which makes P a same-process difference: no cross-arm, no cross-session and no
+    // cross-DLL comparison appears anywhere in it. That matters because the cross-DLL spread on this arm
+    // already measured 1.5 pp.
+    katago_mul_store_report();
 
     // Activation-range pre-flight (only when KATAGO_CPU_ACT_RANGE=1). This is the measurement that decides
     // whether "activations in f16" is mechanically possible at all, and it is also the only thing that could
