@@ -190,6 +190,67 @@ static inline void vec_binary_op_contiguous_f16out(const int64_t n, ggml_fp16_t 
 #endif
 }
 
+// ---------------------------------------------------------------------------------------------------
+// KATAGO_CPU_MUL_BCAST=1 -- the variant that removes the per-ELEMENT call structure of a broadcast mul.
+//
+// What the ablation is for: the per-op work profile says MUL is +51..67% on the retype arm in every run
+// while every other big op sits within ~1.4% of its counterpart. Inside MUL the cost is NOT the conversion
+// instruction -- `type_conversion_table<ggml_fp16_t>::from_f32` is GGML_CPU_FP32_TO_FP16, which
+// simd-mappings.h:58-64 defines as `_cvtss_sh(x, 0)` whenever __F16C__ is set, and ggml-cpu-impl.h:50-51
+// force __F16C__ on for AVX2/AVX512. So the scalar tail already uses the hardware conversion and swapping
+// it would change nothing.
+//
+// What is left is the STRUCTURE. Every retyped tensor is a broadcast multiply with ne10 == 1, i.e. the
+// source has ONE element for the whole row, so `vec_binary_op_contiguous_f16out` is entered once per
+// ELEMENT with n == 1: the 8-wide loop never runs and each element pays a call, a one-iteration loop and
+// the pointer arithmetic around it. 120,187,008 elements per process.
+//
+// Why a variant and not a segmented instrument: instrumenting four segments inside a path that is entered
+// once per element would cost 120M x 4 x ~40 cycles ~= 19 Gcycles, which is the entire thread span. The
+// measurement would be the instrument, and this time it would contaminate BOTH arms, so the symmetry gate
+// could not catch it either. A variant costs nothing to measure: the existing work profile already reports
+// the MUL row.
+//
+// Why an env rather than a separate build: it keeps V1 and V4 inside ONE dll, so the comparison does not
+// carry a code-layout or ASLR difference on top of the thing being measured -- which matters here because
+// the same retype arm has already been measured 1.5 pp apart across two builds of the same source.
+//
+// Bit identity is NOT inherited from the packed path's earlier gate: that gate covered whichever tensors
+// happened to pass through the 8-wide loop, and these broadcast tensors never did. The conversion is the
+// same round-to-nearest-even operation, so the expectation is that the hash does not move -- but the gate
+// has to be run on THIS population (and if it moves, subnormals are the first place to look).
+static int katago_mul_bcast(void) {
+    static int v = -1;
+    if (v < 0) { v = (getenv("KATAGO_CPU_MUL_BCAST") != NULL) ? 1 : 0; }
+    return v;
+}
+
+// One packed loop over the whole row instead of one call per element. The body deliberately applies `op`
+// element by element inside the 8-wide group rather than calling _mm256_mul_ps: that keeps the helper
+// correct for any op, and for op_mul clang still folds it into vmovups + vmulps + vcvtps2ph (exactly the
+// three-instruction loop the packed path compiles to), so nothing is given up for the generality.
+template <float (*op)(float, float)>
+static inline void katago_mul_bcast_f16out(const int64_t n, ggml_fp16_t * z, const float * x, const float * y) {
+#if defined(__F16C__)
+    const float s = y[0];
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        alignas(32) float r[8];
+        for (int k = 0; k < 8; k++) {
+            r[k] = op(x[i + k], s);
+        }
+        _mm_storeu_si128((__m128i *)(z + i), _mm256_cvtps_ph(_mm256_load_ps(r), 0));
+    }
+    for (; i < n; i++) {
+        z[i] = GGML_CPU_FP32_TO_FP16(op(x[i], s));
+    }
+#else
+    for (int64_t i = 0; i < n; i++) {
+        z[i] = GGML_CPU_FP32_TO_FP16(op(x[i], y[0]));
+    }
+#endif
+}
+
 template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>
 static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -268,6 +329,17 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
         if (is_src1_contiguous_rows) {
             // src1 is broadcastable across src0 and dst in i1, i2, i3
             const int64_t nr0 = ne00 / ne10;
+
+            // V4 of the ablation (KATAGO_CPU_MUL_BCAST=1): with ne10 == 1 the loop below degenerates into one
+            // call per ELEMENT, each of which runs a one-iteration loop. This replaces the whole row-set with
+            // a single packed loop. See the note above katago_mul_bcast_f16out for why this is a variant
+            // rather than a segmented instrument.
+            if (ne10 == 1 && katago_mul_bcast()) {
+                if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<dst_t, ggml_fp16_t>) {
+                    katago_mul_bcast_f16out<op>(ne00, dst_ptr, src0_ptr, src1_ptr);
+                    continue;
+                }
+            }
 
             for (int64_t r = 0; r < nr0; ++r) {
 #ifdef GGML_USE_ACCELERATE
