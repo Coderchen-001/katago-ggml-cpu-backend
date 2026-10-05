@@ -7,6 +7,17 @@
 #include <intrin.h>
 #endif
 
+// The P instrument is OFF by default and must stay that way: its branch sat inside the row loop, one
+// execution per call, and with ne10 == 1 that is one execution per ELEMENT -- 120,187,008 of them in the
+// ON arm and ZERO in the off arm, because the f16 destination only exists there. So it was not a symmetric
+// branch: it added cycles to exactly one arm, which is the one shape of instrument error that survives a
+// paired A/B. Measured consequence: the work profile named MUL +48.6% on a DLL that contained this branch,
+// so that reading has to be reproduced on a build without it before it can be quoted. Enabling it takes a
+// build with -DKATAGO_MUL_ST_INSTRUMENT=1, i.e. an instrument build that is never a timing build.
+#ifndef KATAGO_MUL_ST_INSTRUMENT
+#define KATAGO_MUL_ST_INSTRUMENT 0
+#endif
+
 // ---------------------------------------------------------------------------------------------------
 // KATAGO_CPU_MUL_STORE_STATS=1 -- price the PRODUCER side of the f16 store, in situ, per element.
 //
@@ -271,6 +282,7 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
                               std::is_same_v<dst_t, ggml_fp16_t>) {
                     // KATAGO_CPU_MUL_F16's store: packed, because the generic path's conversion is not.
                     // See the note above vec_binary_op_contiguous_f16out.
+#if KATAGO_MUL_ST_INSTRUMENT
                     if (katago_mul_store_stats()) {
                         const int stb = katago_mul_st_bucket(ne10);
                         const uint64_t st0 = katago_mul_st_tsc();
@@ -278,12 +290,15 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
                         katago_mul_st_cyc  [1][stb][params->ith] += katago_mul_st_tsc() - st0;
                         katago_mul_st_elems[1][stb][params->ith] += (uint64_t) ne10;
                         katago_mul_st_calls[1][stb][params->ith] ++;
-                    } else {
+                    } else
+#endif
+                    {
                         vec_binary_op_contiguous_f16out<op>(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
                     }
                 } else if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> &&
                                      std::is_same_v<dst_t, float>) {
                     // The f32 counterpart, timed by the same counter so P is a same-process difference.
+#if KATAGO_MUL_ST_INSTRUMENT
                     if (katago_mul_store_stats()) {
                         const int stb = katago_mul_st_bucket(ne10);
                         const uint64_t st0 = katago_mul_st_tsc();
@@ -291,7 +306,9 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
                         katago_mul_st_cyc  [0][stb][params->ith] += katago_mul_st_tsc() - st0;
                         katago_mul_st_elems[0][stb][params->ith] += (uint64_t) ne10;
                         katago_mul_st_calls[0][stb][params->ith] ++;
-                    } else {
+                    } else
+#endif
+                    {
                         vec_binary_op_contiguous<op>(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
                     }
                 } else {
