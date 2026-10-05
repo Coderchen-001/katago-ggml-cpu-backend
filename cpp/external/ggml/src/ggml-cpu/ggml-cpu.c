@@ -2373,6 +2373,19 @@ UseGgmlGemm1:;
         // activations, and made KataGo stop printing raw-nn after 1.3 KB instead of 58.6 KB -- see G-19.
         // `done` counts CONVERTING repacks only. In lead B's arm the block is also entered for a copy, and
         // counting those here would make done=1064 while done-copy_done=384 is the number gate 4 declares.
+        if (ith == 0) {
+            // The OFF arm's ACTUAL source: the scratch every GEMM reads instead of its src1. One fixed
+            // buffer, so one page offset applies to all of them -- which is exactly what makes the
+            // 4K-aliasing comparison between the two arms possible at all (KATAGO_CPU_MMALIGN_DBG=1).
+            static int wd_off_printed = 0;
+            if (!wd_off_printed && getenv("KATAGO_CPU_MMALIGN_DBG") != NULL) {
+                wd_off_printed = 1;
+                fprintf(stderr, "[mm-align] OFF-arm source: params->wdata%%4096=%llu  wdata%%64=%llu  "
+                                "(one fixed scratch shared by every GEMM)\n",
+                        (unsigned long long) ((uintptr_t) params->wdata % 4096),
+                        (unsigned long long) ((uintptr_t) params->wdata % 64));
+            }
+        }
         if (ith == 0 && !did_copy) { __atomic_fetch_add(&ggml_cpu_mm_repack_done, 1, __ATOMIC_RELAXED); }
         char * wdata = params->wdata;
         const uint64_t repack_t0 = ggml_cpu_bar_tsc();

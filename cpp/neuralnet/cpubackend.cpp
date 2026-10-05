@@ -1463,6 +1463,55 @@ static void reportMulF16Layout() {
 // runtime pattern match with a hard predicate -- the Mul must directly follow the RMS_NORM in the
 // cgraph, all three tensors must be F32, and the weight view must be contiguous F32 with the same
 // ---------------------------------------------------------------------------------------------------
+// ALIGNMENT / ALIASING AUDIT (KATAGO_CPU_MMALIGN_DBG=1) -- what is left after P and D were excluded.
+//
+// The ledger is d = +1.035 - P - D - (relayout), with P = 0.10% measured in situ and D ~ M excluded by the
+// lead-B A/B, so what remains is the arena relayout the retype causes: 15,023,376 fewer elements, 30 MB
+// per graph, every activation moved. This audit is how that stops being an adjective. For every MUL_MAT it
+// reports the page offset (mod 4096) of the destination and of the source, their difference, and the row
+// strides mod 64 -- in BOTH arms, because it does not depend on the retype: the two arms then produce
+// comparable tables and the only thing that differs between them is which buffer the GEMM reads.
+//
+// Why 4096 and 64: a store and a load whose addresses differ by a multiple of 4096 (or by a small offset
+// from one) can falsely alias in the store buffer and stall, which is a several-percent effect at these
+// sizes and is a pure layout accident. 64 is the line size for the row-stride question: an f16 row is
+// 2*ne0 bytes, so a stride that is not a multiple of 64 alternates the rows across the line boundary.
+static void auditMulMatLayout(ggml_cgraph* g) {
+  static bool mmAlignDone = false;
+  if (mmAlignDone)
+    return;
+  if(getenv("KATAGO_CPU_MMALIGN_DBG") == nullptr || getenv("KATAGO_CPU_MMALIGN_DBG")[0] != '1')
+    return;
+  mmAlignDone = true;
+  const int n = ggml_graph_n_nodes(g);
+  int nMm = 0, nearAlias = 0;
+  for(int i = 0; i < n; i++) {
+    ggml_tensor* node = ggml_graph_node(g, i);
+    if(node->op != GGML_OP_MUL_MAT)
+      continue;
+    ggml_tensor* b = node->src[1];
+    if(node->data == NULL || b->data == NULL)
+      continue;
+    const int64_t d4 = (int64_t)(((uintptr_t)node->data) % 4096);
+    const int64_t s4 = (int64_t)(((uintptr_t)b->data) % 4096);
+    const int64_t delta = (d4 >= s4) ? (d4 - s4) : (d4 + 4096 - s4);
+    // "Near" = same 4K offset within a line: the window where a store-buffer false dependency is possible.
+    if(delta < 64 || delta > 4096 - 64)
+      nearAlias++;
+    nMm++;
+    fprintf(stderr, "[mm-align] dst%%4096=%4lld src1%%4096=%4lld (dst-src1)%%4096=%4lld src1nb1%%64=%2lld "
+                    "src0nb1%%64=%2lld src1%%32=%2lld m=%lld n=%lld k=%lld\n",
+            (long long)d4, (long long)s4, (long long)delta, (long long)(b->nb[1] % 64),
+            (long long)(node->src[0]->nb[1] % 64), (long long)(((uintptr_t)b->data) % 32),
+            (long long)node->ne[1], (long long)node->ne[0], (long long)b->ne[0]);
+  }
+  fprintf(stderr, "[mm-align] TOTALS: %d MUL_MAT nodes, %d with dst and src1 within 64 B of the same 4K "
+                  "offset (candidate store-buffer false aliasing)\n", nMm, nearAlias);
+  fprintf(stderr, "[mm-align] NOTE: in the OFF arm the GEMM reads params->wdata rather than src1 -- the DLL "
+                  "prints that buffer's %%4096 once, since the scratch is one fixed buffer and a single "
+                  "offset therefore applies to every GEMM.\n");
+}
+
 // CHUNK-SPLIT AUDIT (KATAGO_CPU_CHUNK_DBG=1) -- how many nodes CANNOT even fill the pool?
 //
 // Every element-wise op (ADD/SUB/MUL/DIV, all unaries, cumsum/fill/tri) splits its work with
@@ -2388,6 +2437,8 @@ void NeuralNet::getOutput(
   // "is the buffer the GEMM reads aligned" is a question with an answer. One-shot: the graph shape is the
   // same on every rebuild and 60 identical copies of 672 lines is not evidence, it is log spam.
   reportMulF16Layout();
+  // The layout question, on both arms and independent of every knob: see auditMulMatLayout above.
+  auditMulMatLayout(gpuHandle->graph);
 
   if(ggml_backend_graph_compute(gpuHandle->backend, gpuHandle->graph) != GGML_STATUS_SUCCESS)
     throw StringError("CPU backend: graph compute failed");
