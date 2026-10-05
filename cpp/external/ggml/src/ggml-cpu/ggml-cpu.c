@@ -1,3 +1,4 @@
+static void ggml_cpu_workprof_report(void);   // defined below the spin report, called from it
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
@@ -1257,6 +1258,7 @@ static void ggml_cpu_bar_spin_report(void) {
     // cross-DLL comparison appears anywhere in it. That matters because the cross-DLL spread on this arm
     // already measured 1.5 pp.
     katago_mul_store_report();
+    ggml_cpu_workprof_report();
 
     // Activation-range pre-flight (only when KATAGO_CPU_ACT_RANGE=1). This is the measurement that decides
     // whether "activations in f16" is mechanically possible at all, and it is also the only thing that could
@@ -1380,6 +1382,49 @@ static void ggml_cpu_bar_spin_report(void) {
     } else {
         fprintf(stderr, "[bar-spin-by-op] VERDICT: OUT -- measured %.2f%% of runtime misses the %.2f%% gate; "
                         "the anchor table is the whole story\n", ew_measured, GGML_CPU_BAR_VERDICT_GATE);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// KATAGO_CPU_WORKPROF=1 -- per-op WORK cycles, as opposed to the spin the row above reports.
+//
+// Why this has to exist: `ggml_cpu_bar_cycles_by_op` is NOT work. It carries
+// ggml_cpu_tls_pending_cycles, which is drained together with spin and waits, and it was measured to
+// equal `spin * cyc_per_iter` for every op (MUL 263.7 vs 262.8, FA 210.4 vs 207.9, ADD 105.5 vs 105.4,
+// all in Mcycles) -- i.e. it is the spin column in other units (G-27). So there is no per-op work
+// number anywhere in this instrument, and after P (~0.10%, measured in situ) and D (~M, excluded by the
+// lead-B A/B) and 4K aliasing (0 of 133 nodes, both arms) were each excluded, "which op carries the
+// 4.6%" is the question that is left.
+//
+// The distinction that makes this useful: wrapping the DISPATCH (not the barrier) gives cycles that
+// exclude waiting, so a uniform slowdown across every op is not a work finding at all -- it is the
+// machine's operating point, and it would explain the 1.5 pp cross-DLL drift and the 2% session spread
+// in the OFF arm in one stroke. A slowdown concentrated in one op names the mechanism on the spot.
+// The environment is read ONCE per process (the established form), never per node or per element.
+static uint64_t ggml_cpu_workprof_cyc [GGML_OP_COUNT + 1];
+static uint64_t ggml_cpu_workprof_call[GGML_OP_COUNT + 1];
+static int ggml_cpu_workprof_on(void) {
+    static int v = -1;
+    if (v < 0) { v = (getenv("KATAGO_CPU_WORKPROF") != NULL) ? 1 : 0; }
+    return v;
+}
+// Relaxed atomics per node: a few thousand per graph, so the cost is nothing next to what it measures.
+static inline void ggml_cpu_workprof_note(int op, uint64_t t0) {
+    if (op < 0 || op > GGML_OP_COUNT) { return; }
+    __atomic_fetch_add(&ggml_cpu_workprof_cyc [op], ggml_cpu_bar_tsc() - t0, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&ggml_cpu_workprof_call[op], 1, __ATOMIC_RELAXED);
+}
+static void ggml_cpu_workprof_report(void) {
+    if (!ggml_cpu_workprof_on()) { return; }
+    fprintf(stderr, "[workprof] per-op WORK cycles (dispatch entry to exit, waiting EXCLUDED). Compare the "
+                    "two arms op by op: a uniform ratio is the machine's operating point, a single op is "
+                    "the mechanism.\n");
+    for (int s = 0; s < GGML_OP_COUNT + 1; s++) {
+        if (ggml_cpu_workprof_call[s] == 0) { continue; }
+        const char * name = (s == GGML_OP_COUNT) ? "graph-end" : ggml_op_name((enum ggml_op) s);
+        fprintf(stderr, "[workprof] %-22s calls=%-8llu work_cycles=%llu\n", name,
+                (unsigned long long) ggml_cpu_workprof_call[s],
+                (unsigned long long) ggml_cpu_workprof_cyc[s]);
     }
 }
 
@@ -5462,7 +5507,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
-            ggml_compute_forward(&params, node);
+    // KATAGO_CPU_WORKPROF=1: per-op WORK cycles, waiting excluded -- see ggml_cpu_workprof_report(). The
+    // flag is read once per process inside ggml_cpu_workprof_on(), so this costs a static read and a
+    // predictable branch per NODE (a few thousand per graph), not per element.
+    if (ggml_cpu_workprof_on()) {
+        const uint64_t wp0 = ggml_cpu_bar_tsc();
+        ggml_compute_forward(&params, node);
+        ggml_cpu_workprof_note((int) node->op, wp0);
+    } else {
+        ggml_compute_forward(&params, node);
+    }
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
