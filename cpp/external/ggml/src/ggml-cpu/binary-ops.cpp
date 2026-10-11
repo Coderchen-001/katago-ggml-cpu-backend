@@ -290,6 +290,41 @@ static inline void katago_mul_bcast_f16out(const int64_t n, ggml_fp16_t * z, con
 #endif
 }
 
+// V5: the SAME structural defect on the F32 destination. The store helper is entered once per ELEMENT with
+// ne10 == 1 and every entry runs a one-iteration loop, so this is one call per element either way; here the
+// whole row is done in one plain loop over an invariant scalar, which clang turns into vmulps on its own.
+//
+// Why V5 is the lower-risk half: it needs no retype, no f16 destination and no consumer predicate. And why it
+// is also the other half of R2's attribution: the retype's confirmation A/B carried the f16 fold in BOTH
+// arms, so its off arm's broadcast sites were still paying this tax while its on arm rode the already
+// specialised f16 path -- part of R2's +5.09% is therefore not "saving the repack" but "the retype
+// incidentally bypassing the baseline's f32 broadcast tax". Measuring V5 alone turns that into a number.
+template <float (*op)(float, float)>
+static inline void katago_mul_bcast_f32out(const int64_t n, float * z, const float * x, const float * y) {
+    const float s = y[0];
+    for (int64_t i = 0; i < n; i++) {
+        z[i] = op(x[i], s);
+    }
+}
+
+// Element counters, one per destination type. Deliberately NOT a timing instrument: a handful of increments
+// per graph, symmetric across arms, and it is what GATE 4 needs in order to declare that an A/B of this
+// specialisation actually moved work -- without it the fold's own wall-clock value cannot be measured at all,
+// because the only other counter it moves is the repack volume, which the retype moves as well.
+static uint64_t katago_mul_bcast_elems[2];   // [0] f16 dst (the retype path), [1] f32 dst (V5)
+static int katago_mul_bcast_stats_on(void) {
+    static int v = -1;
+    if (v < 0) { v = (getenv("KATAGO_CPU_MUL_BCAST_STATS") != NULL) ? 1 : 0; }
+    return v;
+}
+extern "C" void katago_mul_bcast_report(void) {
+    if (!katago_mul_bcast_stats_on()) { return; }
+    fprintf(stderr, "[mul-bcast] broadcast-mul elements: f16_dst=%llu  f32_dst=%llu  (the per-element path "
+                    "would enter the store helper once for each of them)\n",
+            (unsigned long long) katago_mul_bcast_elems[0],
+            (unsigned long long) katago_mul_bcast_elems[1]);
+}
+
 template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>
 static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -373,7 +408,15 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
             // katago_mul_bcast_off(); KATAGO_CPU_MUL_BCAST_OFF=1 is the way back (G-22).
             if (ne10 == 1 && !katago_mul_bcast_off()) {
                 if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<dst_t, ggml_fp16_t>) {
+                    katago_mul_bcast_elems[0] += (uint64_t) ne00;
                     katago_mul_bcast_f16out<op>(ne00, dst_ptr, src0_ptr, src1_ptr);
+                    continue;
+                }
+                // V5: same specialisation for the F32 destination. See katago_mul_bcast_f32out().
+                if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> &&
+                              std::is_same_v<dst_t, float>) {
+                    katago_mul_bcast_elems[1] += (uint64_t) ne00;
+                    katago_mul_bcast_f32out<op>(ne00, dst_ptr, src0_ptr, src1_ptr);
                     continue;
                 }
             }

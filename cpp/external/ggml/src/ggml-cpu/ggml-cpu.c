@@ -679,6 +679,9 @@ static uint64_t ggml_cpu_mm_repack_f16_elems = 0;
 // Declared up here because the report that calls it sits further down the file and this build treats an
 // implicit declaration as an error -- which is how the first attempt at this line failed to compile.
 void katago_mul_store_report(void);
+// Same place, same purpose: element counts for the broadcast-mul specialisation, so that an A/B of it has a
+// declared work delta (GATE 4) that actually moves with the knob.
+void katago_mul_bcast_report(void);
 // The repack is WORK, not waiting: it reads all of src1 and writes the converted copy, and that cost lands in
 // MUL_MAT's own row where no waiting-type instrument can see it. Per-thread rows, like everything else here.
 static uint64_t ggml_cpu_bar_repack_elems [GGML_MAX_N_THREADS];
@@ -1257,6 +1260,7 @@ static void ggml_cpu_bar_spin_report(void) {
     // f32 destination -- which makes P a same-process difference: no cross-arm, no cross-session and no
     // cross-DLL comparison appears anywhere in it. That matters because the cross-DLL spread on this arm
     // already measured 1.5 pp.
+    katago_mul_bcast_report();
     katago_mul_store_report();
     ggml_cpu_workprof_report();
 
