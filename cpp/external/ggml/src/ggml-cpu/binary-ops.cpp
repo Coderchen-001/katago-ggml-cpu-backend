@@ -248,18 +248,31 @@ static bool katago_env_word_is(const char * v, const char * w) {
     }
     return v[i] == '\0' && w[i] == '\0';
 }
+static int katago_bcast_flag(const char * name) {
+    const char * e = getenv(name);
+    if (e == NULL || e[0] == '\0') { return 0; }
+    return !(katago_env_word_is(e, "0") || katago_env_word_is(e, "false") ||
+             katago_env_word_is(e, "no") || katago_env_word_is(e, "off"));
+}
+// Return value: bit0 set = the f16 destination branch is off, bit1 set = the f32 one is off.
+//
+// Two switches, because they are two different experiments. KATAGO_CPU_MUL_BCAST_OFF turns off BOTH (one
+// switch for the whole fold, which is how the landing was verified). KATAGO_CPU_MUL_BCAST_F32_OFF turns off
+// only the f32 branch -- and that separation is not cosmetic: the two branches handle different volumes
+// (f16_dst 46,605,024 vs f32_dst 71,705,112 elements per process), and pricing V5 with both under one knob
+// would put 46.6M f16 elements into a number whose stated purpose is the 71.7M f32 ones.
 static int katago_mul_bcast_off(void) {
     static int v = -1;
     if (v < 0) {
-        const char * e = getenv("KATAGO_CPU_MUL_BCAST_OFF");
-        bool off = false;
-        if (e != NULL && e[0] != '\0') {
-            off = !(katago_env_word_is(e, "0") || katago_env_word_is(e, "false") ||
-                    katago_env_word_is(e, "no") || katago_env_word_is(e, "off"));
-        }
-        v = off ? 1 : 0;
-        fprintf(stderr, "[mul-bcast] effective: broadcast-mul specialisation = %s  (KATAGO_CPU_MUL_BCAST_OFF=%s)\n",
-                off ? "OFF" : "ON", e == NULL ? "unset" : e);
+        const int all = katago_bcast_flag("KATAGO_CPU_MUL_BCAST_OFF");
+        const int f32 = katago_bcast_flag("KATAGO_CPU_MUL_BCAST_F32_OFF");
+        v = (all ? 1 : 0) | ((all || f32) ? 2 : 0);
+        const char * a = getenv("KATAGO_CPU_MUL_BCAST_OFF");
+        const char * b = getenv("KATAGO_CPU_MUL_BCAST_F32_OFF");
+        fprintf(stderr, "[mul-bcast] effective: broadcast-mul specialisation = f16:%s f32:%s  "
+                        "(KATAGO_CPU_MUL_BCAST_OFF=%s KATAGO_CPU_MUL_BCAST_F32_OFF=%s)\n",
+                (v & 1) ? "OFF" : "ON", (v & 2) ? "OFF" : "ON",
+                a == NULL ? "unset" : a, b == NULL ? "unset" : b);
     }
     return v;
 }
@@ -406,18 +419,23 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
 
             // Folded into the F16 write-back path -- no longer a mode. See the note above
             // katago_mul_bcast_off(); KATAGO_CPU_MUL_BCAST_OFF=1 is the way back (G-22).
-            if (ne10 == 1 && !katago_mul_bcast_off()) {
+            if (ne10 == 1) {
+                const int bcast = katago_mul_bcast_off();
                 if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<dst_t, ggml_fp16_t>) {
-                    katago_mul_bcast_elems[0] += (uint64_t) ne00;
-                    katago_mul_bcast_f16out<op>(ne00, dst_ptr, src0_ptr, src1_ptr);
-                    continue;
+                    if (!(bcast & 1)) {
+                        katago_mul_bcast_elems[0] += (uint64_t) ne00;
+                        katago_mul_bcast_f16out<op>(ne00, dst_ptr, src0_ptr, src1_ptr);
+                        continue;
+                    }
                 }
                 // V5: same specialisation for the F32 destination. See katago_mul_bcast_f32out().
                 if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> &&
                               std::is_same_v<dst_t, float>) {
-                    katago_mul_bcast_elems[1] += (uint64_t) ne00;
-                    katago_mul_bcast_f32out<op>(ne00, dst_ptr, src0_ptr, src1_ptr);
-                    continue;
+                    if (!(bcast & 2)) {
+                        katago_mul_bcast_elems[1] += (uint64_t) ne00;
+                        katago_mul_bcast_f32out<op>(ne00, dst_ptr, src0_ptr, src1_ptr);
+                        continue;
+                    }
                 }
             }
 
