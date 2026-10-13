@@ -45,6 +45,14 @@ void ggml_compute_forward_silu_back(const struct ggml_compute_params * params, s
 void ggml_compute_forward_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rms_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rms_norm_mul_fused(const struct ggml_compute_params * params, struct ggml_tensor * dst_rms_norm, struct ggml_tensor * dst_mul);
+// Element-wise chain {MUL, ADD}: dst_add = (m0 * m1) + a1, computed in ONE pass so the MUL's intermediate
+// never reaches memory. The prize is bandwidth (the census puts MUL->ADD at 6576 edges / 1.43G elements /
+// 5.72 GB of reads), unlike FA's 16 KB tiles.
+// CONTRACT, and it is not optional: the kernel runs at the MUL's slot, so every input it reads must already
+// be written. The caller MUST prove that the ADD's non-MUL operand is produced before the MUL's node index
+// (or is a leaf) -- reading a later node's output is exactly how the A1 callable-kernel version failed.
+void ggml_compute_forward_muladd_fused(const struct ggml_compute_params * params,
+        struct ggml_tensor * dst_add, const struct ggml_tensor * dst_mul);
 // Fused {MUL, GET_ROWS|MUL, MUL, ADD} diamond (the RoPE rotation pair):
 //   dst_add = (x * tab_a) + (get_rows(x, idx) * tab_b)
 // See the definition in ops.cpp for the exact-match contract this relies on.

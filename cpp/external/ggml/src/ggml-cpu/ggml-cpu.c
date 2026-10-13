@@ -682,6 +682,11 @@ void katago_mul_store_report(void);
 // Same place, same purpose: element counts for the broadcast-mul specialisation, so that an A/B of it has a
 // declared work delta (GATE 4) that actually moves with the knob.
 void katago_mul_bcast_report(void);
+// FA phase split, defined in ops.cpp (C++), same reporting point as the others.
+void katago_fa_phase_report(void);
+// V_HOIST switch (defined in ops.cpp). The plan sizes the scratch and the kernel uses it, so both must read
+// the same switch through this one function.
+bool katago_fa_v_hoist(void);
 // The repack is WORK, not waiting: it reads all of src1 and writes the converted copy, and that cost lands in
 // MUL_MAT's own row where no waiting-type instrument can see it. Per-thread rows, like everything else here.
 static uint64_t ggml_cpu_bar_repack_elems [GGML_MAX_N_THREADS];
@@ -1260,6 +1265,7 @@ static void ggml_cpu_bar_spin_report(void) {
     // f32 destination -- which makes P a same-process difference: no cross-arm, no cross-session and no
     // cross-DLL comparison appears anywhere in it. That matters because the cross-DLL spread on this arm
     // already measured 1.5 pp.
+    katago_fa_phase_report();
     katago_mul_bcast_report();
     katago_mul_store_report();
     ggml_cpu_workprof_report();
@@ -1422,6 +1428,48 @@ static uint64_t ggml_cpu_workprof_call[GGML_OP_COUNT + 1];
 // Before any recovery figure is quoted, the two sides have to be shown to have done the SAME work -- and
 // "the same number of wrapped nodes" is not that, because a path could measure fewer elements per node.
 static uint64_t ggml_cpu_workprof_elems[GGML_OP_COUNT + 1];
+// SHAPE BUCKETS: the same counters, split by the WIDTH the element-wise kernels actually loop over -- the
+// second source's ne0. Why this exists: a per-op average hides its own shape classes, and both of this
+// project's recent wins (the f16 broadcast fold and its f32 twin) came from ONE class -- ne0_second == 1,
+// where the loop degenerates to one element per call. Bucketing by element COUNT would have missed it: a
+// broadcast multiply can be huge. So: which class has an abnormal cost per element?
+//   0: ne0_second == 1  (broadcast)      1: 2..7  (never reaches an 8-wide loop)
+//   2: 8..63            3: >= 64          4: no second source
+static uint64_t ggml_cpu_workprof_bcyc  [GGML_OP_COUNT + 1][5];
+static uint64_t ggml_cpu_workprof_belems[GGML_OP_COUNT + 1][5];
+static uint64_t ggml_cpu_workprof_bcall [GGML_OP_COUNT + 1][5];
+// GRAPH CENSUS: producer-op -> consumer-op, accumulated as elements and BYTES along the edges. Built for the
+// question no existing table answers: which producers feed an ELEMENT-WISE consumer (a fusion candidate) and
+// which feed a GEMM or attention (a layout contract, not removable by fusion). Charging a fusion's value to
+// the CONT row is the wrong population twice over -- the two accesses a fusion removes are the producer's
+// write and the consumer's read, and those are counted in the PRODUCER's and the CONSUMER's rows, not in any
+// copy node's. Endpoints are IMMEDIATE src ops, so a VIEW/RESHAPE appears as itself.
+static uint64_t ggml_census_elems[GGML_OP_COUNT + 1][GGML_OP_COUNT + 1];
+static uint64_t ggml_census_bytes[GGML_OP_COUNT + 1][GGML_OP_COUNT + 1];
+static uint64_t ggml_census_edges[GGML_OP_COUNT + 1][GGML_OP_COUNT + 1];
+// FA SHAPE BUCKETS, in MAC/CYCLE and not cycles per element. FA is O(S^2), so cyc/elem would just track the
+// sequence length and would "find a defect" in the longest-sequence bucket every time -- that is shape, not
+// efficiency. Normalising by the MACs the op owes (QK^T and PV together, 2*Sq*Skv*D*H*B) makes buckets
+// comparable to each other and to the kernel ceiling (27.4 MAC/cycle from the kernel-ceiling note). The
+// criterion is therefore "a bucket clearly BELOW the others or below the ceiling", never "above".
+// Buckets: head dim D (drives vectorisation) x self/cross (Sq == Skv) x mask present.
+static uint64_t ggml_fa_cyc [16];
+static uint64_t ggml_fa_mac [16];
+static uint64_t ggml_fa_node[16];
+static inline int ggml_fa_bucket(const struct ggml_tensor * node, uint64_t * macs) {
+    const int64_t D = node->ne[0], Sq = node->ne[1], H = node->ne[2], B = node->ne[3];
+    const int64_t Skv = (node->src[1] != NULL) ? node->src[1]->ne[1] : Sq;
+    *macs = (uint64_t) (2 * Sq * Skv * D * H * B);
+    int b = (D >= 128) ? 0 : (D >= 64) ? 1 : (D >= 32) ? 2 : 3;
+    if (Sq != Skv) { b += 4; }
+    if (node->src[3] != NULL) { b += 8; }
+    return b;
+}
+static int ggml_census_on(void) {
+    static int v = -1;
+    if (v < 0) { v = (getenv("KATAGO_CPU_GRAPH_CENSUS") != NULL) ? 1 : 0; }
+    return v;
+}
 static int ggml_cpu_workprof_on(void) {
     static int v = -1;
     if (v < 0) { v = (getenv("KATAGO_CPU_WORKPROF") != NULL) ? 1 : 0; }
@@ -1433,7 +1481,35 @@ static inline void ggml_cpu_workprof_note(const struct ggml_tensor * node, uint6
     if (op < 0 || op > GGML_OP_COUNT) { return; }
     __atomic_fetch_add(&ggml_cpu_workprof_cyc  [op], ggml_cpu_bar_tsc() - t0, __ATOMIC_RELAXED);
     __atomic_fetch_add(&ggml_cpu_workprof_call [op], 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&ggml_cpu_workprof_elems[op], (uint64_t) ggml_nelements(node), __ATOMIC_RELAXED);
+    const uint64_t el = (uint64_t) ggml_nelements(node);
+    __atomic_fetch_add(&ggml_cpu_workprof_elems[op], el, __ATOMIC_RELAXED);
+    // Shape class: width of the second source, i.e. what the kernel's inner loop strides over.
+    int b = 4;
+    if (node->src[1] != NULL) {
+        const int64_t w = node->src[1]->ne[0];
+        b = (w <= 0) ? 4 : (w == 1) ? 0 : (w < 8) ? 1 : (w < 64) ? 2 : 3;
+    }
+    __atomic_fetch_add(&ggml_cpu_workprof_bcyc  [op][b], ggml_cpu_bar_tsc() - t0, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&ggml_cpu_workprof_bcall [op][b], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&ggml_cpu_workprof_belems[op][b], el, __ATOMIC_RELAXED);
+    if (ggml_census_on()) {
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const struct ggml_tensor * sr = node->src[s];
+            if (sr == NULL) { continue; }
+            const int po = (int) sr->op;
+            if (po < 0 || po > GGML_OP_COUNT) { continue; }
+            __atomic_fetch_add(&ggml_census_elems[po][op], (uint64_t) ggml_nelements(sr), __ATOMIC_RELAXED);
+            __atomic_fetch_add(&ggml_census_bytes[po][op], (uint64_t) ggml_nbytes(sr), __ATOMIC_RELAXED);
+            __atomic_fetch_add(&ggml_census_edges[po][op], 1, __ATOMIC_RELAXED);
+        }
+    }
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        uint64_t macs = 0;
+        const int fb = ggml_fa_bucket(node, &macs);
+        __atomic_fetch_add(&ggml_fa_cyc [fb], ggml_cpu_bar_tsc() - t0, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&ggml_fa_mac [fb], macs, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&ggml_fa_node[fb], 1, __ATOMIC_RELAXED);
+    }
 }
 static void ggml_cpu_workprof_report(void) {
     if (!ggml_cpu_workprof_on()) { return; }
@@ -1448,6 +1524,64 @@ static void ggml_cpu_workprof_report(void) {
                 (unsigned long long) ggml_cpu_workprof_call[s],
                 (unsigned long long) ggml_cpu_workprof_elems[s],
                 (unsigned long long) ggml_cpu_workprof_cyc[s]);
+    }
+    // The shape cross-section: cycles per ELEMENT by class, which is the quantity that names a slow shape
+    // rather than a slow op. Only meaningful within one op (the work per element is a constant only there),
+    // which is how it must be read.
+    static const char * bname[5] = { "ne0_2nd=1", "ne0_2nd=2..7", "ne0_2nd=8..63", "ne0_2nd>=64", "no-2nd-src" };
+    fprintf(stderr, "[workprof-shape] op / class / calls / elems / cyc_per_elem\n");
+    for (int s = 0; s < GGML_OP_COUNT + 1; s++) {
+        for (int b = 0; b < 5; b++) {
+            if (ggml_cpu_workprof_bcall[s][b] == 0) { continue; }
+            const double cpe = ggml_cpu_workprof_belems[s][b]
+                ? (double) ggml_cpu_workprof_bcyc[s][b] / (double) ggml_cpu_workprof_belems[s][b] : 0.0;
+            fprintf(stderr, "[workprof-shape] %-18s %-13s calls=%-8llu elems=%-12llu cyc_per_elem=%9.3f\n",
+                    ggml_op_name((enum ggml_op) s), bname[b],
+                    (unsigned long long) ggml_cpu_workprof_bcall[s][b],
+                    (unsigned long long) ggml_cpu_workprof_belems[s][b], cpe);
+        }
+    }
+    // The census table. Column names are explicit because "elems" and "bytes" are different units and this
+    // project has already been bitten by quoting one under the other's name. Small rows are suppressed only
+    // for readability; the TOTAL line is unfiltered, so it must equal the sum over every row.
+    if (ggml_census_on()) {
+        uint64_t tE = 0, tB = 0, tN = 0;
+        fprintf(stderr, "[census] producer_op -> consumer_op : edges / src_elems / src_bytes\n");
+        for (int p = 0; p < GGML_OP_COUNT + 1; p++) {
+            for (int c = 0; c < GGML_OP_COUNT + 1; c++) {
+                if (ggml_census_edges[p][c] == 0) { continue; }
+                tE += ggml_census_elems[p][c]; tB += ggml_census_bytes[p][c]; tN += ggml_census_edges[p][c];
+                if (ggml_census_elems[p][c] < 2000000ULL) { continue; }
+                fprintf(stderr, "[census] %-18s -> %-18s edges=%-7llu elems=%-13llu bytes=%-13llu\n",
+                        ggml_op_name((enum ggml_op) p), ggml_op_name((enum ggml_op) c),
+                        (unsigned long long) ggml_census_edges[p][c],
+                        (unsigned long long) ggml_census_elems[p][c],
+                        (unsigned long long) ggml_census_bytes[p][c]);
+            }
+        }
+        fprintf(stderr, "[census] TOTAL edges=%llu src_elems=%llu src_bytes=%llu (all rows, unfiltered)\n",
+                (unsigned long long) tN, (unsigned long long) tE, (unsigned long long) tB);
+    }
+    // The FA table. Printed whenever the instrument is on, and it carries a TOTAL row on purpose: bucket rows
+    // named after an op have already been mistaken for that op's total once in this project.
+    {
+        uint64_t tcyc = 0, tmac = 0, tnode = 0;
+        static const char * dims[4] = { "D>=128", "D=64..127", "D=32..63", "D<32" };
+        fprintf(stderr, "[fa-bucket] D / self|cross / mask : nodes / macs / cycles / MAC_per_cycle (ceiling 27.4)\n");
+        for (int b = 0; b < 16; b++) {
+            if (ggml_fa_node[b] == 0) { continue; }
+            tcyc += ggml_fa_cyc[b]; tmac += ggml_fa_mac[b]; tnode += ggml_fa_node[b];
+            const double mpc = ggml_fa_cyc[b] ? (double) ggml_fa_mac[b] / (double) ggml_fa_cyc[b] : 0.0;
+            fprintf(stderr, "[fa-bucket] %-9s %-6s %-7s nodes=%-5llu macs=%-14llu cycles=%-13llu MAC_per_cycle=%7.2f\n",
+                    dims[b % 4], (b & 4) ? "cross" : "self", (b & 8) ? "mask" : "nomask",
+                    (unsigned long long) ggml_fa_node[b], (unsigned long long) ggml_fa_mac[b],
+                    (unsigned long long) ggml_fa_cyc[b], mpc);
+        }
+        if (tnode) {
+            fprintf(stderr, "[fa-bucket] TOTAL     nodes=%llu macs=%llu cycles=%llu MAC_per_cycle=%.2f\n",
+                    (unsigned long long) tnode, (unsigned long long) tmac, (unsigned long long) tcyc,
+                    tcyc ? (double) tmac / (double) tcyc : 0.0);
+        }
     }
 }
 #else
@@ -4215,6 +4349,12 @@ struct ggml_cplan ggml_graph_plan(
                         size_t n_chunks = n_tasks;
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
+                        // V_HOIST adds one whole-(head,batch) float copy of V per thread. This MUST match the
+                        // V_all pointer arithmetic in ops.cpp, or the kernel walks out of its own region.
+                        if (katago_fa_v_hoist()) {
+                            const int64_t n_kv_pad = ((node->src[1]->ne[1] + GGML_FA_TILE_KV - 1) / GGML_FA_TILE_KV) * GGML_FA_TILE_KV;
+                            prefill += sizeof(float)*(size_t)n_kv_pad*DV*n_tasks;
+                        }
                         cur += MAX(prefill, decode);
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
@@ -5355,6 +5495,64 @@ static int ggml_cpu_try_fuse_ops(
         }
     }
 
+    // Element-wise chain {MUL, ADD} (opt-in: KATAGO_CPU_EW_FUSE_MULADD=1). One pass, so the MUL's whole-tensor
+    // intermediate never reaches memory. Bandwidth, not instructions: the census puts MUL->ADD at 6576 edges /
+    // 1.43G elements / 5.72 GB of reads -- whole MB-scale tensors, unlike FA's 16 KB tiles.
+    {
+        static int ew_muladd = -1;
+        if (ew_muladd < 0) {
+            const char * e = getenv("KATAGO_CPU_EW_FUSE_MULADD");
+            ew_muladd = (e != NULL && e[0] != '\0' &&
+                !(e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N' ||
+                  e[0] == 'o' || e[0] == 'O')) ? 1 : 0;
+        }
+        if (ew_muladd && node->op == GGML_OP_MUL) {
+            const enum ggml_op fuse_ops[] = { GGML_OP_MUL, GGML_OP_ADD };
+            if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {
+                struct ggml_tensor * mul_node = node;
+                struct ggml_tensor * add_node = cgraph->nodes[node_n + 1];
+                const struct ggml_tensor * m0 = mul_node->src[0];
+                const struct ggml_tensor * m1 = mul_node->src[1];
+                const struct ggml_tensor * a1 = (add_node->src[0] == mul_node)
+                    ? add_node->src[1] : add_node->src[0];
+
+                // A1 LESSON, and the reason this guard is not optional: the fused kernel runs at the MUL's
+                // slot, so every input it reads must ALREADY be written. The ADD's non-MUL operand is the only
+                // one that can be produced later. Scanning from our own index onward catches "produced at or
+                // after us"; anything not found there is either an earlier node or a leaf, hence ready.
+                int a1_ready = 1;
+                for (int i = node_n; i < cgraph->n_nodes; i++) {
+                    if (cgraph->nodes[i] == a1) { a1_ready = 0; break; }
+                }
+
+                if (m0 != NULL && m1 != NULL && a1 != NULL && a1_ready &&
+                    mul_node->type == GGML_TYPE_F32 && add_node->type == GGML_TYPE_F32 &&
+                    m0->type == GGML_TYPE_F32 && m1->type == GGML_TYPE_F32 && a1->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(mul_node) && ggml_is_contiguous(add_node) &&
+                    ggml_is_contiguous(m0) && ggml_is_contiguous(m1) && ggml_is_contiguous(a1) &&
+                    ggml_nelements(mul_node) > 0 &&
+                    ggml_nelements(m0) == ggml_nelements(mul_node) &&
+                    ggml_nelements(m1) == ggml_nelements(mul_node) &&
+                    ggml_nelements(a1) == ggml_nelements(mul_node) &&
+                    ggml_nelements(add_node) == ggml_nelements(mul_node) &&
+                    !(add_node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    if (params->ith == 0) {
+                        // One-shot probe: GATE 5 needs a line that appears ONLY in the knob arm. That is how
+                        // "the switch was honoured at run time" is proved rather than assumed.
+                        static int ew_reported = 0;
+                        if (ew_reported < 4) {
+                            ew_reported++;
+                            fprintf(stderr, "[ew-fuse] node=%d ne=%lld\n", node_n,
+                                    (long long) ggml_nelements(mul_node));
+                        }
+                    }
+                    ggml_compute_forward_muladd_fused(params, add_node, mul_node);
+                    return 1;
+                }
+            }
+        }
+    }
+
     // A1 BISECT (diagnostic, KATAGO_CPU_T9_ADDONLY=1): run the fused pass IN PLACE OF the stock ADD kernel,
     // with the GEMM and the view left completely alone. This isolates ONE variable -- my pass versus
     // ggml_compute_forward_add_non_quantized -- at the same position in the same barrier interval, so it
@@ -6370,5 +6568,27 @@ void ggml_cpu_init(void) {
 
     ggml_critical_section_end();
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 

@@ -1,4 +1,35 @@
 #include "ops.h"
+#include <cstdlib>
+
+// V_HOIST switch, defined once for both this TU and ggml_graph_plan's work-size case: the plan sizes the
+// scratch, the kernel uses it, and they must agree. Default OFF (opt-in).
+extern "C" bool katago_fa_v_hoist(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("KATAGO_CPU_FA_V_HOIST");
+        v = (e != NULL && e[0] != '\0' &&
+             !(e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N' ||
+               e[0] == 'o' || e[0] == 'O')) ? 1 : 0;
+    }
+    return v != 0;
+}
+
+// Correctly rounded single-precision product, which the compiler must NOT contract with the following add.
+// The two-pass version this replaces stores the product into a tensor, so the product is rounded to F32; an FMA
+// would keep the product exact and round once at the end -- a different value, and the bit gate would flip.
+// The builtin route is out: this clang has no __builtin_fmul_rn (it suggests __builtin_fmin). The exact-widening
+// route is PROVABLY equivalent: the product of two floats is representable exactly in double (24+24 bits fit in
+// 53), so rounding that double product back to float is the correctly rounded F32 product. And because a
+// float-to-double conversion sits between the multiply and the float add, fusing them into an FMA is not a
+// legal transformation here (it would change the result), so contraction cannot silently break bit identity.
+// The disassembly assertion in the round's log is what checks that claim on the generated code.
+static inline float katago_mul_rn(float a, float b) {
+    return (float) ((double) a * (double) b);
+}
+
+// Element-wise {MUL, ADD} in one pass -- definition lives next to ggml_compute_forward_rms_norm_mul_fused,
+// where struct ggml_compute_params is complete.
+
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
@@ -3966,6 +3997,53 @@ void ggml_compute_forward_rms_norm(
 
 // Fused RMS_NORM + MUL: computes dst = rms_norm(src0) * src1 in a single pass.
 // This avoids materializing the intermediate rms_norm result in memory.
+// Element-wise {MUL, ADD} in one pass: dst_add[i] = (m0[i] * m1[i]) + a1[i]. Bit-identical to running the two
+// stock kernels in sequence, because each output element is computed from the same three inputs with the
+// product rounded to F32 first and then a plain F32 add -- the same operations, in the same order, as the
+// materialised version. What changes is that the MUL's whole-tensor output is never written.
+// The caller has already proved shape/type/contiguity and the "input is ready" condition (see ops.h).
+//
+// TWO THINGS THE FIRST VERSION GOT WRONG, both caught by the wall clock (the knob arm was 5.5% SLOWER over
+// 12/12 rounds even though the memory traffic fell by 3.2 GB per process, so that run priced an
+// instruction-bound kernel, not the bandwidth hypothesis):
+//   1. It used the i += nth STRIDE, so every thread touched every cache line. The stock element-wise kernels
+//      use get_thread_range (common.h:74) for a BLOCK partition, and so does this one now.
+//   2. It was SCALAR (vmulss/vaddss, one element per iteration) while the stock kernels are 8-wide. Now it
+//      uses _mm256_mul_ps + _mm256_add_ps: intrinsics map 1:1 onto instructions, so contraction into an FMA
+//      is impossible BY CONSTRUCTION -- a structural guarantee, unlike the preceding version whose guarantee
+//      depended on the double-widening trick surviving the optimiser (it did, but only per build).
+void ggml_compute_forward_muladd_fused(const struct ggml_compute_params * params,
+        struct ggml_tensor * dst_add, const struct ggml_tensor * dst_mul) {
+    const float * m0 = (const float *) dst_mul->src[0]->data;
+    const float * m1 = (const float *) dst_mul->src[1]->data;
+    const float * a1 = (const float *) ((dst_add->src[0] == dst_mul) ? dst_add->src[1]->data
+                                                                    : dst_add->src[0]->data);
+    float * out = (float *) dst_add->data;
+
+    // get_thread_range (common.h:74) splits ROWS, not elements: nr = ggml_nrows(t), dr = ceil(nr/nth). The
+    // first AVX2 attempt treated ir0..ir1 as element indices and therefore wrote only about 1/ne0 of the
+    // output -- and the bit gate caught it on the very next build (on-arm hash C8D36311BC3EEB60). The guard in
+    // ggml-cpu.c requires every operand to be contiguous, so a row is ne0 contiguous floats and its base is
+    // simply ir*ne0.
+    const int64_t ne0 = dst_add->ne[0];
+    const auto [ir0, ir1] = get_thread_range(params, dst_add);
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t b = ir * ne0;
+        int64_t i = 0;
+#if defined(__AVX2__)
+        for (; i + 8 <= ne0; i += 8) {
+            const __m256 x = _mm256_loadu_ps(m0 + b + i);
+            const __m256 y = _mm256_loadu_ps(m1 + b + i);
+            const __m256 c = _mm256_loadu_ps(a1 + b + i);
+            _mm256_storeu_ps(out + b + i, _mm256_add_ps(_mm256_mul_ps(x, y), c));
+        }
+#endif
+        for (; i < ne0; i++) {
+            out[b + i] = katago_mul_rn(m0[b + i], m1[b + i]) + a1[b + i];
+        }
+    }
+}
+
 void ggml_compute_forward_rms_norm_mul_fused(
         const ggml_compute_params * params,
         ggml_tensor * dst_rms_norm,
@@ -9225,10 +9303,78 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     }
 }
 
+// ---- FA PHASE INSTRUMENT ------------------------------------------------------------------------------
+// FA is 31% of this graph's work -- the largest single op -- and MAC/cycle cannot price it: its MAC
+// denominator treats softmax as free, while one scalar expf costs 10-20 cycles against a MAC's ~0.037. So the
+// phases are timed separately, at the KV-TILE level: one level up from the element loops, because ~10^7
+// timestamps would measure themselves. (The element-wise path taught the same lesson in the opposite
+// direction: 1.2e8 calls there, ~5e5 here.)
+// FOUR phases, not three, because the K/V f16->f32 packing is O(S) per KV tile and therefore repeats once per
+// QUERY tile -- a per-element conversion whose total is O(S^2/Q_TILE). No MAC denominator and no cyc/elem
+// table can see that.
+// The report prints cycles AND the phase-group count: the last row tile and the last KV tile are PARTIAL
+// tiles, so a mean without its denominator would be biased by them. The TOTAL is the sum of the four phases,
+// so the table satisfies sum(rows) == TOTAL by construction, and that total can be checked against the
+// work-profile's FA row as an independent measurement.
+#ifndef KATAGO_FA_PHASE_INSTRUMENT
+#define KATAGO_FA_PHASE_INSTRUMENT 0
+#endif
+static uint64_t g_fa_cyc[4];
+static uint64_t g_fa_grp[4];
+static uint64_t g_fa_expf;
+#if KATAGO_FA_PHASE_INSTRUMENT
+#include <cstdio>
+#include <cstdlib>
+static int katago_fa_phase_on(void) {
+    static int v = -1;
+    if (v < 0) { v = (getenv("KATAGO_CPU_FA_PHASES") != NULL) ? 1 : 0; }
+    return v;
+}
+#define FA_PHASE_MARK(i) do { if (fa_ph) { const uint64_t t_ = __rdtsc(); \
+    __atomic_fetch_add(&g_fa_cyc[i], t_ - fa_t, __ATOMIC_RELAXED); \
+    __atomic_fetch_add(&g_fa_grp[i], 1, __ATOMIC_RELAXED); fa_t = t_; } } while (0)
+extern "C" void katago_fa_phase_report(void) {
+    if (!katago_fa_phase_on() || g_fa_grp[0] == 0) { return; }
+    static const char * pn[4] = { "kv-pack", "qk^T", "softmax", "pv" };
+    uint64_t tot = 0;
+    for (int i = 0; i < 4; i++) { tot += g_fa_cyc[i]; }
+    fprintf(stderr, "[fa-phase] phase / cycles / groups / cyc_per_group / share_of_FA\n");
+    for (int i = 0; i < 4; i++) {
+        fprintf(stderr, "[fa-phase] %-8s cycles=%-14llu groups=%-9llu cyc_per_group=%10.1f share=%6.2f%%\n",
+                pn[i], (unsigned long long) g_fa_cyc[i], (unsigned long long) g_fa_grp[i],
+                g_fa_grp[i] ? (double) g_fa_cyc[i] / (double) g_fa_grp[i] : 0.0,
+                tot ? 100.0 * (double) g_fa_cyc[i] / (double) tot : 0.0);
+    }
+    fprintf(stderr, "[fa-phase] TOTAL    cycles=%llu groups=%llu\n",
+            (unsigned long long) tot, (unsigned long long) g_fa_grp[0]);
+    fprintf(stderr, "[fa-phase] scalar expf (the ONLINE RESCALE only; the row softmax is the vectorised "
+                    "ggml_vec_soft_max_f32) calls=%llu groups=%llu per_group=%.2f\n",
+            (unsigned long long) g_fa_expf, (unsigned long long) g_fa_grp[0],
+            g_fa_grp[0] ? (double) g_fa_expf / (double) g_fa_grp[0] : 0.0);
+}
+#else
+static int katago_fa_phase_on(void) { return 0; }
+#define FA_PHASE_MARK(i) do { } while (0)
+extern "C" void katago_fa_phase_report(void) { }
+#endif
+
 static void ggml_compute_forward_flash_attn_ext_tiled(
         const ggml_compute_params * params,
         ggml_tensor * dst,
         int ir0, int ir1) {
+    // SOFTMAX+PV FUSION, OPT-IN (`KATAGO_CPU_FA_SOFTMAX_PV_FUSE=1`). The row's P is consumed where it is
+    // produced instead of being written to KQ and read back by the PV gemm. Expected to be BIT-IDENTICAL:
+    //   * the per-output accumulation order over the KV tile is unchanged -- same simd_gemm, same K loop,
+    //     just invoked with M=1 for the row whose P is already in L1;
+    //   * KV tile boundaries, the max sampling time and the rescale time are untouched;
+    //   * V32 is packed BEFORE the softmax instead of after: a pure data move into scratch, no value changes;
+    //   * a `skip[tq]` row simply does not accumulate, which is exactly what the old KQ zeroing achieved.
+    // Default OFF, so the default build keeps the old path bit for bit.
+    static const bool fa_fuse = []() {
+        const char * e = getenv("KATAGO_CPU_FA_SOFTMAX_PV_FUSE");
+        if (e == NULL || e[0] == '\0') { return false; }
+        return !(e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N' || e[0] == 'o' || e[0] == 'O');
+    }();
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -9334,7 +9480,12 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         // VKQ32:  Q_TILE_SZ * DV (FP32 output accumulator)
         // V32:    KV_TILE_SZ * DV (F32 buffer for V tile)
         // K_f32:  KV_TILE_SZ * DK (F32 buffer for K tile — GEMM path)
-        float * base  = (float *) params->wdata + ith*(Q_TILE_SZ*DK + 2*Q_TILE_SZ*KV_TILE_SZ + Q_TILE_SZ*DV + KV_TILE_SZ*DV + KV_TILE_SZ*DK + CACHE_LINE_SIZE_F32);
+        // The per-thread stride MUST include the hoisted V slice whenever the hoist is on, and it must match
+        // the FA "prefill" term in ggml_graph_plan exactly. Getting this wrong makes one thread's V_all overlap
+        // the next thread's scratch -- which is precisely the wrong hash the bit gate caught on the first try.
+        const int64_t v_hoist_floats = katago_fa_v_hoist()
+            ? ((nek1 + KV_TILE_SZ - 1) / KV_TILE_SZ) * KV_TILE_SZ * DV : 0;
+        float * base  = (float *) params->wdata + ith*(Q_TILE_SZ*DK + 2*Q_TILE_SZ*KV_TILE_SZ + Q_TILE_SZ*DV + KV_TILE_SZ*DV + KV_TILE_SZ*DK + CACHE_LINE_SIZE_F32 + v_hoist_floats);
 
         void  * Q_q    = base;
         float * KQ     = (float *)((char *)base + Q_TILE_SZ * DK * sizeof(float));
@@ -9342,6 +9493,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         float * VKQ32  = mask32 + Q_TILE_SZ * KV_TILE_SZ;
         float * V32    = VKQ32 + Q_TILE_SZ * DV;
         float * K_f32  = V32 + KV_TILE_SZ * DV;
+        // V_HOIST: a whole-(head,batch) float copy of V, so the f16->f32 conversion happens once per row tile
+        // instead of once per KV tile. Only touched when katago_fa_v_hoist(); its size is added to the FA
+        // prefill term in ggml_graph_plan.
+        float * V_all  = K_f32 + KV_TILE_SZ * DK;
 
         memset(VKQ32, 0, Q_TILE_SZ * DV * sizeof(float));
         memset(mask32, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));
@@ -9368,6 +9523,36 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         memset(K_f32, 0, DK * KV_TILE_SZ * sizeof(float));
         memset(V32,   0, KV_TILE_SZ * DV * sizeof(float));
 
+        // Phase timing starts HERE so the V hoist falls INSIDE the "pack" window. It used to sit outside every
+        // window, which made the pack phase look 22.5% cheaper with no work having vanished -- accounting
+        // displacement, not a saving. The "unmarked = FA_total - sum(phases)" guard is what exposes the gap.
+        const bool fa_ph = katago_fa_phase_on() != 0;
+        uint64_t fa_t = fa_ph ? __rdtsc() : 0;
+        (void) fa_t;
+        // Hoist the V conversion once per (head, batch) slice. Keyed on the V POINTER too: the same (iq2,iq3)
+        // can reappear in a different node with different V data, and a stale cache entry would be wrong.
+        static thread_local const void * last_v = NULL;
+        static thread_local int64_t last_iv2 = -1, last_iv3 = -1;
+        if (katago_fa_v_hoist() && (v->data != last_v || iq2 != last_iv2 || iq3 != last_iv3)) {
+            last_v = v->data; last_iv2 = iq2; last_iv3 = iq3;
+            // Convert this (head, batch) slice's V once for the whole row tile. F16->F32 is an EXACT widening,
+            // so no value can change -- bit identity here is a construction guarantee, not a hope.
+            // The slots beyond nek1 are ZEROED on purpose: P is exactly 0 there (the KQ padding is -INF), and
+            // 0 * NaN would be NaN if a fresh scratch buffer happened to hold a NaN bit pattern. The old code
+            // got away with stale-but-finite V32 values; a new buffer cannot rely on that.
+            const int64_t iv2h = iq2 / rv2;
+            const int64_t iv3h = iq3 / rv3;
+            const int64_t n_kv_pad = ((nek1 + KV_TILE_SZ - 1) / KV_TILE_SZ) * KV_TILE_SZ;
+            for (int64_t k = 0; k < nek1; k++) {
+                const char * v_data = (const char *)v->data + k*nbv1 + iv2h*nbv2 + iv3h*nbv3;
+                if (kv_type == GGML_TYPE_F16) {
+                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)v_data, V_all + k*DV, DV);
+                } else {
+                    memcpy(V_all + k*DV, v_data, DV * sizeof(float));
+                }
+            }
+            memset(V_all + nek1*DV, 0, (size_t)(n_kv_pad - nek1)*DV*sizeof(float));
+        }
         for (int64_t ic = 0; ic < nek1; ic += KV_TILE_SZ) {
             const int kv_tile = (int)std::min((int64_t)KV_TILE_SZ, nek1 - ic);
 
@@ -9409,9 +9594,27 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                     }
                 }
             }
+            // The V operand for this KV tile: either the per-tile pack (default) or a pointer into the hoisted
+            // whole-slice copy. With the hoist on, the per-tile pack is skipped entirely.
+            const bool v_hoist_on = katago_fa_v_hoist();
+            float * Vtile = v_hoist_on ? (V_all + ic*DV) : V32;
+            if (!v_hoist_on) {
+            // V tile packed HERE rather than after the softmax: the fused path needs it before the row loop.
+            // Pure data movement into scratch (V32), so the values and the results are unchanged.
+            for (int tk = 0; tk < kv_tile; tk++) {
+                const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
+                if (kv_type == GGML_TYPE_F16) {
+                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
+                } else {
+                    memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
+                }
+            }
+            }
+            FA_PHASE_MARK(0);   // K pack done
             memset(KQ, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));
             simd_gemm(KQ, (const float *)Q_q, K_f32, Q_TILE_SZ, DK, KV_TILE_SZ);
             ggml_vec_scale_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, scale);
+            FA_PHASE_MARK(1);   // QK^T + scale done
 
             // Set padded KQ entries to -inf so softmax gives them zero weight
             if (kv_tile < KV_TILE_SZ) {
@@ -9448,6 +9651,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 const float Mnew = fmaxf(Mold, tile_max);
 
                 if (Mnew > Mold) {
+                    if (fa_ph) { __atomic_fetch_add(&g_fa_expf, 1, __ATOMIC_RELAXED); }
                     const float ms = expf(Mold - Mnew);
                     ggml_vec_scale_f32(DV, VKQ32 + tq * DV, ms);
                     S[tq] *= ms;
@@ -9456,24 +9660,24 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
 
                 S[tq] += ggml_vec_soft_max_f32(KV_TILE_SZ, kq_row, kq_row, Mnew);
+                if (fa_fuse) {
+                    // Consume this row's P while it is hot. Same function and same K loop as the batched PV
+                    // call below, with M=1 and C advanced per row -- hence the same accumulation order.
+                    simd_gemm(VKQ32 + tq * DV, kq_row, Vtile, 1, KV_TILE_SZ, DV);
+                }
             }
+            FA_PHASE_MARK(2);   // softmax done (the PV accumulation is inside this window when fused)
 
-            // V accumulation: VKQ32 += softmax(KQ) * V
-            // Pack V tile to contiguous F32, zero-padded
-            for (int tk = 0; tk < kv_tile; tk++) {
-                const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
-                if (kv_type == GGML_TYPE_F16) {
-                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
-                } else {
-                    memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
+            // V accumulation: VKQ32 += softmax(KQ) * V   (the V tile itself was packed above)
+            if (!fa_fuse) {
+                for (int tq = 0; tq < Q_TILE_SZ; tq++) {
+                    if (skip[tq]) {
+                        memset(KQ + tq * KV_TILE_SZ, 0, KV_TILE_SZ * sizeof(float));
+                    }
                 }
+                simd_gemm(VKQ32, KQ, Vtile, Q_TILE_SZ, KV_TILE_SZ, DV);
             }
-            for (int tq = 0; tq < Q_TILE_SZ; tq++) {
-                if (skip[tq]) {
-                    memset(KQ + tq * KV_TILE_SZ, 0, KV_TILE_SZ * sizeof(float));
-                }
-            }
-            simd_gemm(VKQ32, KQ, V32, Q_TILE_SZ, KV_TILE_SZ, DV);
+            FA_PHASE_MARK(3);   // V pack + PV done; the four phases now sum to this KV tile
         }
 
         // sinks (apply only to valid rows in the tile)
@@ -9690,9 +9894,49 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         GGML_CPU_BAR_SITE(GGML_CPU_BAR_SITE_FA_EXT_2);
         ggml_barrier(params->threadpool);
 
-        const int64_t dr = (nr + nchunk - 1) / nchunk;
+        // ONE TILE PER WORK-STEALING CHUNK. The old (nr + nchunk - 1)/nchunk with nchunk = nth*4 = 24 gave
+        // dr = 271, i.e. 4.2 tiles per chunk, so every chunk paid a partial tile: 5 issued tiles of 64 rows
+        // for 271 valid rows = 49/320 = 15.3% of the row work spent computing padding. With dr = Q_TILE_SZ
+        // each chunk is exactly one tile and the only waste is the final tail (34 rows of the last chunk).
+        // It also raises the chunk count from 24 to 102, which balances the stealing better, and the K/V
+        // packing -- which sits inside the tile loop -- now pays 102 tile-passes instead of 120.
+        // Bit-identical: only the chunking changes, not any row's arithmetic. Verify with the raw-nn hash.
+        // OPT-IN until a PAIRED profile proves it. The MUL_F16 precedent: ship default-off, flip the default
+        // only with evidence, and record the calibre break when flipping -- otherwise every later measurement
+        // is built on an unproven configuration and has to be redone when the default moves.
+        // KATAGO_CPU_FA_TILE_CHUNK=1 enables one tile per work-stealing chunk.
+        static const bool fa_tile_chunk = []() {
+            const char * e = getenv("KATAGO_CPU_FA_TILE_CHUNK");
+            if (e == NULL || e[0] == '\0') { return false; }
+            return !(e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N' || e[0] == 'o' || e[0] == 'O');
+        }();
+        int64_t dr = (nr + nchunk - 1) / nchunk;
+        if (fa_tile_chunk) {
+            dr = ggml_fa_tile_config::Q;
+            if (!disable_chunking) {
+                nchunk = (nr + dr - 1) / dr;
+            }
+        }
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
+        // One-shot split report. It exists because two of this project's instruments disagreed about FA's
+        // row padding by 3.46x, and every quantity reverse-derived from an instrument has the status of an
+        // ASSUMPTION: the tensor dimensions and the chunk arithmetic below are printed so that the padding
+        // factor can be computed from OBSERVED dimensions instead of reverse-derived ones. Cheap, one line
+        // per process, and it does not need the instrument build.
+        static bool fa_split_reported = false;
+        if (ith == 0 && !fa_split_reported) {
+            fa_split_reported = true;
+            const int64_t tiles = (dr + Q_TILE_SZ - 1) / Q_TILE_SZ;
+            fprintf(stderr, "[fa-split] nr=%lld neq=(%lld,%lld,%lld) dst_ne=(%lld,%lld,%lld,%lld) "
+                            "k_ne1=%lld nth=%d nth_scaled=%d chunk_size=%lld nchunk=%lld dr=%lld "
+                            "tiles_per_chunk=%lld Q_TILE=%lld KV_TILE=%lld\n",
+                    (long long) nr, (long long) neq1, (long long) neq2, (long long) neq3,
+                    (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                    (long long) nek1, nth, nth_scaled, (long long) chunk_size, (long long) nchunk,
+                    (long long) dr, (long long) tiles, (long long) Q_TILE_SZ,
+                    (long long) ggml_fa_tile_config::KV);
+        }
         bool use_tiled = !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
@@ -12536,3 +12780,11 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+
+
+
+
+
+
+
